@@ -5,5 +5,5 @@ workers_dev = false
 preview_urls = false
 
 routes = [
-  { pattern = "manki.dustinface.me/*", zone_name = "dustinface.me" }
+  { pattern = "manki-api.dustinface.me/*", zone_name = "dustinface.me" }
 ]

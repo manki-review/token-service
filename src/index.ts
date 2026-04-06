@@ -83,7 +83,7 @@ async function verifyGitHubOIDC(token: string, expectedRepo: string): Promise<OI
 
   const { payload } = await jwtVerify(token, JWKS, {
     issuer: GITHUB_OIDC_ISSUER,
-    audience: 'manki.dustinface.me',
+    audience: 'manki-api.dustinface.me',
   });
 
   const claims = payload as unknown as OIDCClaims;
