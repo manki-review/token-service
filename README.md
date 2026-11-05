@@ -30,6 +30,8 @@ wrangler secret put APP_PRIVATE_KEY
 
 ```sh
 npm install
-npm run dev      # local dev server
-npm run deploy   # deploy to Cloudflare
+npm run dev        # local dev server
+npm run typecheck  # type-check the Worker and the tests
+npm test           # run the tests
+npm run deploy     # deploy to Cloudflare
 ```
