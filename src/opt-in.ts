@@ -12,17 +12,21 @@ export interface WorkflowFile {
   text: string | null;
 }
 
-// The events an event-driven Manki workflow runs on. Any of them next to the dispatch workflow would review twice.
+// The triggers of an event-driven Manki workflow. Any of them next to the dispatch workflow would review twice.
+// `workflow_call` counts too: such a reusable workflow runs whenever another workflow is triggered.
 const EVENT_TRIGGERS = new Set([
   'pull_request',
   'pull_request_target',
   'pull_request_review',
   'pull_request_review_comment',
   'issue_comment',
+  'workflow_call',
 ]);
 
 // The Manki action, or the job `if` from `SETUP.md`, which manki's own workflow also carries with `uses: ./`.
-const MANKI_WORKFLOW = /uses:\s*['"]?manki-review\/manki[@/'"\s]|manki-review\[bot\]/;
+// A reusable workflow in another repository hides both, so a caller of one cannot be detected.
+const MANKI_WORKFLOW = /uses:\s*['"]?manki-review\/manki[@/'"\s]|manki-review\[bot\]/i;
+const LOCAL_REUSABLE = /uses:\s*['"]?\.\/\.github\/workflows\/([^\s'"@]+)/gi;
 
 function triggers(text: string): Set<string> | null {
   let workflow: unknown;
@@ -42,6 +46,23 @@ function isWorkflowFile(name: string): boolean {
   return name.endsWith('.yml') || name.endsWith('.yaml');
 }
 
+/** Returns the names of the workflow files that run Manki, directly or through a local reusable workflow. */
+function mankiWorkflows(files: WorkflowFile[]): Set<string> {
+  const manki = new Set(files.filter((file) => file.text && MANKI_WORKFLOW.test(file.text)).map((file) => file.name));
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const file of files) {
+      if (manki.has(file.name) || !file.text) continue;
+      const called = [...file.text.matchAll(LOCAL_REUSABLE)].map((match) => match[1]);
+      if (called.some((name) => manki.has(name))) {
+        manki.add(file.name);
+        grew = true;
+      }
+    }
+  }
+  return manki;
+}
+
 /**
  * Decides whether a repository opted in to webhook mode from the workflow files on its default branch. It opts in
  * when `manki-dispatch.yml` runs on `workflow_dispatch` and no other file is an event-driven Manki workflow.
@@ -53,8 +74,9 @@ export function classifyWorkflows(files: WorkflowFile[]): OptIn {
     return { optedIn: false, reason: `${DISPATCH_WORKFLOW} does not run on workflow_dispatch` };
   }
 
+  const manki = mankiWorkflows(files);
   for (const file of files) {
-    if (file === dispatch || !isWorkflowFile(file.name) || !file.text || !MANKI_WORKFLOW.test(file.text)) continue;
+    if (file === dispatch || !isWorkflowFile(file.name) || !file.text || !manki.has(file.name)) continue;
     const on = triggers(file.text);
     // A file that does not parse cannot be ruled out, so it counts as event-driven.
     if (on === null || [...on].some((name) => EVENT_TRIGGERS.has(name))) {
