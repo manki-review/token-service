@@ -19,7 +19,7 @@ instructions: |
 review:
   classes:
     security:
-      match: { paths_any: ["src/**", "wrangler.toml"] }
+      match: { paths_any: ["src/**", "wrangler.toml", ".github/workflows/**", "package.json", "package-lock.json"] }
 
 static_analysis:
   analyzers:

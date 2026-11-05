@@ -27,6 +27,8 @@ jobs:
       && (github.event.action != 'closed' || github.event.pull_request.merged)
       && (github.event_name != 'issue_comment' || contains(github.event.comment.body, '@manki') || contains(github.event.comment.body, '/manki') || contains(github.event.comment.body, '- [x] Force review'))
       && (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository)
+      && (github.event_name != 'issue_comment' || (github.event.issue.pull_request && (contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) || (github.event.action == 'edited' && github.event.comment.user.login == 'manki-review[bot]'))))
+      && (github.event_name != 'pull_request_review_comment' || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
     concurrency:
       group: manki-${{ (github.event_name == 'pull_request' || (github.event_name == 'issue_comment' && (contains(github.event.comment.body, 'manki review') || contains(github.event.comment.body, '- [x] Force review')))) && 'review' || 'reply' }}-${{ github.event.pull_request.number || github.event.issue.number }}
       queue: max
