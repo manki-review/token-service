@@ -95,6 +95,8 @@ function nextPage(link: string | null): string | null {
  */
 export class Reconciler extends DurableObject<Env> {
   private readonly sql: SqlStorage;
+  /** The pass in progress. The object runs as a single instance, so this guard sees every cron call. */
+  private pass: Promise<void> | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -149,8 +151,23 @@ export class Reconciler extends DurableObject<Env> {
     if (optedInAt === now) log('reconciler_opted_in', { repository_id: target.repositoryId, repo: `${target.owner}/${target.repo}` });
   }
 
-  /** One cron pass. Each half catches its own errors, so a failing redelivery never stops the catch-up. */
+  /**
+   * One cron pass. A pass that starts while the previous one still waits on GitHub is skipped, since both would
+   * redeliver the same failures and race on the scan state.
+   */
   async reconcile(): Promise<void> {
+    if (this.pass) {
+      log('reconciler_pass_skipped', { reason: 'previous pass still running' });
+      return;
+    }
+    this.pass = this.runPass().finally(() => {
+      this.pass = null;
+    });
+    return this.pass;
+  }
+
+  /** Each half catches its own errors, so a failing redelivery never stops the catch-up. */
+  private async runPass(): Promise<void> {
     const budget = new Budget(SUBREQUEST_BUDGET);
     try {
       await this.redeliver(budget);

@@ -386,6 +386,38 @@ describe('Reconciler redelivery', () => {
     expect(github.pullListCalls).toEqual([allowed.repo]);
   });
 
+  it('skips a pass that starts while the previous one still waits on GitHub', async () => {
+    const { stub, repo } = setup();
+    const target = repo();
+    await stub.recordOptIn(target, true);
+    const github = fakeGitHub();
+    github.pages = [[failure(target, 1, 0)]];
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let listing = false;
+    const fake = vi.mocked(globalThis.fetch).getMockImplementation()!;
+    vi.mocked(globalThis.fetch).mockImplementation(async (input, init) => {
+      if (new URL(new Request(input, init).url).pathname === '/app/hook/deliveries') {
+        listing = true;
+        await held;
+      }
+      return fake(input, init);
+    });
+    const first = stub.reconcile();
+    await vi.waitFor(() => expect(listing).toBe(true));
+    await stub.reconcile();
+    expect(logged(log, 'reconciler_pass_skipped')).toHaveLength(1);
+    release();
+    await first;
+    expect(github.redelivered).toEqual([1]);
+
+    // Once the pass ended, the next one runs.
+    await stub.reconcile();
+    expect(github.deliveryListCalls).toBe(2);
+  });
+
   it('stops redelivering when the pass runs out of budget, and reaches the rest first on the next pass', async () => {
     const { stub, repo } = setup();
     const target = repo();
