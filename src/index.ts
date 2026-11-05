@@ -1,12 +1,9 @@
 import { createAppJWT } from './app-jwt';
+import type { Env } from './env';
 import { createInstallationToken, getInstallation } from './github';
 import { verifyGitHubOIDC } from './oidc';
 import { cappedPermissions, type Permissions } from './permissions';
-
-interface Env {
-  APP_ID: string;
-  APP_PRIVATE_KEY: string;
-}
+import { handleWebhook } from './webhook';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -19,6 +16,9 @@ export default {
     }
 
     const url = new URL(request.url);
+    if (url.pathname === '/webhook') {
+      return handleWebhook(request, env);
+    }
     if (url.pathname !== '/token') {
       return Response.json({ error: 'Not found' }, { status: 404 });
     }

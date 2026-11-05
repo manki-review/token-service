@@ -1,0 +1,155 @@
+import { describe, expect, it } from 'vitest';
+import { routeDelivery, type Route, type WebhookPayload } from '../src/routing';
+import { INSTALLATION_ID, OWNER, REPO } from './helpers';
+import {
+  ACTIONS_AUTHOR,
+  BOT_SENDER,
+  COMMENT_ID,
+  FORCE_CAP_COMMENT,
+  FORCE_REVIEW_COMMENT,
+  forkPullRequestEvent,
+  HEAD_SHA,
+  issueCommentEvent,
+  MANKI_AUTHOR,
+  PR_NUMBER,
+  pullRequestEvent,
+  REPOSITORY_ID,
+  REVIEW_ID,
+  reviewCommentEvent,
+  reviewEvent,
+  workflowRunEvent,
+} from './payloads';
+
+/** A compact form of the route: `ignore`, `<lane>:<kind>`, `close`, `close+merged` or `run_completed`. */
+function verdict(route: Route): string {
+  switch (route.type) {
+    case 'ignore':
+      return 'ignore';
+    case 'work':
+      return `${route.work.lane}:${route.work.kind}`;
+    case 'close':
+      return route.merged ? 'close+merged' : 'close';
+    case 'run_completed':
+      return 'run_completed';
+  }
+}
+
+const cases: Array<[string, string, WebhookPayload, string]> = [
+  // pull_request
+  ['a push', 'pull_request', pullRequestEvent('synchronize'), 'state:review'],
+  ['an opened PR', 'pull_request', pullRequestEvent('opened'), 'state:review'],
+  ['a PR marked ready', 'pull_request', pullRequestEvent('ready_for_review'), 'state:review'],
+  ['a push to a draft', 'pull_request', pullRequestEvent('synchronize', { draft: true }), 'ignore'],
+  ['a push to a fork PR', 'pull_request', forkPullRequestEvent('synchronize'), 'ignore'],
+  ['a push to a PR whose fork was deleted', 'pull_request', pullRequestEvent('synchronize', { head: { sha: HEAD_SHA, repo: null } }), 'ignore'],
+  ['a push by a bot', 'pull_request', pullRequestEvent('synchronize', {}, BOT_SENDER), 'ignore'],
+  ['a push by the Manki App', 'pull_request', pullRequestEvent('synchronize', {}, { login: 'manki-review[bot]', type: 'User' }), 'ignore'],
+  ['a labeled PR', 'pull_request', pullRequestEvent('labeled'), 'ignore'],
+  ['a reopened PR', 'pull_request', pullRequestEvent('reopened'), 'ignore'],
+  ['a merge', 'pull_request', pullRequestEvent('closed', { merged: true }), 'close+merged'],
+  ['a close without merge', 'pull_request', pullRequestEvent('closed'), 'close'],
+  ['a merge by a bot', 'pull_request', pullRequestEvent('closed', { merged: true }, BOT_SENDER), 'close'],
+  ['a merge of a fork PR', 'pull_request', { ...forkPullRequestEvent('closed'), pull_request: { ...forkPullRequestEvent('closed').pull_request, merged: true } }, 'close'],
+
+  // pull_request_review
+  ['a submitted review', 'pull_request_review', reviewEvent('submitted'), 'state:review_state'],
+  ['a dismissed review', 'pull_request_review', reviewEvent('dismissed'), 'state:review_state'],
+  ['an edited review', 'pull_request_review', reviewEvent('edited'), 'ignore'],
+  ['a review by a bot', 'pull_request_review', reviewEvent('submitted', { user: MANKI_AUTHOR }), 'ignore'],
+  ['a review on a stale commit', 'pull_request_review', reviewEvent('submitted', { commit_id: 'b'.repeat(40) }), 'ignore'],
+  ['a review on a fork PR', 'pull_request_review', { ...reviewEvent('submitted'), pull_request: forkPullRequestEvent('x').pull_request }, 'ignore'],
+
+  // pull_request_review_comment
+  ['a reply in a thread', 'pull_request_review_comment', reviewCommentEvent('Fixed in the last push', { in_reply_to_id: 1 }), 'state:thread'],
+  ['a mention in a new thread', 'pull_request_review_comment', reviewCommentEvent('@manki is this safe?'), 'state:thread'],
+  ['a dismiss in a thread', 'pull_request_review_comment', reviewCommentEvent('@manki dismiss', { in_reply_to_id: 1 }), 'state:thread'],
+  ['a remember in a thread', 'pull_request_review_comment', reviewCommentEvent('@manki remember use tabs', { in_reply_to_id: 1 }), 'chat:thread'],
+  ['a forget in a thread', 'pull_request_review_comment', reviewCommentEvent('@manki forget tabs'), 'chat:thread'],
+  ['a help in a thread', 'pull_request_review_comment', reviewCommentEvent('/manki help'), 'chat:thread'],
+  ['a check in a thread', 'pull_request_review_comment', reviewCommentEvent('@manki check'), 'chat:thread'],
+  ['a new thread without a mention', 'pull_request_review_comment', reviewCommentEvent('nit: rename this'), 'ignore'],
+  ['a review comment by a bot', 'pull_request_review_comment', reviewCommentEvent('@manki hi', { user: ACTIONS_AUTHOR }), 'ignore'],
+  ['a Manki finding comment', 'pull_request_review_comment', reviewCommentEvent('<!-- manki-finding --> @manki', { user: { login: 'alice', type: 'User' } }), 'ignore'],
+  ['an edited review comment', 'pull_request_review_comment', reviewCommentEvent('@manki hi', {}, 'edited'), 'ignore'],
+  ['a review comment on a fork PR', 'pull_request_review_comment', reviewCommentEvent('@manki hi', {}, 'created', { head: { sha: HEAD_SHA, repo: { full_name: 'mallory/manki' } } }), 'ignore'],
+
+  // issue_comment on a PR
+  ['a review request', 'issue_comment', issueCommentEvent('@manki review'), 'state:review'],
+  ['a review request by slash command', 'issue_comment', issueCommentEvent('/manki review please'), 'state:review'],
+  ['a check', 'issue_comment', issueCommentEvent('@manki check'), 'state:comment'],
+  ['a dismiss', 'issue_comment', issueCommentEvent('@manki dismiss the null check finding'), 'state:comment'],
+  ['an explain', 'issue_comment', issueCommentEvent('@manki explain the cache'), 'chat:comment'],
+  ['a free question', 'issue_comment', issueCommentEvent('@manki why is this slow?'), 'chat:comment'],
+  ['a help', 'issue_comment', issueCommentEvent('@Manki help'), 'chat:comment'],
+  ['a remember', 'issue_comment', issueCommentEvent('@manki remember we use tabs'), 'chat:comment'],
+  ['a forget', 'issue_comment', issueCommentEvent('@manki-review forget tabs'), 'chat:comment'],
+  ['a check quoted in code', 'issue_comment', issueCommentEvent('@manki what does `@manki check` do?'), 'chat:comment'],
+  ['a comment without a mention', 'issue_comment', issueCommentEvent('LGTM'), 'ignore'],
+  ['a mention inside a word', 'issue_comment', issueCommentEvent('ask @mankind'), 'ignore'],
+  ['a comment by a bot', 'issue_comment', issueCommentEvent('@manki review', { sender: BOT_SENDER }), 'ignore'],
+  ['a deleted comment', 'issue_comment', issueCommentEvent('@manki review', { action: 'deleted' }), 'ignore'],
+  ['a ticked Force review', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { action: 'edited', author: MANKI_AUTHOR }), 'state:review'],
+  ['a ticked round cap override', 'issue_comment', issueCommentEvent(FORCE_CAP_COMMENT, { action: 'edited', author: MANKI_AUTHOR }), 'state:review'],
+  ['a ticked box on a github-actions comment', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { action: 'edited', author: ACTIONS_AUTHOR }), 'state:review'],
+  ['a ticked box copied by a human', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { action: 'edited' }), 'ignore'],
+  ['a ticked box in a new comment', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { author: MANKI_AUTHOR }), 'ignore'],
+  ['an edit that adds a mention', 'issue_comment', issueCommentEvent('@manki explain', { action: 'edited', previousBody: 'hmm' }), 'chat:comment'],
+  ['an edit that adds a review request', 'issue_comment', issueCommentEvent('@manki review', { action: 'edited', previousBody: 'hmm' }), 'state:review'],
+  ['an edit that keeps a mention', 'issue_comment', issueCommentEvent('@manki explain this', { action: 'edited', previousBody: '@manki explain' }), 'ignore'],
+  ['an edit that removes a mention', 'issue_comment', issueCommentEvent('never mind', { action: 'edited', previousBody: '@manki explain' }), 'ignore'],
+
+  // issue_comment on an issue
+  ['a mention on an issue', 'issue_comment', issueCommentEvent('@manki help', { onIssue: true }), 'chat:issue'],
+  ['a remember on an issue', 'issue_comment', issueCommentEvent('@manki remember tabs', { onIssue: true }), 'chat:issue'],
+  ['a review request on an issue', 'issue_comment', issueCommentEvent('@manki review', { onIssue: true }), 'ignore'],
+  ['a Manki comment on an issue', 'issue_comment', issueCommentEvent('<!-- manki-bot --> @manki help', { onIssue: true }), 'ignore'],
+  ['a ticked box on an issue', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { action: 'edited', author: MANKI_AUTHOR, onIssue: true }), 'ignore'],
+
+  // workflow_run
+  ['a finished dispatch run', 'workflow_run', workflowRunEvent(), 'run_completed'],
+  ['a started dispatch run', 'workflow_run', workflowRunEvent({}, 'in_progress'), 'ignore'],
+  ['a finished CI run', 'workflow_run', workflowRunEvent({ event: 'pull_request', path: '.github/workflows/ci.yml' }), 'ignore'],
+  ['a dispatch of another workflow', 'workflow_run', workflowRunEvent({ path: '.github/workflows/deploy.yml' }), 'ignore'],
+  ['a dispatch run without a PR in its name', 'workflow_run', workflowRunEvent({ display_title: 'Manki dispatch' }), 'ignore'],
+
+  // Other events and broken payloads
+  ['a ping', 'ping', { zen: 'Keep it logically awesome.' } as WebhookPayload, 'ignore'],
+  ['an installation event', 'installation', { action: 'new_permissions_accepted' }, 'ignore'],
+  ['a push event', 'push', pullRequestEvent('x'), 'ignore'],
+  ['a payload without an installation', 'pull_request', { ...pullRequestEvent('synchronize'), installation: undefined }, 'ignore'],
+];
+
+describe('routeDelivery', () => {
+  it.each(cases)('routes %s', (_case, event, payload, expected) => {
+    expect(verdict(routeDelivery(event, payload))).toBe(expected);
+  });
+
+  it('names the target from the payload', () => {
+    const route = routeDelivery('pull_request', pullRequestEvent('synchronize'));
+    expect(route).toMatchObject({
+      target: { installationId: INSTALLATION_ID, repositoryId: REPOSITORY_ID, owner: OWNER, repo: REPO, defaultBranch: 'main', number: PR_NUMBER },
+    });
+  });
+
+  it.each<[string, string, WebhookPayload, object]>([
+    ['a push', 'pull_request', pullRequestEvent('synchronize'), { event: 'pull_request.synchronize', headSha: HEAD_SHA, objectId: null, sender: 'alice' }],
+    ['a review', 'pull_request_review', reviewEvent('submitted'), { event: 'pull_request_review.submitted', headSha: HEAD_SHA, objectId: REVIEW_ID }],
+    ['a thread reply', 'pull_request_review_comment', reviewCommentEvent('ok', { in_reply_to_id: 1 }), { event: 'pull_request_review_comment.created', objectId: COMMENT_ID }],
+    ['a review request', 'issue_comment', issueCommentEvent('@manki review'), { event: 'issue_comment.created', headSha: null, objectId: COMMENT_ID }],
+    ['a Force review tick', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { action: 'edited', author: MANKI_AUTHOR }), { event: 'issue_comment.edited', sender: 'alice' }],
+  ])('fills the dispatch fields for %s', (_case, event, payload, expected) => {
+    const route = routeDelivery(event, payload);
+    expect(route.type).toBe('work');
+    expect(route.type === 'work' && route.work).toMatchObject(expected);
+  });
+
+  it('fills the merge work and the run end', () => {
+    expect(routeDelivery('pull_request', pullRequestEvent('closed', { merged: true }))).toMatchObject({
+      type: 'close',
+      merged: { lane: 'state', kind: 'merged', event: 'pull_request.closed', headSha: HEAD_SHA },
+    });
+    expect(routeDelivery('workflow_run', workflowRunEvent({ conclusion: 'failure' }))).toMatchObject({
+      type: 'run_completed', runId: 555, conclusion: 'failure', target: { number: PR_NUMBER },
+    });
+  });
+});
