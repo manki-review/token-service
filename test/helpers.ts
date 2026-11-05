@@ -1,5 +1,6 @@
 import { exportJWK, exportPKCS8, generateKeyPair, SignJWT, type JWTPayload } from 'jose';
 import { vi } from 'vitest';
+import type { Env } from '../src/env';
 import worker from '../src/index';
 
 export const OIDC_ISSUER = 'https://token.actions.githubusercontent.com';
@@ -19,7 +20,9 @@ export const appPrivateKeyPkcs1 = pkcs1Pem(appPrivateKeyPkcs8);
 
 const oidcJwk = { ...(await exportJWK(oidcKeys.publicKey)), kid: OIDC_KID, alg: 'RS256', use: 'sig' };
 
-export const TEST_ENV = { APP_ID, APP_PRIVATE_KEY: appPrivateKeyPkcs1 };
+export const WEBHOOK_SECRET = 'test-webhook-secret';
+
+export const TEST_ENV: Env = { APP_ID, APP_PRIVATE_KEY: appPrivateKeyPkcs1, WEBHOOK_SECRET };
 
 function derLengthSize(der: Uint8Array, offset: number): number {
   return der[offset] & 0x80 ? 1 + (der[offset] & 0x7f) : 1;
@@ -110,7 +113,7 @@ export function apiRequests(requests: Request[]): Request[] {
 export interface PostTokenOptions {
   token?: string | null;
   body?: unknown;
-  env?: typeof TEST_ENV;
+  env?: Env;
 }
 
 /** Sends a `/token` request to the Worker. A missing `token` means a fresh valid OIDC token. */
@@ -122,5 +125,44 @@ export async function postToken(options: PostTokenOptions = {}): Promise<Respons
   }
   const body = typeof options.body === 'string' ? options.body : JSON.stringify(options.body ?? { owner: OWNER, repo: REPO });
   const request = new Request(`https://${OIDC_AUDIENCE}/token`, { method: 'POST', headers, body });
+  return worker.fetch(request, options.env ?? TEST_ENV);
+}
+
+/** Returns the `X-Hub-Signature-256` header GitHub sends for `body` under `secret`. */
+export async function signWebhook(body: string, secret = WEBHOOK_SECRET): Promise<string> {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const digest = new Uint8Array(await crypto.subtle.sign('HMAC', key, encoder.encode(body)));
+  return `sha256=${Array.from(digest, (byte) => byte.toString(16).padStart(2, '0')).join('')}`;
+}
+
+export const DELIVERY_ID = '72d3162e-cc78-11e3-81ab-4c9367dc0958';
+
+export interface PostWebhookOptions {
+  event?: string | null;
+  payload?: unknown;
+  /** The raw body, when it must differ from the JSON of `payload`. */
+  body?: string;
+  delivery?: string | null;
+  /** The `X-Hub-Signature-256` header. A missing value means the correct signature, `null` no header. */
+  signature?: string | null;
+  targetId?: string | null;
+  env?: Env;
+}
+
+/** Sends a signed `/webhook` delivery to the Worker. Headers left out of `options` get valid values. */
+export async function postWebhook(options: PostWebhookOptions = {}): Promise<Response> {
+  const body = options.body ?? JSON.stringify(options.payload ?? {});
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const values: Record<string, string | null> = {
+    'X-GitHub-Event': options.event === undefined ? 'ping' : options.event,
+    'X-GitHub-Delivery': options.delivery === undefined ? DELIVERY_ID : options.delivery,
+    'X-GitHub-Hook-Installation-Target-ID': options.targetId === undefined ? APP_ID : options.targetId,
+    'X-Hub-Signature-256': options.signature === undefined ? await signWebhook(body) : options.signature,
+  };
+  for (const [name, value] of Object.entries(values)) {
+    if (value !== null) headers[name] = value;
+  }
+  const request = new Request(`https://${OIDC_AUDIENCE}/webhook`, { method: 'POST', headers, body });
   return worker.fetch(request, options.env ?? TEST_ENV);
 }

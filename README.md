@@ -12,6 +12,10 @@ Workflows authenticate via [GitHub's OIDC provider](https://docs.github.com/en/a
 4. It creates a GitHub App JWT, looks up the installation for the repository, and requests an installation token limited to the permissions Manki uses (see `src/permissions.ts`), each at no more than the installation grants. `actions` never goes above `read`
 5. The installation token, its expiry and the permissions GitHub reports for it are returned to the workflow
 
+## Webhook
+
+`POST /webhook` receives the GitHub App's webhook deliveries for Manki's webhook mode. It checks the `X-Hub-Signature-256` HMAC against `WEBHOOK_SECRET`, checks that `X-GitHub-Hook-Installation-Target-ID` is `APP_ID`, and works out where the delivery would go: ignored, the PR's state lane (reviews, thread replies, `check`, `dismiss`) or its chat lane (explain, questions, help, remember, forget). For now it only logs that decision and answers `202`.
+
 ## Configuration
 
 The following secrets must be set in the Cloudflare Worker environment:
@@ -20,10 +24,12 @@ The following secrets must be set in the Cloudflare Worker environment:
 |---|---|
 | `APP_ID` | GitHub App ID for the manki-review app |
 | `APP_PRIVATE_KEY` | PEM private key for the GitHub App |
+| `WEBHOOK_SECRET` | The App's webhook secret. `/webhook` answers `500` until it is set |
 
 ```sh
 wrangler secret put APP_ID
 wrangler secret put APP_PRIVATE_KEY
+wrangler secret put WEBHOOK_SECRET
 ```
 
 ## Development
