@@ -490,7 +490,7 @@ describe('PrCoordinator dispatch', () => {
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches).toHaveLength(1);
 
-    const runEnd = workflowRunEvent({ id: 9000, display_title: `Manki pull_request.synchronize on #${pr.number}`, conclusion: 'success' });
+    const runEnd = workflowRunEvent({ id: 9000, display_title: `Manki pull_request.synchronize on #${pr.number} (d-1)`, conclusion: 'success' });
     expect((await postWebhook({ event: 'workflow_run', payload: runEnd })).status).toBe(202);
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'done', conclusion: 'success', note: 'run completed' }, { status: 'queued' }]);
     expect(await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm())).toBe(Date.now());
@@ -628,15 +628,18 @@ describe('PrCoordinator dispatch', () => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
     github.dispatchStatuses = [502];
-    await pr.send('pull_request', pr.push(SHA_1));
+    await pr.send('pull_request', pr.push(SHA_1), 'd-lost');
     await runDurableObjectAlarm(pr.stub);
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'dispatching', attempts: 1, lease_until: Date.now() + DISPATCH_BACKOFF_MS[0] }]);
 
-    const title = `Manki pull_request.synchronize on #${pr.number}`;
+    const event = `Manki pull_request.synchronize on #${pr.number}`;
+    const run = (id: number, display_title: string, login = 'manki-review[bot]') =>
+      ({ id, display_title, created_at: new Date().toISOString(), actor: { login } });
     github.listedRuns = [
-      { id: 7001, display_title: title, created_at: new Date().toISOString(), actor: { login: 'alice' } },
-      { id: 7002, display_title: `Manki issue_comment.created on #${pr.number}`, created_at: new Date().toISOString(), actor: { login: 'manki-review[bot]' } },
-      { id: 7003, display_title: title, created_at: new Date().toISOString(), actor: { login: 'manki-review[bot]' } },
+      run(7001, `${event} (d-lost)`, 'alice'),
+      run(7002, `${event} (d-other)`),
+      run(7004, event),
+      run(7003, `${event} (d-lost)`),
     ];
     advanceClock(DISPATCH_BACKOFF_MS[0]);
     await runDurableObjectAlarm(pr.stub);

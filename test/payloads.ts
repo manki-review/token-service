@@ -87,7 +87,7 @@ export function workflowRunEvent(run: Record<string, unknown> = {}, action = 'co
       id: 555,
       event: 'workflow_dispatch',
       path: '.github/workflows/manki-dispatch.yml',
-      display_title: `Manki pull_request.synchronize on #${PR_NUMBER}`,
+      display_title: `Manki pull_request.synchronize on #${PR_NUMBER} (72d3162e-cc78-11e3-81ab-4c9367dc0958)`,
       conclusion: 'success',
       ...run,
     },
@@ -95,7 +95,7 @@ export function workflowRunEvent(run: Record<string, unknown> = {}, action = 'co
 }
 
 export const DISPATCH_WORKFLOW_YAML = `name: Manki dispatch
-run-name: Manki \${{ inputs.event }}.\${{ inputs.action }} on #\${{ inputs.pr }}
+run-name: Manki \${{ inputs.event }}.\${{ inputs.action }} on #\${{ inputs.pr }} (\${{ inputs.delivery_id }})
 on:
   workflow_dispatch:
     inputs:

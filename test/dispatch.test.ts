@@ -12,6 +12,7 @@ describe('dispatchInputs', () => {
     ['a thread reply', { event: 'pull_request_review_comment.created', head_sha: SHA, object_id: 6 }, { event: 'pull_request_review_comment', action: 'created', comment_id: '6' }],
     ['a review request', { event: 'issue_comment.created', head_sha: SHA, object_id: 7 }, { event: 'issue_comment', action: 'created', comment_id: '7' }],
     ['a Force review tick', { event: 'issue_comment.edited', head_sha: null, object_id: 8 }, { event: 'issue_comment', action: 'edited', comment_id: '8' }],
+    ['a resolved thread', { event: 'pull_request_review_thread.resolved', head_sha: SHA, object_id: null }, { event: 'pull_request_review_thread', action: 'resolved' }],
   ])('builds the inputs for %s', (_case, item, expected) => {
     expect(dispatchInputs({ ...item, delivery: DELIVERY }, 12)).toEqual({ ...expected, pr: '12', delivery_id: DELIVERY });
   });
@@ -19,11 +20,16 @@ describe('dispatchInputs', () => {
 
 describe('runTitle', () => {
   it('matches the run-name of the documented dispatch workflow and reads back', () => {
-    expect(runTitle({ event: 'issue_comment.created' }, 12)).toBe('Manki issue_comment.created on #12');
+    expect(runTitle({ event: 'issue_comment.created', delivery: DELIVERY }, 12)).toBe(`Manki issue_comment.created on #12 (${DELIVERY})`);
+    expect(numberFromRunTitle(`Manki issue_comment.created on #12 (${DELIVERY})`)).toBe(12);
+    expect(numberFromRunTitle('Manki pull_request.synchronize on #7 (catch-up-111111111111)')).toBe(7);
+  });
+
+  it('reads the number from a run name without the delivery id', () => {
     expect(numberFromRunTitle('Manki issue_comment.created on #12')).toBe(12);
   });
 
-  it.each(['Manki dispatch', 'Manki issue_comment.created on #12 extra', 'CI on #12', 'Manki x.y on #012', undefined])(
+  it.each(['Manki dispatch', 'Manki issue_comment.created on #12 extra', 'Manki issue_comment.created on #12 (bad id!)', 'CI on #12', 'Manki x.y on #012', undefined])(
     'reads no number from %s',
     (title) => {
       expect(numberFromRunTitle(title)).toBeUndefined();

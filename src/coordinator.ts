@@ -437,8 +437,8 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Finds the run an earlier attempt started when its response was lost. It must carry the exact `display_title`,
-   * come from the App, start after the first attempt and belong to no other item.
+   * Finds the run an earlier attempt started when its response was lost. Its `display_title` names the item's
+   * delivery id, so only that item's run matches. It must also come from the App and belong to no other item.
    */
   private async findRun(item: WorkRow, target: Target): Promise<number | null> {
     const token = await this.token({ actions: 'read' });
