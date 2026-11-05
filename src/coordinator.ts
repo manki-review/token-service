@@ -271,12 +271,15 @@ export class PrCoordinator extends DurableObject<Env> {
       // The check reads the PR when it runs, so one queued check covers every review and thread change before it.
       const [check] = this.queued('state', ['review_state']);
       if (check) {
-        // A review carries the id the dispatch names, so it replaces the queued trigger. A thread change does not.
-        if (work.event.startsWith('pull_request_review.')) {
+        // A review carries the id the dispatch names, so it replaces the queued trigger. A thread change does not, and
+        // an outsider's review never replaces a trusted trigger. Trusted work makes the check trusted.
+        if (work.event.startsWith('pull_request_review.') && (work.trusted || !check.trusted)) {
           this.sql.exec(
-            'UPDATE work SET event = ?, head_sha = ?, object_id = ?, sender = ?, delivery = ? WHERE id = ?',
-            work.event, work.headSha, work.objectId, work.sender, delivery, check.id,
+            'UPDATE work SET event = ?, head_sha = ?, object_id = ?, sender = ?, delivery = ?, trusted = ? WHERE id = ?',
+            work.event, work.headSha, work.objectId, work.sender, delivery, Number(work.trusted), check.id,
           );
+        } else if (work.trusted) {
+          this.sql.exec('UPDATE work SET trusted = 1 WHERE id = ?', check.id);
         }
         return `merged into work ${check.id}`;
       }

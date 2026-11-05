@@ -37,7 +37,7 @@ export function reviewEvent(action: string, review: Record<string, unknown> = {}
   return {
     ...base(action),
     pull_request: pullRequest(pr),
-    review: { id: REVIEW_ID, commit_id: HEAD_SHA, user: HUMAN, ...review },
+    review: { id: REVIEW_ID, commit_id: HEAD_SHA, user: HUMAN, author_association: 'COLLABORATOR', ...review },
   };
 }
 

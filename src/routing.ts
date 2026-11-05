@@ -54,8 +54,8 @@ export interface Work {
   objectId: number | null;
   sender: string;
   /**
-   * Whether a repository user caused the work. Only a comment can come from someone else, and only a trusted comment
-   * may merge with a push review.
+   * Whether a repository user caused the work. Only a comment or a review can come from someone else, and only a
+   * trusted comment may merge with a push review.
    */
   trusted: boolean;
 }
@@ -96,7 +96,7 @@ export interface WebhookPayload {
     created_at?: string;
     updated_at?: string;
   };
-  review?: { id?: number; commit_id?: string; user?: User };
+  review?: { id?: number; commit_id?: string; user?: User; author_association?: string };
   workflow_run?: { id?: number; event?: string; path?: string; display_title?: string; conclusion?: string | null };
 }
 
@@ -132,12 +132,14 @@ function isForkHead(payload: WebhookPayload): boolean {
 const REPO_USER_ASSOCIATIONS = ['OWNER', 'MEMBER', 'COLLABORATOR', 'CONTRIBUTOR'];
 
 /**
- * Whether a repository user caused the event, as Manki's `isLLMAccessAllowed` decides it: the comment's author is
- * one, or the sender wrote the pull request or issue. An event without a comment came from a repository user.
+ * Whether a repository user caused the event, as Manki's `isLLMAccessAllowed` decides it: the comment's or review's
+ * author is one, or the sender wrote the pull request or issue. Any other event came from a repository user: a push
+ * takes write access, and only the PR author or a writer can resolve a thread.
  */
 function isTrusted(payload: WebhookPayload): boolean {
-  if (!payload.comment) return true;
-  if (REPO_USER_ASSOCIATIONS.includes(payload.comment.author_association ?? '')) return true;
+  const authored = payload.comment ?? payload.review;
+  if (!authored) return true;
+  if (REPO_USER_ASSOCIATIONS.includes(authored.author_association ?? '')) return true;
   const author = (payload.issue?.user ?? payload.pull_request?.user)?.login?.toLowerCase();
   return author !== undefined && payload.sender?.login?.toLowerCase() === author;
 }

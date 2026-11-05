@@ -69,6 +69,7 @@ function pullRequest() {
     comment: (body: string, action = 'created') => issueCommentEvent(body, { number, action }),
     outsiderComment: (body: string, action = 'created') => issueCommentEvent(body, { number, action, association: 'NONE' }),
     review: () => reviewEvent('submitted', {}, { number }),
+    outsiderReview: (id = 3003) => reviewEvent('submitted', { id, author_association: 'NONE' }, { number }),
     resolve: (action = 'resolved') => reviewThreadEvent(action, { number }),
     reply: (body: string) => reviewCommentEvent(body, { in_reply_to_id: 1 }, 'created', { number }),
     close: (merged: boolean) => pullRequestEvent('closed', { number, merged }),
@@ -159,6 +160,19 @@ describe('PrCoordinator.receive', () => {
     expect(await pr.send('pull_request_review', { ...pr.review(), review: { ...pr.review().review, id: 3003 } }, 'd-newest'))
       .toEqual({ accepted: true, effect: 'merged into work 1' });
     expect(await workRows(pr.stub)).toMatchObject([{ kind: 'review_state', object_id: 3003, sender: 'alice', delivery: 'd-newest' }]);
+  });
+
+  it('never lets an outsider\'s review replace a trusted review state trigger, and lets trusted work take over an outsider\'s', async () => {
+    const pr = pullRequest();
+    await pr.send('pull_request_review', pr.review(), 'd-trusted');
+    expect(await pr.send('pull_request_review', pr.outsiderReview())).toEqual({ accepted: true, effect: 'merged into work 1' });
+    expect(await workRows(pr.stub)).toMatchObject([{ object_id: 2002, delivery: 'd-trusted', trusted: 1 }]);
+
+    const other = pullRequest();
+    await other.send('pull_request_review', other.outsiderReview());
+    expect(await workRows(other.stub)).toMatchObject([{ trusted: 0 }]);
+    await other.send('pull_request_review_thread', other.resolve());
+    expect(await workRows(other.stub)).toMatchObject([{ event: 'pull_request_review.submitted', trusted: 1 }]);
   });
 
   it('queues a thread change as a review state check that merges with the others', async () => {

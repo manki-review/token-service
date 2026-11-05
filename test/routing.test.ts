@@ -178,7 +178,10 @@ describe('routeDelivery', () => {
 
   it.each<[string, string, WebhookPayload, boolean]>([
     ['a push', 'pull_request', pullRequestEvent('synchronize'), true],
-    ['a review', 'pull_request_review', reviewEvent('submitted'), true],
+    ['a review by a collaborator', 'pull_request_review', reviewEvent('submitted'), true],
+    ['a review by an outsider', 'pull_request_review', reviewEvent('submitted', { author_association: 'NONE' }), false],
+    ['a review by the PR author', 'pull_request_review', reviewEvent('submitted', { author_association: 'NONE' }, { user: { login: 'alice', type: 'User' } }), true],
+    ['a resolved thread', 'pull_request_review_thread', reviewThreadEvent('resolved'), true],
     ...['OWNER', 'MEMBER', 'COLLABORATOR', 'CONTRIBUTOR'].map((association): [string, string, WebhookPayload, boolean] =>
       [`a review request by a ${association}`, 'issue_comment', issueCommentEvent('@manki review', { association }), true]),
     ['a review request by a first-time contributor', 'issue_comment', issueCommentEvent('@manki review', { association: 'FIRST_TIME_CONTRIBUTOR' }), false],
