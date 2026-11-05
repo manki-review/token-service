@@ -138,6 +138,19 @@ describe('routeDelivery', () => {
     expect(verdict(routeDelivery(event, payload))).toBe(expected);
   });
 
+  it('drops a comment event that arrives over 6 hours after the comment was written or edited', () => {
+    const now = Date.parse('2030-01-01T12:00:00Z');
+    const at = (iso: string) => ({ created_at: '2030-01-01T00:00:00Z', updated_at: iso });
+    const issueComment = (iso: string) => {
+      const payload = issueCommentEvent('@manki explain');
+      return { ...payload, comment: { ...payload.comment, ...at(iso) } };
+    };
+    expect(verdict(routeDelivery('issue_comment', issueComment('2030-01-01T06:00:00Z'), now))).toBe('chat:comment');
+    expect(routeDelivery('issue_comment', issueComment('2030-01-01T05:59:59Z'), now)).toEqual({ type: 'ignore', reason: 'comment is over 6 hours old' });
+    expect(verdict(routeDelivery('pull_request_review_comment', reviewCommentEvent('ok', { in_reply_to_id: 1, ...at('2030-01-01T05:00:00Z') }), now))).toBe('ignore');
+    expect(verdict(routeDelivery('pull_request_review', { ...reviewEvent('submitted'), comment: at('2030-01-01T00:00:00Z') }, now))).toBe('state:review_state');
+  });
+
   it('names the target from the payload', () => {
     const route = routeDelivery('pull_request', pullRequestEvent('synchronize'));
     expect(route).toMatchObject({

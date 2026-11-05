@@ -10,6 +10,9 @@ import {
   parseCommandType,
 } from './manki';
 
+/** A comment event older than this when it arrives, such as a late redelivery, is dropped. */
+export const STALE_COMMENT_MS = 6 * 60 * 60 * 1000;
+
 /** The file name of the dispatch-only workflow a repository adds to opt in to webhook mode. */
 export const DISPATCH_WORKFLOW = 'manki-dispatch.yml';
 
@@ -78,7 +81,7 @@ export interface WebhookPayload {
   repository?: { id?: number; name?: string; full_name?: string; default_branch?: string; owner?: { login?: string } };
   pull_request?: PullRequest;
   issue?: { number?: number; pull_request?: unknown };
-  comment?: { id?: number; body?: string; user?: User; in_reply_to_id?: number };
+  comment?: { id?: number; body?: string; user?: User; in_reply_to_id?: number; created_at?: string; updated_at?: string };
   review?: { id?: number; commit_id?: string; user?: User };
   workflow_run?: { id?: number; event?: string; path?: string; display_title?: string; conclusion?: string | null };
 }
@@ -126,7 +129,7 @@ function work(lane: Lane, kind: WorkKind, payload: WebhookPayload, event: string
  * Decides what a verified delivery becomes. It drops only what Manki would drop anyway: the consumer workflow's job
  * `if` and the checks `run()` makes before it reaches a handler. It may forward more than Manki acts on, never less.
  */
-export function routeDelivery(event: string, payload: WebhookPayload): Route {
+export function routeDelivery(event: string, payload: WebhookPayload, now = Date.now()): Route {
   if (event === 'workflow_run') return routeWorkflowRun(payload);
   const handled = ['pull_request', 'pull_request_review', 'pull_request_review_comment', 'pull_request_review_thread', 'issue_comment'];
   if (!handled.includes(event)) {
@@ -144,6 +147,11 @@ export function routeDelivery(event: string, payload: WebhookPayload): Route {
   }
 
   if (isBot(payload.sender)) return ignore('sender is a bot');
+  // An answer that late helps nobody. The time is the comment's last edit, which is what a Force review tick changes.
+  const commentAt = Date.parse(payload.comment?.updated_at ?? payload.comment?.created_at ?? '');
+  if ((event === 'issue_comment' || event === 'pull_request_review_comment') && now - commentAt > STALE_COMMENT_MS) {
+    return ignore('comment is over 6 hours old');
+  }
   if (payload.pull_request && isForkHead(payload)) return ignore('head is on a fork');
 
   switch (event) {
