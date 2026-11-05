@@ -52,7 +52,7 @@ export async function createInstallationToken(
 }
 
 export type MintResult =
-  | { ok: true; token: string }
+  | { ok: true; token: string; expiresAt: number }
   | { ok: false; status: number; message: string };
 
 /** Mints a token for one repository of an installation, holding only `permissions`. */
@@ -67,8 +67,8 @@ export async function mintRepositoryToken(
   if (!response.ok) {
     return { ok: false, status: response.status, message: await response.text() };
   }
-  const { token } = await response.json() as { token: string };
-  return { ok: true, token };
+  const { token, expires_at } = await response.json() as { token: string; expires_at: string };
+  return { ok: true, token, expiresAt: Date.parse(expires_at) };
 }
 
 /** Calls the GitHub REST API at `path` with `token`. */

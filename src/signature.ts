@@ -4,6 +4,11 @@ function toHex(bytes: Uint8Array): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
+/** Returns the hex SHA-256 of `body`. */
+export async function sha256Hex(body: ArrayBuffer): Promise<string> {
+  return toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', body)));
+}
+
 /** Whether `signature`, the `X-Hub-Signature-256` header, is the HMAC-SHA256 of the raw `body` under `secret`. */
 export async function verifyWebhookSignature(secret: string, body: ArrayBuffer, signature: string | null): Promise<boolean> {
   if (!secret || signature === null) return false;

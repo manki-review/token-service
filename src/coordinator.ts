@@ -1,7 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import { dispatchInputs, runTitle } from './dispatch';
 import type { Env } from './env';
-import { githubApi, mintRepositoryToken } from './github';
+import { githubApi, type MintResult, mintRepositoryToken } from './github';
 import { log } from './log';
 import { BOT_LOGIN } from './manki';
 import { type OptIn, readOptIn } from './opt-in';
@@ -9,9 +9,10 @@ import type { Permissions } from './permissions';
 import { DISPATCH_WORKFLOW, type Lane, type Route, type Target, type Work } from './routing';
 
 const MINUTE = 60_000;
-const DAY = 24 * 60 * MINUTE;
+const HOUR = 60 * MINUTE;
+const DAY = 24 * HOUR;
 
-/** How long a delivery id is remembered. Longer than the 3 days in which GitHub can redeliver it. */
+/** How long a delivery's id and body hash are remembered. Longer than the 3 days in which GitHub can redeliver it. */
 export const DELIVERY_RETENTION_MS = 7 * DAY;
 /** A queued item older than this is dropped. A review is derived from the current head anyway. */
 export const QUEUED_MAX_AGE_MS = DAY;
@@ -34,8 +35,12 @@ export const RUNNING_RUN_TIMEOUT_MS = 40 * MINUTE;
 export const RUN_DEADLINE_MS = 75 * MINUTE;
 /** A dispatch answered without a run id fails once no matching run turned up in this time. */
 export const RUN_LOOKUP_TIMEOUT_MS = 10 * MINUTE;
-/** Stops a comment loop from starting runs without end. */
+/** Per lane, stops a comment loop from starting runs without end. */
 export const DISPATCHES_PER_HOUR = 30;
+/** Per lane, for work from people outside the repository. It is counted apart, so they cannot use up the cap above. */
+export const UNTRUSTED_DISPATCHES_PER_HOUR = 5;
+/** A token is minted again once it expires within this time. */
+const TOKEN_EXPIRY_MARGIN_MS = 5 * MINUTE;
 const NOT_STARTED = new Set(['queued', 'requested', 'waiting', 'pending']);
 
 export type WorkStatus = 'queued' | 'dispatching' | 'running' | 'done' | 'failed' | 'timed_out' | 'dropped' | 'skipped';
@@ -62,6 +67,14 @@ export interface WorkRow extends Record<string, string | number | null> {
   conclusion: string | null;
   /** Consecutive failed starts or polls, which set how long the next try waits. */
   errors: number;
+  /** 1 when a repository user caused the work, 0 for a comment by anyone else. */
+  trusted: number;
+}
+
+/** A delivery's id and the SHA-256 of its raw body. A delivery is a replay when either was seen before. */
+export interface Delivery {
+  id: string;
+  bodyHash: string;
 }
 
 export type ReceiveResult = { accepted: false; reason: string } | { accepted: true; effect: string };
@@ -93,6 +106,7 @@ export const MIGRATIONS = [
    ALTER TABLE work ADD COLUMN conclusion TEXT;
    ALTER TABLE work ADD COLUMN errors INTEGER NOT NULL DEFAULT 0;
    CREATE INDEX work_by_run ON work (run_id);`,
+  `ALTER TABLE work ADD COLUMN trusted INTEGER NOT NULL DEFAULT 1;`,
 ];
 
 const ACTIVE = `status IN ('dispatching', 'running')`;
@@ -115,6 +129,8 @@ export class PrCoordinator extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   /** The opt-in read in flight, shared by both lanes of one alarm pass. */
   private optInRead: Promise<OptIn> | null = null;
+  /** Tokens minted by this instance, by repository and permissions. Kept in memory only, so no token is stored. */
+  private readonly tokens = new Map<string, { token: string; expiresAt: number }>();
 
   /** Whether this instance created or upgraded its tables. They are created on first use, not in the constructor. */
   private schemaReady = false;
@@ -160,37 +176,44 @@ export class PrCoordinator extends DurableObject<Env> {
     return target ? { repo: `${target.owner}/${target.repo}`, pr: target.number } : {};
   }
 
-  /** Records a routed delivery and queues its work. A delivery id seen before is refused, which stops replays. */
-  async receive(delivery: string, route: Extract<Route, { type: 'work' | 'close' }>): Promise<ReceiveResult> {
+  /** Whether the delivery's id or body was seen before. The id header is not signed, so a captured body can come back under a new id. */
+  private isReplay(delivery: Delivery): boolean {
+    return this.sql.exec('SELECT 1 FROM deliveries WHERE id IN (?, ?)', delivery.id, `sha256:${delivery.bodyHash}`).toArray().length > 0;
+  }
+
+  private remember(delivery: Delivery, now: number): void {
+    this.sql.exec('INSERT INTO deliveries (id, received_at) VALUES (?, ?), (?, ?)', delivery.id, now, `sha256:${delivery.bodyHash}`, now);
+  }
+
+  /** Records a routed delivery and queues its work. A delivery whose id or body was seen before is refused. */
+  async receive(delivery: Delivery, route: Extract<Route, { type: 'work' | 'close' }>): Promise<ReceiveResult> {
     this.ensureSchema();
     const now = Date.now();
     const result = this.ctx.storage.transactionSync((): ReceiveResult => {
       this.sql.exec('DELETE FROM deliveries WHERE received_at < ?', now - DELIVERY_RETENTION_MS);
-      if (this.sql.exec('SELECT 1 FROM deliveries WHERE id = ?', delivery).toArray().length > 0) {
-        return { accepted: false, reason: 'duplicate delivery' };
-      }
-      this.sql.exec('INSERT INTO deliveries (id, received_at) VALUES (?, ?)', delivery, now);
+      if (this.isReplay(delivery)) return { accepted: false, reason: 'duplicate delivery' };
+      this.remember(delivery, now);
       this.setMeta('target', route.target);
 
       if (route.type === 'close') {
         const dropped = this.sql.exec(
           `UPDATE work SET status = 'dropped', note = 'pull request closed' WHERE status IN ('queued', 'dispatching') RETURNING id`,
         ).toArray().length;
-        const merged = route.merged ? `, queued ${this.insert(route.merged, delivery, now)}` : '';
+        const merged = route.merged ? `, queued ${this.insert(route.merged, delivery.id, now)}` : '';
         return { accepted: true, effect: `closed, dropped ${dropped}${merged}` };
       }
-      return { accepted: true, effect: this.enqueue(route.work, delivery, now) };
+      return { accepted: true, effect: this.enqueue(route.work, delivery.id, now) };
     });
-    log('coordinator_receive', { ...this.logFields(), delivery, ...result });
+    log('coordinator_receive', { ...this.logFields(), delivery: delivery.id, ...result });
     if (result.accepted) await this.ctx.storage.setAlarm(now);
     return result;
   }
 
   private insert(work: Work, delivery: string, now: number): string {
     const id = this.sql.exec<{ id: number }>(
-      `INSERT INTO work (lane, kind, event, head_sha, object_id, sender, delivery, enqueued_at, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued') RETURNING id`,
-      work.lane, work.kind, work.event, work.headSha, work.objectId, work.sender, delivery, now,
+      `INSERT INTO work (lane, kind, event, head_sha, object_id, sender, delivery, enqueued_at, status, trusted)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?) RETURNING id`,
+      work.lane, work.kind, work.event, work.headSha, work.objectId, work.sender, delivery, now, Number(work.trusted),
     ).one().id;
     return `work ${id}`;
   }
@@ -204,8 +227,22 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /** Queues `work`, merging it with what is already queued where one run covers both. */
   private enqueue(work: Work, delivery: string, now: number): string {
+    if (work.event === 'issue_comment.edited' && work.objectId !== null) {
+      // The run reads the comment as it is then, so one queued item covers every edit of the comment.
+      const [same] = this.sql.exec<{ id: number }>(
+        `SELECT id FROM work WHERE status = 'queued' AND lane = ? AND kind = ? AND object_id = ? AND trusted = ? AND event LIKE 'issue_comment.%'`,
+        work.lane, work.kind, work.objectId, Number(work.trusted),
+      ).toArray();
+      if (same) {
+        this.sql.exec('UPDATE work SET event = ?, sender = ?, delivery = ? WHERE id = ?', work.event, work.sender, delivery, same.id);
+        return `merged into work ${same.id}`;
+      }
+    }
+
     if (work.kind === 'review') {
-      const review = this.queued('state', ['review']).at(-1);
+      // A request by someone outside the repository can neither take over a push review nor take on its head.
+      if (!work.trusted) return `queued ${this.insert(work, delivery, now)}`;
+      const review = this.queued('state', ['review']).filter((row) => row.trusted).at(-1);
       if (!review) return `queued ${this.insert(work, delivery, now)}`;
       const isPush = work.event.startsWith('pull_request.');
       const queuedPush = review.event.startsWith('pull_request.');
@@ -286,18 +323,17 @@ export class PrCoordinator extends DurableObject<Env> {
         const running = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'running'`, lane).toArray()[0];
         if (running && (running.check_at ?? 0) <= now) await this.poll(running);
         if (this.sql.exec(`SELECT 1 FROM work WHERE lane = ? AND ${ACTIVE}`, lane).toArray().length > 0) return;
-        const next = this.sql.exec<WorkRow>(
-          `SELECT * FROM work WHERE lane = ? AND status = 'queued' ORDER BY id LIMIT 1`, lane,
-        ).toArray()[0];
-        if (next) await this.start(next);
+        const next = this.nextQueued(lane);
+        // A queued item's `check_at` holds it until the dispatch cap allows another run.
+        if (next && (next.check_at ?? 0) <= now) await this.start(next);
       } catch (error) {
         log('coordinator_lane_error', { ...this.logFields(), lane, error: String(error) });
       }
     }));
   }
 
-  private hasQueued(lane: Lane): boolean {
-    return this.sql.exec(`SELECT 1 FROM work WHERE lane = ? AND status = 'queued' LIMIT 1`, lane).toArray().length > 0;
+  private nextQueued(lane: Lane): WorkRow | undefined {
+    return this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'queued' ORDER BY id LIMIT 1`, lane).toArray()[0];
   }
 
   private row(id: number): WorkRow | undefined {
@@ -322,10 +358,20 @@ export class PrCoordinator extends DurableObject<Env> {
     return target;
   }
 
-  /** Mints a token for this repository alone. Returns null when GitHub refuses, which it does for an ungranted permission. */
-  private async token(permissions: Permissions): Promise<string | null> {
+  /** Mints a token for this repository alone, or reuses one this instance minted that is not about to expire. */
+  private async mint(permissions: Permissions): Promise<MintResult> {
     const target = this.target();
+    const key = JSON.stringify([target.installationId, target.repositoryId, Object.entries(permissions).sort()]);
+    const cached = this.tokens.get(key);
+    if (cached && cached.expiresAt - TOKEN_EXPIRY_MARGIN_MS > Date.now()) return { ok: true, ...cached };
     const mint = await mintRepositoryToken(this.env, target.installationId, target.repositoryId, permissions);
+    if (mint.ok) this.tokens.set(key, { token: mint.token, expiresAt: mint.expiresAt });
+    return mint;
+  }
+
+  /** Returns a token for this repository alone. Returns null when GitHub refuses, which it does for an ungranted permission. */
+  private async token(permissions: Permissions): Promise<string | null> {
+    const mint = await this.mint(permissions);
     if (mint.ok) return mint.token;
     log('coordinator_token_refused', { ...this.logFields(), permissions, status: mint.status, message: mint.message });
     return null;
@@ -346,13 +392,7 @@ export class PrCoordinator extends DurableObject<Env> {
         this.finish(item.id, 'skipped', `not opted in: ${optIn.reason}`);
         return;
       }
-      const recent = this.sql.exec<{ count: number }>(
-        'SELECT COUNT(*) AS count FROM work WHERE dispatched_at > ?', Date.now() - 60 * MINUTE,
-      ).one().count;
-      if (recent >= DISPATCHES_PER_HOUR) {
-        this.finish(item.id, 'dropped', `over ${DISPATCHES_PER_HOUR} dispatches in the last hour`);
-        return;
-      }
+      if (this.capped(item)) return;
       await this.dispatch(item);
     } catch (error) {
       // The lease runs out after the backoff, and the next pass takes the item again.
@@ -362,6 +402,29 @@ export class PrCoordinator extends DurableObject<Env> {
       );
       log('coordinator_start_error', { ...this.logFields(), work_id: item.id, error: String(error) });
     }
+  }
+
+  /**
+   * Applies the hourly dispatch cap of the item's lane, counted apart for trusted and untrusted work. A trusted
+   * review or merge over the cap is held until the hour allows another run. Any other item is dropped. Returns
+   * whether the item was held or dropped.
+   */
+  private capped(item: WorkRow): boolean {
+    const cap = item.trusted ? DISPATCHES_PER_HOUR : UNTRUSTED_DISPATCHES_PER_HOUR;
+    const recent = this.sql.exec<{ at: number }>(
+      'SELECT dispatched_at AS at FROM work WHERE lane = ? AND trusted = ? AND dispatched_at > ? ORDER BY dispatched_at DESC LIMIT ?',
+      item.lane, item.trusted, Date.now() - HOUR, cap,
+    ).toArray();
+    if (recent.length < cap) return false;
+    if (item.trusted && (item.kind === 'review' || item.kind === 'merged')) {
+      // The oldest of the newest `cap` runs leaving the hour is what brings the count under the cap.
+      const until = recent[cap - 1].at + HOUR;
+      this.sql.exec(`UPDATE work SET status = 'queued', lease_until = NULL, check_at = ? WHERE id = ?`, until, item.id);
+      log('coordinator_held', { ...this.logFields(), work_id: item.id, until, note: `over ${cap} dispatches in the last hour` });
+    } else {
+      this.finish(item.id, 'dropped', `over ${cap} dispatches in the last hour`);
+    }
+    return true;
   }
 
   private describe(item: WorkRow): Record<string, unknown> {
@@ -566,24 +629,22 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /** Ends the item whose run finished, from the `workflow_run` webhook, and frees its lane. */
-  async runCompleted(delivery: string, runId: number, conclusion: string | null): Promise<ReceiveResult> {
+  async runCompleted(delivery: Delivery, runId: number, conclusion: string | null): Promise<ReceiveResult> {
     if (!this.hasState()) {
-      log('coordinator_run_completed', { delivery, run_id: runId, accepted: false, reason: 'no coordinator state' });
+      log('coordinator_run_completed', { delivery: delivery.id, run_id: runId, accepted: false, reason: 'no coordinator state' });
       return { accepted: false, reason: 'no coordinator state' };
     }
     this.ensureSchema();
     const now = Date.now();
     const result = this.ctx.storage.transactionSync((): ReceiveResult => {
-      if (this.sql.exec('SELECT 1 FROM deliveries WHERE id = ?', delivery).toArray().length > 0) {
-        return { accepted: false, reason: 'duplicate delivery' };
-      }
+      if (this.isReplay(delivery)) return { accepted: false, reason: 'duplicate delivery' };
       const [item] = this.sql.exec<{ id: number }>(`SELECT id FROM work WHERE run_id = ? AND status = 'running'`, runId).toArray();
       if (!item) return { accepted: false, reason: `no running item for run ${runId}` };
-      this.sql.exec('INSERT INTO deliveries (id, received_at) VALUES (?, ?)', delivery, now);
+      this.remember(delivery, now);
       this.finish(item.id, 'done', 'run completed', conclusion);
       return { accepted: true, effect: `finished work ${item.id}` };
     });
-    log('coordinator_run_completed', { ...this.logFields(), delivery, run_id: runId, conclusion, ...result });
+    log('coordinator_run_completed', { ...this.logFields(), delivery: delivery.id, run_id: runId, conclusion, ...result });
     if (result.accepted) await this.ctx.storage.setAlarm(now);
     return result;
   }
@@ -601,10 +662,11 @@ export class PrCoordinator extends DurableObject<Env> {
   private async readOptIn(): Promise<OptIn> {
     const target = this.getMeta<Target>('target');
     if (!target) return { optedIn: false, reason: 'no target recorded' };
-    const mint = await mintRepositoryToken(this.env, target.installationId, target.repositoryId, { contents: 'read', metadata: 'read' });
+    const mint = await this.mint({ contents: 'read', metadata: 'read' });
     const optIn = mint.ok
       ? await readOptIn(mint.token, target)
       : { optedIn: false, reason: `token mint refused with ${mint.status}` };
+    log('coordinator_opt_in', { ...this.logFields(), opted_in: optIn.optedIn, reason: optIn.reason });
     this.setMeta('opt_in', { ...optIn, expires: Date.now() + OPT_IN_TTL_MS });
     return optIn;
   }
@@ -616,8 +678,9 @@ export class PrCoordinator extends DurableObject<Env> {
       const active = this.sql.exec<{ at: number | null }>(
         `SELECT COALESCE(lease_until, check_at) AS at FROM work WHERE lane = ? AND ${ACTIVE}`, lane,
       ).toArray()[0];
+      const next = active ? undefined : this.nextQueued(lane);
       if (active?.at) times.push(active.at);
-      else if (!active && this.hasQueued(lane)) times.push(now);
+      else if (next) times.push(next.check_at ?? now);
     }
     const newest = this.sql.exec<{ at: number | null }>('SELECT MAX(received_at) AS at FROM deliveries').one().at;
     if (newest !== null) times.push(newest + DELIVERY_RETENTION_MS);

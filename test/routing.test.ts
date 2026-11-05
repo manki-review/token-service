@@ -176,6 +176,25 @@ describe('routeDelivery', () => {
     expect(route.type === 'work' && route.work).toMatchObject(expected);
   });
 
+  it.each<[string, string, WebhookPayload, boolean]>([
+    ['a push', 'pull_request', pullRequestEvent('synchronize'), true],
+    ['a review', 'pull_request_review', reviewEvent('submitted'), true],
+    ...['OWNER', 'MEMBER', 'COLLABORATOR', 'CONTRIBUTOR'].map((association): [string, string, WebhookPayload, boolean] =>
+      [`a review request by a ${association}`, 'issue_comment', issueCommentEvent('@manki review', { association }), true]),
+    ['a review request by a first-time contributor', 'issue_comment', issueCommentEvent('@manki review', { association: 'FIRST_TIME_CONTRIBUTOR' }), false],
+    ['a review request by an outsider', 'issue_comment', issueCommentEvent('@manki review', { association: 'NONE' }), false],
+    ['a review request without an association', 'issue_comment', { ...issueCommentEvent('@manki review'), comment: { id: COMMENT_ID, body: '@manki review' } }, false],
+    ['a review request by the PR author', 'issue_comment', issueCommentEvent('@manki review', { association: 'NONE', issueAuthor: 'Alice' }), true],
+    ['an outsider\'s question', 'issue_comment', issueCommentEvent('@manki explain', { association: 'NONE' }), false],
+    ['a Force review tick', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { action: 'edited', author: MANKI_AUTHOR, association: 'NONE' }), true],
+    ['a tick on an outsider\'s comment', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { action: 'edited', association: 'NONE' }), false],
+    ['a thread reply by an outsider', 'pull_request_review_comment', reviewCommentEvent('ok', { in_reply_to_id: 1, author_association: 'NONE' }), false],
+    ['a thread reply by the PR author', 'pull_request_review_comment', reviewCommentEvent('ok', { in_reply_to_id: 1, author_association: 'NONE' }, 'created', { user: { login: 'alice', type: 'User' } }), true],
+  ])('marks %s as trusted or not', (_case, event, payload, trusted) => {
+    const route = routeDelivery(event, payload);
+    expect(route.type === 'work' && route.work.trusted).toBe(trusted);
+  });
+
   it('fills the merge work and the run end', () => {
     expect(routeDelivery('pull_request', pullRequestEvent('closed', { merged: true }))).toMatchObject({
       type: 'close',

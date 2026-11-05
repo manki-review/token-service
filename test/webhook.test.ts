@@ -94,6 +94,18 @@ describe('/webhook', () => {
     expect(await workRows(coordinator(REPOSITORY_ID, 31))).toHaveLength(1);
   });
 
+  it('refuses a body it has seen under a new delivery id', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const payload = issueCommentEvent('@manki explain', { number: 34 });
+    expect((await postWebhook({ event: 'issue_comment', payload })).status).toBe(202);
+    expect((await postWebhook({ event: 'issue_comment', payload })).status).toBe(202);
+    expect(logged(log).filter((line) => line.msg === 'coordinator_receive')).toMatchObject([
+      { accepted: true },
+      { accepted: false, reason: 'duplicate delivery' },
+    ]);
+    expect(await workRows(coordinator(REPOSITORY_ID, 34))).toHaveLength(1);
+  });
+
   it('answers 500 when the coordinator cannot store the delivery, so GitHub records a failure', async () => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
     const failing = { getByName: () => ({ receive: async () => { throw new Error('storage unavailable'); } }) };
