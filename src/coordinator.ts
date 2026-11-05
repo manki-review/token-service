@@ -13,6 +13,8 @@ export const DELIVERY_RETENTION_MS = 7 * DAY;
 /** A queued item older than this is dropped. A review is derived from the current head anyway. */
 export const QUEUED_MAX_AGE_MS = DAY;
 export const OPT_IN_TTL_MS = 5 * MINUTE;
+/** How long a finished, skipped or dropped item stays, for the logs and the tests to read. */
+export const FINISHED_RETENTION_MS = 7 * DAY;
 /** How long an alarm may hold an item in `dispatching` before another pass takes it back. */
 const LEASE_MS = 5 * MINUTE;
 const RETRY_MS = MINUTE;
@@ -112,7 +114,7 @@ export class PrCoordinator extends DurableObject<Env> {
 
       if (route.type === 'close') {
         const dropped = this.sql.exec(
-          `UPDATE work SET status = 'dropped', note = 'pull request closed' WHERE status = 'queued' RETURNING id`,
+          `UPDATE work SET status = 'dropped', note = 'pull request closed' WHERE status IN ('queued', 'dispatching') RETURNING id`,
         ).toArray().length;
         const merged = route.merged ? `, queued ${this.insert(route.merged, delivery, now)}` : '';
         return { accepted: true, effect: `closed, dropped ${dropped}${merged}` };
@@ -143,31 +145,41 @@ export class PrCoordinator extends DurableObject<Env> {
   /** Queues `work`, merging it with what is already queued where one run covers both. */
   private enqueue(work: Work, delivery: string, now: number): string {
     if (work.kind === 'review') {
-      const [review] = this.queued('state', ['review']);
+      const review = this.queued('state', ['review']).at(-1);
       if (!review) return `queued ${this.insert(work, delivery, now)}`;
-      if (work.event.startsWith('pull_request.') && !review.event.startsWith('pull_request.')) {
+      const isPush = work.event.startsWith('pull_request.');
+      const queuedPush = review.event.startsWith('pull_request.');
+      if (isPush && queuedPush) {
+        this.sql.exec(
+          'UPDATE work SET event = ?, head_sha = ?, sender = ?, delivery = ?, enqueued_at = ? WHERE id = ?',
+          work.event, work.headSha, work.sender, delivery, now, review.id,
+        );
+      } else if (isPush) {
         // A comment-triggered review keeps its trigger and reviews the newest head.
-        this.sql.exec('UPDATE work SET head_sha = ? WHERE id = ?', work.headSha, review.id);
-      } else {
+        this.sql.exec('UPDATE work SET head_sha = ?, enqueued_at = ? WHERE id = ?', work.headSha, now, review.id);
+      } else if (queuedPush) {
+        // A review request takes over the queued push review and keeps its place.
         this.sql.exec(
           'UPDATE work SET event = ?, head_sha = COALESCE(?, head_sha), object_id = ?, sender = ?, delivery = ? WHERE id = ?',
           work.event, work.headSha, work.objectId, work.sender, delivery, review.id,
         );
+      } else {
+        // Each review request or tick is answered on its own, so one never hides another.
+        return `queued ${this.insert(work, delivery, now)}`;
       }
       return `merged into work ${review.id}`;
     }
 
     if (work.kind === 'review_state') {
-      // A queued thread reply or state check already ends with the same auto-approve check.
-      const [covered] = this.queued('state', ['thread', 'review_state']);
-      if (covered) return `covered by work ${covered.id}`;
-    }
-
-    if (work.lane === 'state' && work.kind === 'thread') {
-      this.sql.exec(
-        `UPDATE work SET status = 'dropped', note = 'covered by a later thread reply'
-         WHERE lane = 'state' AND status = 'queued' AND kind = 'review_state'`,
-      );
+      // The check reads the PR when it runs, so one queued check covers every review submitted before it starts.
+      const [check] = this.queued('state', ['review_state']);
+      if (check) {
+        this.sql.exec(
+          'UPDATE work SET head_sha = ?, object_id = ?, sender = ?, delivery = ? WHERE id = ?',
+          work.headSha, work.objectId, work.sender, delivery, check.id,
+        );
+        return `merged into work ${check.id}`;
+      }
     }
     return `queued ${this.insert(work, delivery, now)}`;
   }
@@ -189,11 +201,17 @@ export class PrCoordinator extends DurableObject<Env> {
     if (pending || (newest !== null && Date.now() - newest < DELIVERY_RETENTION_MS)) return false;
     log('coordinator_deleted', this.logFields());
     await this.ctx.storage.deleteAll();
+    // The object can stay in memory after `deleteAll()`, so its tables must exist again for the next delivery.
+    this.migrate();
     return true;
   }
 
   private async advance(): Promise<void> {
     const now = Date.now();
+    this.sql.exec(
+      `DELETE FROM work WHERE status NOT IN ('queued', 'dispatching', 'running') AND enqueued_at < ?`,
+      now - FINISHED_RETENTION_MS,
+    );
     this.sql.exec(
       `UPDATE work SET status = 'dropped', note = 'queued too long' WHERE status = 'queued' AND enqueued_at < ?`,
       now - QUEUED_MAX_AGE_MS,

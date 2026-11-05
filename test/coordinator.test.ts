@@ -1,6 +1,6 @@
 import { runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { DELIVERY_RETENTION_MS, OPT_IN_TTL_MS, QUEUED_MAX_AGE_MS } from '../src/coordinator';
+import { DELIVERY_RETENTION_MS, FINISHED_RETENTION_MS, OPT_IN_TTL_MS, QUEUED_MAX_AGE_MS } from '../src/coordinator';
 import { routeDelivery, type WebhookPayload } from '../src/routing';
 import { apiRequests, coordinator, freezeClock, type GitHubStub, INSTALLATION_ID, stubGitHub, workRows } from './helpers';
 import {
@@ -17,6 +17,7 @@ import {
 const SHA_1 = '1'.repeat(40);
 const SHA_2 = '2'.repeat(40);
 const SHA_3 = '3'.repeat(40);
+const MINUTE = 60_000;
 
 const OPTED_IN: GitHubStub = { api: { 'POST /graphql': workflowsReply({ 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML }) } };
 
@@ -105,22 +106,44 @@ describe('PrCoordinator.receive', () => {
     ]);
   });
 
-  it('skips a review state check that a queued reply already covers', async () => {
+  it('keeps a review state check queued behind a thread reply', async () => {
     const pr = pullRequest();
     await pr.send('pull_request_review_comment', pr.reply('Fixed'));
-    expect(await pr.send('pull_request_review', pr.review())).toEqual({ accepted: true, effect: 'covered by work 1' });
-    expect(await workRows(pr.stub)).toHaveLength(1);
+    await pr.send('pull_request_review', pr.review());
+    await pr.send('pull_request_review_comment', pr.reply('Agreed'));
+    expect((await workRows(pr.stub)).map((row) => `${row.kind}:${row.status}`)).toEqual(['thread:queued', 'review_state:queued', 'thread:queued']);
   });
 
-  it('drops a queued review state check when a thread reply follows', async () => {
+  it('merges review state checks into the queued one, which runs for the newest review', async () => {
     const pr = pullRequest();
     await pr.send('pull_request_review', pr.review());
-    expect(await pr.send('pull_request_review', pr.review())).toEqual({ accepted: true, effect: 'covered by work 1' });
-    await pr.send('pull_request_review_comment', pr.reply('Fixed'));
+    expect(await pr.send('pull_request_review', { ...pr.review(), review: { ...pr.review().review, id: 3003 } }, 'd-newest'))
+      .toEqual({ accepted: true, effect: 'merged into work 1' });
+    expect(await workRows(pr.stub)).toMatchObject([{ kind: 'review_state', object_id: 3003, sender: 'alice', delivery: 'd-newest' }]);
+  });
+
+  it('queues each review request on its own once the push review became one', async () => {
+    const pr = pullRequest();
+    await pr.send('pull_request', pr.push(SHA_1));
+    await pr.send('issue_comment', pr.comment('@manki review'));
+    expect(await pr.send('issue_comment', { ...pr.comment('@manki review again'), comment: { id: 1002, body: '@manki review again', user: { login: 'bob', type: 'User' } } }))
+      .toEqual({ accepted: true, effect: 'queued work 2' });
+    await pr.send('pull_request', pr.push(SHA_2));
     expect(await workRows(pr.stub)).toMatchObject([
-      { kind: 'review_state', status: 'dropped', note: 'covered by a later thread reply' },
-      { kind: 'thread', status: 'queued' },
+      { id: 1, event: 'issue_comment.created', object_id: 1001, head_sha: SHA_1 },
+      { id: 2, event: 'issue_comment.created', object_id: 1002, head_sha: SHA_2 },
     ]);
+  });
+
+  it('restarts the age of a queued review on every push', async () => {
+    stubGitHub(OPTED_IN);
+    const pr = pullRequest();
+    await pr.send('pull_request', pr.push(SHA_1));
+    advanceClock(QUEUED_MAX_AGE_MS - MINUTE);
+    await pr.send('pull_request', pr.push(SHA_2));
+    advanceClock(2 * MINUTE);
+    await runDurableObjectAlarm(pr.stub);
+    expect(await workRows(pr.stub)).toMatchObject([{ head_sha: SHA_2, status: 'skipped' }]);
   });
 
   it('drops queued work on a merge and queues the fix rate run', async () => {
@@ -223,6 +246,53 @@ describe('PrCoordinator.alarm', () => {
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped' }]);
   });
 
+  it('starts nothing else in a lane while an item there is dispatching', async () => {
+    stubGitHub({ api: { 'POST /graphql': { status: 502, body: {} } } });
+    const pr = pullRequest();
+    await pr.send('pull_request', pr.push(SHA_1));
+    await pr.send('pull_request_review_comment', pr.reply('Fixed'));
+    await runDurableObjectAlarm(pr.stub);
+    advanceClock(30_000);
+    await runDurableObjectAlarm(pr.stub);
+    expect((await workRows(pr.stub)).map((row) => row.status)).toEqual(['dispatching', 'queued']);
+  });
+
+  it('drops an item that a close lands on while the alarm waits for GitHub', async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    stubGitHub({
+      api: {
+        'POST /graphql': async () => {
+          await held;
+          return Response.json(workflowsReply({ 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML }).body);
+        },
+      },
+    });
+    const pr = pullRequest();
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    const alarm = runDurableObjectAlarm(pr.stub);
+    await vi.waitFor(async () => expect((await workRows(pr.stub))[0].status).toBe('dispatching'));
+    expect(await pr.send('pull_request', pr.close(false))).toEqual({ accepted: true, effect: 'closed, dropped 1' });
+    release();
+    await alarm;
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'dropped', note: 'pull request closed' }]);
+    expect(logged(log, 'coordinator_would_dispatch')).toEqual([]);
+  });
+
+  it('deletes finished items after a week', async () => {
+    stubGitHub(OPTED_IN);
+    const pr = pullRequest();
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    await runDurableObjectAlarm(pr.stub);
+    advanceClock(FINISHED_RETENTION_MS - MINUTE);
+    await pr.send('issue_comment', pr.comment('@manki help'));
+    advanceClock(2 * MINUTE);
+    await runDurableObjectAlarm(pr.stub);
+    expect((await workRows(pr.stub)).map((row) => row.id)).toEqual([2]);
+  });
+
   it('drops work that stayed queued for more than a day', async () => {
     stubGitHub(OPTED_IN);
     const pr = pullRequest();
@@ -243,10 +313,11 @@ describe('PrCoordinator.alarm', () => {
 
     advanceClock(DELIVERY_RETENTION_MS);
     await runDurableObjectAlarm(pr.stub);
-    expect(await runInDurableObject(pr.stub, (_instance, state) => [
-      state.storage.sql.exec('SELECT name FROM sqlite_master WHERE type = ?', 'table').toArray().length,
-    ])).toEqual([0]);
+    expect(await workRows(pr.stub)).toEqual([]);
     expect(await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm())).toBeNull();
     expect(logged(log, 'coordinator_deleted')).toHaveLength(1);
+
+    // The same instance keeps working after the cleanup.
+    expect(await pr.send('pull_request', pr.push(SHA_2))).toEqual({ accepted: true, effect: 'queued work 1' });
   });
 });

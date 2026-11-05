@@ -94,6 +94,14 @@ describe('/webhook', () => {
     expect(await workRows(coordinator(REPOSITORY_ID, 31))).toHaveLength(1);
   });
 
+  it('answers 500 when the coordinator cannot store the delivery, so GitHub records a failure', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const failing = { getByName: () => ({ receive: async () => { throw new Error('storage unavailable'); } }) };
+    const env = { ...TEST_ENV, PR_COORDINATOR: failing as unknown as typeof TEST_ENV.PR_COORDINATOR };
+    const response = await postWebhook({ event: 'pull_request', payload: pullRequestEvent('synchronize'), env });
+    expect(response.status).toBe(500);
+  });
+
   it('leaves the coordinator alone for an ignored delivery', async () => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
     expect((await postWebhook({ event: 'issue_comment', payload: issueCommentEvent('LGTM', { number: 32 }) })).status).toBe(202);
