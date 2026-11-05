@@ -382,7 +382,9 @@ export class PrCoordinator extends DurableObject<Env> {
       log('coordinator_dispatch_error', { ...this.logFields(), work_id: item.id, attempts, error: String(error) });
     }
     const latest = this.row(item.id);
-    if (latest?.status !== 'dispatching') return;
+    // A run that started is tracked even when a close dropped the item meanwhile, so the lane waits for it.
+    const started = response?.status === 200 || response?.status === 204;
+    if (!latest || (latest.status !== 'dispatching' && !started)) return;
 
     if (response?.status === 200) {
       const { workflow_run_id } = await response.json() as { workflow_run_id?: number };

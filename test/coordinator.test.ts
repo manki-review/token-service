@@ -510,6 +510,34 @@ describe('PrCoordinator dispatch', () => {
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'done', conclusion: 'failure' }]);
   });
 
+  it('tracks a run that started while a close dropped its item', async () => {
+    const pr = pullRequest();
+    fakeGitHub(pr.number);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let dispatching = false;
+    const fake = vi.mocked(globalThis.fetch).getMockImplementation()!;
+    vi.mocked(globalThis.fetch).mockImplementation(async (input, init) => {
+      if (new Request(input, init).url.endsWith('/dispatches')) {
+        dispatching = true;
+        await held;
+      }
+      return fake(input, init);
+    });
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    const alarm = runDurableObjectAlarm(pr.stub);
+    await vi.waitFor(() => expect(dispatching).toBe(true));
+    await pr.send('pull_request', pr.close(true));
+    release();
+    await alarm;
+    expect(await workRows(pr.stub)).toMatchObject([
+      { kind: 'comment', status: 'running', run_id: 9000 },
+      { kind: 'merged', status: 'queued' },
+    ]);
+  });
+
   it('queues a review of a new head pushed while a review runs', async () => {
     const pr = pullRequest();
     fakeGitHub(pr.number);
