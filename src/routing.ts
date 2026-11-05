@@ -53,6 +53,11 @@ export interface Work {
   /** The comment or review id, when the event is about one. */
   objectId: number | null;
   sender: string;
+  /**
+   * Whether a repository user caused the work. Only a comment or a review can come from someone else, and only a
+   * trusted comment may merge with a push review.
+   */
+  trusted: boolean;
 }
 
 export type Route =
@@ -68,6 +73,7 @@ interface User {
 
 interface PullRequest {
   number?: number;
+  user?: User;
   draft?: boolean;
   merged?: boolean;
   state?: string;
@@ -80,9 +86,17 @@ export interface WebhookPayload {
   installation?: { id?: number };
   repository?: { id?: number; name?: string; full_name?: string; default_branch?: string; owner?: { login?: string } };
   pull_request?: PullRequest;
-  issue?: { number?: number; pull_request?: unknown };
-  comment?: { id?: number; body?: string; user?: User; in_reply_to_id?: number; created_at?: string; updated_at?: string };
-  review?: { id?: number; commit_id?: string; user?: User };
+  issue?: { number?: number; pull_request?: unknown; user?: User };
+  comment?: {
+    id?: number;
+    body?: string;
+    user?: User;
+    author_association?: string;
+    in_reply_to_id?: number;
+    created_at?: string;
+    updated_at?: string;
+  };
+  review?: { id?: number; commit_id?: string; user?: User; author_association?: string };
   workflow_run?: { id?: number; event?: string; path?: string; display_title?: string; conclusion?: string | null };
 }
 
@@ -114,6 +128,22 @@ function isForkHead(payload: WebhookPayload): boolean {
   return payload.pull_request?.head?.repo?.full_name !== payload.repository?.full_name;
 }
 
+/** The `author_association` values Manki's `isRepoUser` accepts. */
+const REPO_USER_ASSOCIATIONS = ['OWNER', 'MEMBER', 'COLLABORATOR', 'CONTRIBUTOR'];
+
+/**
+ * Whether a repository user caused the event, as Manki's `isLLMAccessAllowed` decides it: the comment's or review's
+ * author is one, or the sender wrote the pull request or issue. Any other event came from a repository user: a push
+ * takes write access, and only the PR author or a writer can resolve a thread.
+ */
+function isTrusted(payload: WebhookPayload): boolean {
+  const authored = payload.comment ?? payload.review;
+  if (!authored) return true;
+  if (REPO_USER_ASSOCIATIONS.includes(authored.author_association ?? '')) return true;
+  const author = (payload.issue?.user ?? payload.pull_request?.user)?.login?.toLowerCase();
+  return author !== undefined && payload.sender?.login?.toLowerCase() === author;
+}
+
 function work(lane: Lane, kind: WorkKind, payload: WebhookPayload, event: string, objectId: number | null = null): Work {
   return {
     lane,
@@ -122,6 +152,7 @@ function work(lane: Lane, kind: WorkKind, payload: WebhookPayload, event: string
     headSha: payload.pull_request?.head?.sha ?? null,
     objectId,
     sender: payload.sender?.login ?? '',
+    trusted: isTrusted(payload),
   };
 }
 
@@ -217,8 +248,11 @@ function routeIssueComment(target: Target, payload: WebhookPayload): Route {
   // Manki decides whether the comment's author is one of its identities. Only a tick on a comment by its default
   // logins becomes a review trigger. Any other tick queues on its own, so it cannot replace a queued push review.
   if (onPullRequest && action === 'edited' && detectTickedMarker(body) !== null) {
-    const kind = MANKI_LOGINS.includes(comment?.user?.login ?? '') ? 'review' : 'comment';
-    return { type: 'work', target, work: work('state', kind, payload, 'issue_comment', objectId) };
+    if (!MANKI_LOGINS.includes(comment?.user?.login ?? '')) {
+      return { type: 'work', target, work: work('state', 'comment', payload, 'issue_comment', objectId) };
+    }
+    // The association is that of Manki's comment. Editing someone else's comment takes write access, so the tick is trusted.
+    return { type: 'work', target, work: { ...work('state', 'review', payload, 'issue_comment', objectId), trusted: true } };
   }
 
   // An edit that keeps an earlier mention is forwarded too. Manki's eyes reaction check skips one it answered.

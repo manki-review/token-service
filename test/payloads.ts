@@ -37,7 +37,7 @@ export function reviewEvent(action: string, review: Record<string, unknown> = {}
   return {
     ...base(action),
     pull_request: pullRequest(pr),
-    review: { id: REVIEW_ID, commit_id: HEAD_SHA, user: HUMAN, ...review },
+    review: { id: REVIEW_ID, commit_id: HEAD_SHA, user: HUMAN, author_association: 'COLLABORATOR', ...review },
   };
 }
 
@@ -49,7 +49,7 @@ export function reviewCommentEvent(body: string, comment: Record<string, unknown
   return {
     ...base(action),
     pull_request: pullRequest(pr),
-    comment: { id: COMMENT_ID, body, user: HUMAN, ...comment },
+    comment: { id: COMMENT_ID, body, user: HUMAN, author_association: 'COLLABORATOR', ...comment },
   };
 }
 
@@ -60,14 +60,22 @@ export interface IssueCommentOptions {
   sender?: { login: string; type: string };
   previousBody?: string;
   number?: number;
+  /** The comment author's `author_association`, `COLLABORATOR` when left out. */
+  association?: string;
+  /** Who opened the pull request or issue. */
+  issueAuthor?: string;
 }
 
 export function issueCommentEvent(body: string, options: IssueCommentOptions = {}): WebhookPayload {
   return {
     ...base(options.action ?? 'created'),
     sender: options.sender ?? HUMAN,
-    issue: { number: options.number ?? PR_NUMBER, ...(options.onIssue ? {} : { pull_request: { url: 'https://api.github.com/x' } }) },
-    comment: { id: COMMENT_ID, body, user: options.author ?? HUMAN },
+    issue: {
+      number: options.number ?? PR_NUMBER,
+      user: { login: options.issueAuthor ?? 'carol', type: 'User' },
+      ...(options.onIssue ? {} : { pull_request: { url: 'https://api.github.com/x' } }),
+    },
+    comment: { id: COMMENT_ID, body, user: options.author ?? HUMAN, author_association: options.association ?? 'COLLABORATOR' },
     ...(options.previousBody === undefined ? {} : { changes: { body: { from: options.previousBody } } }),
   };
 }

@@ -13,6 +13,8 @@ import {
   RUN_DEADLINE_MS,
   RUN_LOOKUP_TIMEOUT_MS,
   RUNNING_RUN_TIMEOUT_MS,
+  type Delivery,
+  UNTRUSTED_DISPATCHES_PER_HOUR,
 } from '../src/coordinator';
 import { routeDelivery, type WebhookPayload } from '../src/routing';
 import {
@@ -49,6 +51,11 @@ const MINUTE = 60_000;
 
 const OPTED_IN: GitHubStub = { api: { 'POST /graphql': workflowsReply({ 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML }) } };
 
+/** A delivery key with a body hash of its own, since the tests send the same payload as different deliveries. */
+function key(id: string, bodyHash: string = crypto.randomUUID()): Delivery {
+  return { id, bodyHash };
+}
+
 // Storage outlives a single test, so each test works on its own PR number.
 let nextNumber = 100;
 
@@ -60,14 +67,16 @@ function pullRequest() {
     stub,
     push: (sha: string, action = 'synchronize') => pullRequestEvent(action, { number, head: { sha, repo: { full_name: 'manki-review/manki' } } }),
     comment: (body: string, action = 'created') => issueCommentEvent(body, { number, action }),
+    outsiderComment: (body: string, action = 'created') => issueCommentEvent(body, { number, action, association: 'NONE' }),
     review: () => reviewEvent('submitted', {}, { number }),
+    outsiderReview: (id = 3003) => reviewEvent('submitted', { id, author_association: 'NONE' }, { number }),
     resolve: (action = 'resolved') => reviewThreadEvent(action, { number }),
     reply: (body: string) => reviewCommentEvent(body, { in_reply_to_id: 1 }, 'created', { number }),
     close: (merged: boolean) => pullRequestEvent('closed', { number, merged }),
     async send(event: string, payload: WebhookPayload, delivery: string = crypto.randomUUID()) {
       const route = routeDelivery(event, payload);
       if (route.type !== 'work' && route.type !== 'close') throw new Error(`Route ${route.type} is not for the coordinator`);
-      return stub.receive(delivery, route);
+      return stub.receive(key(delivery), route);
     },
   };
 }
@@ -153,6 +162,19 @@ describe('PrCoordinator.receive', () => {
     expect(await workRows(pr.stub)).toMatchObject([{ kind: 'review_state', object_id: 3003, sender: 'alice', delivery: 'd-newest' }]);
   });
 
+  it('never lets an outsider\'s review replace a trusted review state trigger, and lets trusted work take over an outsider\'s', async () => {
+    const pr = pullRequest();
+    await pr.send('pull_request_review', pr.review(), 'd-trusted');
+    expect(await pr.send('pull_request_review', pr.outsiderReview())).toEqual({ accepted: true, effect: 'merged into work 1' });
+    expect(await workRows(pr.stub)).toMatchObject([{ object_id: 2002, delivery: 'd-trusted', trusted: 1 }]);
+
+    const other = pullRequest();
+    await other.send('pull_request_review', other.outsiderReview());
+    expect(await workRows(other.stub)).toMatchObject([{ trusted: 0 }]);
+    await other.send('pull_request_review_thread', other.resolve());
+    expect(await workRows(other.stub)).toMatchObject([{ event: 'pull_request_review.submitted', trusted: 1 }]);
+  });
+
   it('queues a thread change as a review state check that merges with the others', async () => {
     const pr = pullRequest();
     expect(await pr.send('pull_request_review_thread', pr.resolve(), 'd-thread')).toEqual({ accepted: true, effect: 'queued work 1' });
@@ -172,13 +194,56 @@ describe('PrCoordinator.receive', () => {
     const pr = pullRequest();
     await pr.send('pull_request', pr.push(SHA_1));
     await pr.send('issue_comment', pr.comment('@manki review'));
-    expect(await pr.send('issue_comment', { ...pr.comment('@manki review again'), comment: { id: 1002, body: '@manki review again', user: { login: 'bob', type: 'User' } } }))
+    expect(await pr.send('issue_comment', { ...pr.comment('@manki review again'), comment: { id: 1002, body: '@manki review again', user: { login: 'bob', type: 'User' }, author_association: 'MEMBER' } }))
       .toEqual({ accepted: true, effect: 'queued work 2' });
     await pr.send('pull_request', pr.push(SHA_2));
     expect(await workRows(pr.stub)).toMatchObject([
       { id: 1, event: 'issue_comment.created', object_id: 1001, head_sha: SHA_1 },
       { id: 2, event: 'issue_comment.created', object_id: 1002, head_sha: SHA_2 },
     ]);
+  });
+
+  it('queues an outsider\'s review request on its own, so it neither takes over nor joins a push review', async () => {
+    const pr = pullRequest();
+    await pr.send('pull_request', pr.push(SHA_1));
+    expect(await pr.send('issue_comment', pr.outsiderComment('@manki review'))).toEqual({ accepted: true, effect: 'queued work 2' });
+    expect(await pr.send('pull_request', pr.push(SHA_2))).toEqual({ accepted: true, effect: 'merged into work 1' });
+    expect(await workRows(pr.stub)).toMatchObject([
+      { id: 1, event: 'pull_request.synchronize', head_sha: SHA_2, trusted: 1 },
+      { id: 2, event: 'issue_comment.created', head_sha: null, trusted: 0 },
+    ]);
+
+    const other = pullRequest();
+    await other.send('issue_comment', other.outsiderComment('@manki review'));
+    expect(await other.send('pull_request', other.push(SHA_1))).toEqual({ accepted: true, effect: 'queued work 2' });
+    expect(await workRows(other.stub)).toMatchObject([
+      { id: 1, event: 'issue_comment.created', head_sha: null, trusted: 0 },
+      { id: 2, event: 'pull_request.synchronize', head_sha: SHA_1, trusted: 1 },
+    ]);
+  });
+
+  it('collapses the edits of one comment into its queued item', async () => {
+    const pr = pullRequest();
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    expect(await pr.send('issue_comment', pr.comment('@manki explain this', 'edited'), 'd-edit-1')).toEqual({ accepted: true, effect: 'merged into work 1' });
+    expect(await pr.send('issue_comment', pr.comment('@manki explain that', 'edited'), 'd-edit-2')).toEqual({ accepted: true, effect: 'merged into work 1' });
+    // An edit that turns the comment into another kind of work, or that comes from someone else, queues on its own.
+    expect(await pr.send('issue_comment', pr.comment('@manki review', 'edited'))).toEqual({ accepted: true, effect: 'queued work 2' });
+    expect(await pr.send('issue_comment', pr.outsiderComment('@manki explain', 'edited'))).toEqual({ accepted: true, effect: 'queued work 3' });
+    expect(await workRows(pr.stub)).toMatchObject([
+      { id: 1, kind: 'comment', event: 'issue_comment.edited', delivery: 'd-edit-2', trusted: 1 },
+      { id: 2, kind: 'review' },
+      { id: 3, kind: 'comment', trusted: 0 },
+    ]);
+  });
+
+  it('refuses a body it has seen under another delivery id', async () => {
+    const pr = pullRequest();
+    const route = routeDelivery('pull_request', pr.push(SHA_1));
+    if (route.type !== 'work') throw new Error('expected work');
+    expect(await pr.stub.receive(key('d-1', 'body'), route)).toMatchObject({ accepted: true });
+    expect(await pr.stub.receive(key('d-2', 'body'), route)).toEqual({ accepted: false, reason: 'duplicate delivery' });
+    expect(await workRows(pr.stub)).toHaveLength(1);
   });
 
   it('restarts the age of a queued comment-triggered review on a push', async () => {
@@ -557,9 +622,10 @@ describe('PrCoordinator dispatch', () => {
     fakeGitHub(pr.number);
     await pr.send('pull_request', pr.push(SHA_1));
     await runDurableObjectAlarm(pr.stub);
-    expect(await pr.stub.runCompleted('d-other', 1234, 'success')).toEqual({ accepted: false, reason: 'no running item for run 1234' });
-    expect(await pr.stub.runCompleted('d-end', 9000, 'failure')).toMatchObject({ accepted: true });
-    expect(await pr.stub.runCompleted('d-end', 9000, 'failure')).toEqual({ accepted: false, reason: 'duplicate delivery' });
+    expect(await pr.stub.runCompleted(key('d-other'), 1234, 'success')).toEqual({ accepted: false, reason: 'no running item for run 1234' });
+    expect(await pr.stub.runCompleted(key('d-end', 'end'), 9000, 'failure')).toMatchObject({ accepted: true });
+    expect(await pr.stub.runCompleted(key('d-end'), 9000, 'failure')).toEqual({ accepted: false, reason: 'duplicate delivery' });
+    expect(await pr.stub.runCompleted(key('d-replayed', 'end'), 9000, 'failure')).toEqual({ accepted: false, reason: 'duplicate delivery' });
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'done', conclusion: 'failure' }]);
   });
 
@@ -748,7 +814,7 @@ describe('PrCoordinator dispatch', () => {
     for (let i = 0; i <= DISPATCHES_PER_HOUR; i++) {
       await pr.send('issue_comment', pr.comment(`@manki explain ${i}`));
       await runDurableObjectAlarm(pr.stub);
-      await pr.stub.runCompleted(`d-end-${i}`, 9000 + i, 'success');
+      await pr.stub.runCompleted(key(`d-end-${i}`), 9000 + i, 'success');
     }
     expect(github.dispatches).toHaveLength(DISPATCHES_PER_HOUR);
     expect((await workRows(pr.stub)).at(-1)).toMatchObject({ status: 'dropped', note: `over ${DISPATCHES_PER_HOUR} dispatches in the last hour` });
@@ -762,6 +828,91 @@ describe('PrCoordinator dispatch', () => {
     await pr.send('issue_comment', pr.comment('@manki explain after the hour'));
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches).toHaveLength(DISPATCHES_PER_HOUR + 1);
+  });
+
+  it('counts the cap per lane', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    for (let i = 0; i < DISPATCHES_PER_HOUR; i++) {
+      await pr.send('issue_comment', pr.comment(`@manki explain ${i}`));
+      await runDurableObjectAlarm(pr.stub);
+      await pr.stub.runCompleted(key(`d-end-${i}`), 9000 + i, 'success');
+    }
+    await pr.send('pull_request_review_comment', pr.reply('Fixed'));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches).toHaveLength(DISPATCHES_PER_HOUR + 1);
+    expect((await workRows(pr.stub)).at(-1)).toMatchObject({ lane: 'state', status: 'running' });
+  });
+
+  it(`drops outsiders' work over ${UNTRUSTED_DISPATCHES_PER_HOUR} dispatches an hour without using up the cap of repository users`, async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    for (let i = 0; i <= UNTRUSTED_DISPATCHES_PER_HOUR; i++) {
+      await pr.send('issue_comment', pr.outsiderComment(`@manki explain ${i}`));
+      await runDurableObjectAlarm(pr.stub);
+      await pr.stub.runCompleted(key(`d-end-${i}`), 9000 + i, 'success');
+    }
+    expect(github.dispatches).toHaveLength(UNTRUSTED_DISPATCHES_PER_HOUR);
+    expect((await workRows(pr.stub)).at(-1)).toMatchObject({ status: 'dropped', note: `over ${UNTRUSTED_DISPATCHES_PER_HOUR} dispatches in the last hour` });
+
+    for (let i = 0; i < DISPATCHES_PER_HOUR; i++) {
+      await pr.send('issue_comment', pr.comment(`@manki explain ${i}`));
+      await runDurableObjectAlarm(pr.stub);
+      await pr.stub.runCompleted(key(`d-user-end-${i}`), 9000 + UNTRUSTED_DISPATCHES_PER_HOUR + i, 'success');
+    }
+    expect(github.dispatches).toHaveLength(UNTRUSTED_DISPATCHES_PER_HOUR + DISPATCHES_PER_HOUR);
+  });
+
+  it.each([
+    ['a review', (pr: ReturnType<typeof pullRequest>) => pr.send('pull_request', pr.push(SHA_1)), 'pull_request'],
+    ['a merge', (pr: ReturnType<typeof pullRequest>) => pr.send('pull_request', pr.close(true)), 'pull_request'],
+  ])(`holds %s over ${DISPATCHES_PER_HOUR} dispatches an hour until the hour allows it`, async (_case, queue, event) => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    const start = Date.now();
+    for (let i = 0; i < DISPATCHES_PER_HOUR; i++) {
+      await pr.send('issue_comment', pr.comment(`@manki check ${i}`));
+      await runDurableObjectAlarm(pr.stub);
+      await pr.stub.runCompleted(key(`d-end-${i}`), 9000 + i, 'success');
+    }
+    advanceClock(10 * MINUTE);
+    await queue(pr);
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches).toHaveLength(DISPATCHES_PER_HOUR);
+    expect((await workRows(pr.stub)).at(-1)).toMatchObject({ status: 'queued', check_at: start + 60 * MINUTE });
+    expect(logged(log, 'coordinator_held')).toHaveLength(1);
+    expect(await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm())).toBe(start + 60 * MINUTE);
+
+    advanceClock(49 * MINUTE);
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches).toHaveLength(DISPATCHES_PER_HOUR);
+    expect(logged(log, 'coordinator_held')).toHaveLength(1);
+
+    advanceClock(MINUTE);
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches.at(-1)?.inputs.event).toBe(event);
+    expect((await workRows(pr.stub)).at(-1)).toMatchObject({ status: 'running' });
+  });
+
+  it('reuses a token until shortly before it expires', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    const actionsWrites = () => github.mints.filter((mint) => mint.permissions.actions === 'write').length;
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    await runDurableObjectAlarm(pr.stub);
+    await pr.stub.runCompleted(key('d-end-1'), 9000, 'success');
+    await pr.send('issue_comment', pr.comment('@manki help'));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches).toHaveLength(2);
+    expect(actionsWrites()).toBe(1);
+
+    // The fake GitHub's tokens expire an hour after the clock starts.
+    await pr.stub.runCompleted(key('d-end-2'), 9001, 'success');
+    advanceClock(55 * MINUTE);
+    await pr.send('issue_comment', pr.comment('@manki forget tabs'));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches).toHaveLength(3);
+    expect(actionsWrites()).toBe(2);
   });
 
   it.each<[string, number | { status: number; headers: Record<string, string> }]>([

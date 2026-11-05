@@ -1,7 +1,7 @@
 import type { Env } from './env';
 import { log } from './log';
 import { routeDelivery, type Route, type WebhookPayload } from './routing';
-import { verifyWebhookSignature } from './signature';
+import { sha256Hex, verifyWebhookSignature } from './signature';
 
 const MAX_BODY_BYTES = 25 * 1024 * 1024;
 const DELIVERY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -103,9 +103,12 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
   log('webhook', { delivery, event, action: payload.action ?? null, ...summarize(route) });
   if (route.type !== 'ignore') {
     const coordinator = env.PR_COORDINATOR.getByName(`${route.target.repositoryId}:${route.target.number}`);
+    // A thread event names no time, so resolving, reopening and resolving again send the same body. A replay of one
+    // only adds a review state check, which merges with the queued one, so its id alone is checked.
+    const key = { id: delivery, bodyHash: event === 'pull_request_review_thread' ? null : await sha256Hex(body) };
     try {
-      if (route.type === 'run_completed') await coordinator.runCompleted(delivery, route.runId, route.conclusion);
-      else await coordinator.receive(delivery, route);
+      if (route.type === 'run_completed') await coordinator.runCompleted(key, route.runId, route.conclusion);
+      else await coordinator.receive(key, route);
     } catch (error) {
       log('webhook_coordinator_error', { delivery, error: String(error) });
       return Response.json({ error: 'Could not queue the delivery' }, { status: 500 });
