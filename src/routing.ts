@@ -64,6 +64,7 @@ export type Route =
   | { type: 'ignore'; reason: string }
   | { type: 'work'; target: Target; work: Work }
   | { type: 'close'; target: Target; merged: Work | null }
+  | { type: 'seen'; target: Target; headSha: string }
   | { type: 'run_completed'; target: Target; runId: number; conclusion: string | null };
 
 interface User {
@@ -177,7 +178,12 @@ export function routeDelivery(event: string, payload: WebhookPayload, now = Date
     return { type: 'close', target, merged: recordsFixRate ? work('state', 'merged', payload, event) : null };
   }
 
-  if (isBot(payload.sender)) return ignore('sender is a bot');
+  // Manki skips a bot's push. The coordinator still records the head, so the cron does not review it later.
+  if (isBot(payload.sender)) {
+    const headSha = payload.pull_request?.head?.sha;
+    const pushed = event === 'pull_request' && ['opened', 'synchronize', 'ready_for_review'].includes(payload.action ?? '');
+    return pushed && headSha && !isForkHead(payload) ? { type: 'seen', target, headSha } : ignore('sender is a bot');
+  }
   // An answer that late helps nobody. The time is the comment's last edit, which is what a Force review tick changes.
   const commentAt = Date.parse(payload.comment?.updated_at ?? payload.comment?.created_at ?? '');
   if ((event === 'issue_comment' || event === 'pull_request_review_comment') && now - commentAt > STALE_COMMENT_MS) {

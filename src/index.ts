@@ -4,9 +4,11 @@ import { createInstallationToken, getInstallation, type Installation } from './g
 import { log } from './log';
 import { verifyGitHubOIDC } from './oidc';
 import { cappedPermissions, MANKI_PERMISSION_CAPS, MEMORY_PERMISSION_CAPS, type Permissions } from './permissions';
+import { RECONCILER_NAME } from './reconciler';
 import { handleWebhook } from './webhook';
 
 export { PrCoordinator } from './coordinator';
+export { Reconciler } from './reconciler';
 
 // Only this name is minted, so a token for one installation account can never write another account's memory.
 const MEMORY_REPO = 'review-memory';
@@ -38,6 +40,10 @@ async function mintMemoryToken(jwt: string, installation: Installation): Promise
 }
 
 export default {
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(env.RECONCILER.getByName(RECONCILER_NAME).reconcile());
+  },
+
   async fetch(request: Request, env: Env): Promise<Response> {
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204 });

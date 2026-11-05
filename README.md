@@ -26,6 +26,17 @@ The repository name is fixed. A memory repo with any other name (`memory.repo` i
 
 Only repositories whose numeric id is in `WEBHOOK_REPOS` (comma-separated, in `wrangler.toml`) reach a coordinator. A delivery for any other repository is logged and answered `202` without touching Durable Object storage, so another installation cannot use up the account's daily storage write quota. `workflow_run` deliveries are dropped unless `manki-review[bot]` sent them, and a body over 25 MiB is refused with `413` while it is read, with or without `Content-Length`.
 
+## Reconciler
+
+A cron trigger every 5 minutes runs one pass of the `Reconciler` Durable Object, a singleton.
+
+- **Opt-in registry.** Each time a coordinator reads the workflows it reports the result. The first sighting of `manki-dispatch.yml` records the repository's opt-in time, and opting out removes it.
+- **Redelivery.** It lists the App's webhook deliveries, newest first, down to the newest delivery the last finished scan reached. A scan that hits the limit of 10 pages goes on from the same page in the next pass, so failures behind a burst of `workflow_run` deliveries are still found. Each failed delivery is redelivered at most twice, those not retried yet first. Only deliveries whose first attempt is under 6 hours old, the same limit as for stale comments, for a repository that had opted in by then, are sent again. So failures from before the Worker was ready stay failed.
+- **Catch-up.** For each opted-in repository it lists open PRs updated in the last day.
+  - A same-repository, non-draft PR goes to its coordinator as a review when its head has no Manki review and no review run in the coordinator that ended in success. A review that was skipped, dropped, failed, cancelled or deleted does not count, so its head is caught up again, at most once a day.
+  - PRs opened by a bot are skipped, as Manki does not review them. A bot's push to a person's PR reaches the coordinator, which records the head as handled. If that delivery was lost, the catch-up cannot tell it from a person's push and reviews the head.
+- Each pass makes at most 40 calls, counting GitHub and coordinator calls together, within the Free plan's 50 subrequests. The next pass resumes with the next repository.
+
 With `DISPATCH_ENABLED` (in `wrangler.toml`) set to anything but `"true"`, the coordinators only log what they would dispatch.
 
 ### App events

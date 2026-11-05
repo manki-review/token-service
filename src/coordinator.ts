@@ -6,6 +6,7 @@ import { log } from './log';
 import { BOT_LOGIN } from './manki';
 import { type OptIn, readOptIn, type Repository } from './opt-in';
 import type { Permissions } from './permissions';
+import { RECONCILER_NAME } from './reconciler';
 import { DISPATCH_WORKFLOW, type Lane, type Route, type Target, type Work } from './routing';
 
 const MINUTE = 60_000;
@@ -212,10 +213,79 @@ export class PrCoordinator extends DurableObject<Env> {
         const merged = route.merged ? `, queued ${this.insert(route.merged, delivery.id, now)}` : '';
         return { accepted: true, effect: `closed, dropped ${dropped}${merged}` };
       }
+      if (route.work.kind === 'review' && route.work.event.startsWith('pull_request.')) {
+        // A late redelivery of the push, after a catch-up already reviews this head, must not review it twice.
+        const state = this.reviewState(route.work.headSha);
+        if (state !== null) return { accepted: true, effect: 'head already reviewed or under review' };
+      }
       return { accepted: true, effect: this.enqueue(route.work, delivery.id, now) };
     });
     log('coordinator_receive', { ...this.logFields(), delivery: delivery.id, ...result });
     if (result.accepted) await this.ctx.storage.setAlarm(now);
+    return result;
+  }
+
+  /**
+   * Whether a review of `head` ran to success (`handled`) or is queued or running (`pending`). Null when neither, also
+   * when its run failed, was cancelled or was deleted, so such a head is reviewed again.
+   */
+  private reviewState(head: string | null): 'handled' | 'pending' | null {
+    const rows = this.sql.exec<{ status: WorkStatus; conclusion: string | null }>(
+      `SELECT status, conclusion FROM work WHERE kind = 'review' AND head_sha = ?`, head,
+    ).toArray();
+    if (rows.some((row) => row.status === 'done' && row.conclusion === 'success')) return 'handled';
+    if (rows.some((row) => row.status === 'queued' || row.status === 'dispatching' || row.status === 'running')) return 'pending';
+    return null;
+  }
+
+  /**
+   * Where `head` stands for the cron. It is `handled` once a review run of it succeeded or a bot pushed it, `pending`
+   * while a review is queued or running, and `needed` otherwise, also when that review was skipped, dropped or failed.
+   * Writes nothing, so asking about a PR without state creates none.
+   */
+  async catchUpState(head: string): Promise<'needed' | 'pending' | 'handled'> {
+    if (!this.hasState()) return 'needed';
+    this.ensureSchema();
+    if (this.getMeta<string>('bot_head') === head) return 'handled';
+    return this.reviewState(head) ?? 'needed';
+  }
+
+  /**
+   * Queues a review of `head`, which the cron found without a Manki review, as if its push had arrived. It is stored
+   * like a delivery, so the coordinator keeps its state for the usual retention.
+   */
+  async catchUp(target: Target, head: string): Promise<ReceiveResult> {
+    if ((await this.catchUpState(head)) !== 'needed') return { accepted: false, reason: 'head already handled' };
+    this.ensureSchema();
+    const now = Date.now();
+    const delivery = `catch-up-${head.slice(0, 12)}`;
+    // The head is a same-repository push, which the webhook path trusts too.
+    const work: Work = { lane: 'state', kind: 'review', event: 'pull_request.synchronize', headSha: head, objectId: null, sender: '', trusted: true };
+    const effect = this.ctx.storage.transactionSync(() => {
+      this.sql.exec('INSERT OR REPLACE INTO deliveries (id, received_at) VALUES (?, ?)', delivery, now);
+      this.setMeta('target', target);
+      return this.enqueue(work, delivery, now);
+    });
+    await this.ctx.storage.setAlarm(now);
+    return { accepted: true, effect };
+  }
+
+  /**
+   * Records a head pushed by a bot, which Manki does not review, without queuing work. The cron then knows the head
+   * was skipped on purpose and does not catch it up.
+   */
+  async markSeen(delivery: Delivery, target: Target, head: string): Promise<ReceiveResult> {
+    this.ensureSchema();
+    const now = Date.now();
+    const result = this.ctx.storage.transactionSync((): ReceiveResult => {
+      if (this.isReplay(delivery)) return { accepted: false, reason: 'duplicate delivery' };
+      this.remember(delivery, now);
+      this.setMeta('target', target);
+      this.setMeta('bot_head', head);
+      return { accepted: true, effect: 'head marked as seen' };
+    });
+    log('coordinator_receive', { ...this.logFields(), delivery: delivery.id, ...result });
+    if (result.accepted) await this.scheduleNext();
     return result;
   }
 
@@ -741,10 +811,20 @@ export class PrCoordinator extends DurableObject<Env> {
         repository = { owner: repo.owner.login, repo: repo.name, defaultBranch: repo.default_branch };
         optIn = await readOptIn(mint.token, repository);
       }
+      await this.reportOptIn(repository === null ? target : { ...target, ...repository }, optIn.optedIn);
     }
     log('coordinator_opt_in', { ...this.logFields(), opted_in: optIn.optedIn, reason: optIn.reason });
     this.setMeta('opt_in', { ...optIn, expires: Date.now() + OPT_IN_TTL_MS, repository } satisfies CachedOptIn);
     return optIn;
+  }
+
+  /** Tells the reconciler what the opt-in read found. A failure is logged and never blocks the coordinator. */
+  private async reportOptIn(target: Target, optedIn: boolean): Promise<void> {
+    try {
+      await this.env.RECONCILER.getByName(RECONCILER_NAME).recordOptIn(target, optedIn);
+    } catch (error) {
+      log('coordinator_record_opt_in_error', { ...this.logFields(), error: String(error) });
+    }
   }
 
   private async scheduleNext(): Promise<void> {
