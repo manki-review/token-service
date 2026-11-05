@@ -16,5 +16,8 @@ class_name = "PrCoordinator"
 tag = "v1"
 new_sqlite_classes = ["PrCoordinator"]
 
+[vars]
+DISPATCH_ENABLED = "false"
+
 [observability]
 enabled = true

@@ -16,7 +16,33 @@ Workflows authenticate via [GitHub's OIDC provider](https://docs.github.com/en/a
 
 `POST /webhook` receives the GitHub App's webhook deliveries for Manki's webhook mode. It checks the `X-Hub-Signature-256` HMAC against `WEBHOOK_SECRET`, checks that `X-GitHub-Hook-Installation-Target-ID` is `APP_ID`, and works out where the delivery would go: ignored, the PR's state lane (reviews, thread replies, `check`, `dismiss`, review state checks from reviews and from resolved or reopened threads) or its chat lane (explain, questions, help, remember, forget). Work and closes go to the PR's `PrCoordinator` Durable Object before the `202` leaves.
 
-`PrCoordinator` (one per PR or issue, named `<repository id>:<number>`, SQLite storage) refuses a delivery id it has seen in the last 7 days, queues work per lane, collapses queued pushes into one review of the newest head, and drops queued work when the PR closes. Its alarm takes the oldest item of each free lane, checks that the repository opted in (`.github/workflows/manki-dispatch.yml` on the default branch and no event-driven Manki workflow next to it, cached for 5 minutes), and for now only logs what it would dispatch. It deletes its storage a week after the last delivery.
+`PrCoordinator` (one per PR or issue, named `<repository id>:<number>`, SQLite storage) refuses a delivery id it has seen in the last 7 days, queues work per lane, collapses queued pushes into one review of the newest head, and drops queued work when the PR closes. Its alarm takes the oldest item of each free lane, checks that the repository opted in (`.github/workflows/manki-dispatch.yml` on the default branch and no event-driven Manki workflow next to it, cached for 5 minutes), and then starts a run of `manki-dispatch.yml` on the default branch with `workflow_dispatch`. The inputs follow Manki's dispatch adapter: `event`, `action`, `pr`, `head_sha` (pushes and merges), `comment_id` or `review_id`, and `delivery_id`. The workflow's `run-name` must be `Manki ${{ inputs.event }}.${{ inputs.action }} on #${{ inputs.pr }} (${{ inputs.delivery_id }})`: the Worker reads the PR from it to route `workflow_run`, and matches the delivery id to find a run whose dispatch response was lost. The token for that call is minted for the one repository with `actions: write` and nothing else, apart from `/token`, which stays capped. A lane stays busy until the `workflow_run` webhook reports the run's end. A poll every 2 minutes is the safety net: it ends items whose run completed or was deleted, and cancels runs still queued after 30 minutes or running after 40. Failed dispatches retry after 15 seconds, 1 minute and 5 minutes, and a retry first looks for a run the earlier attempt started. At most 30 dispatches per PR per hour. It deletes its storage a week after the last delivery.
+
+With `DISPATCH_ENABLED` (in `wrangler.toml`) set to anything but `"true"`, the coordinators only log what they would dispatch.
+
+### App events
+
+The GitHub App subscribes to these events. They all arrive at `/webhook`:
+
+| Event | Used for |
+|---|---|
+| Pull request | Reviews on open, push and ready for review. A close clears the queue, and a merge records the fix rate |
+| Pull request review | The review state check (auto-approve) |
+| Pull request review comment | Thread replies and thread commands |
+| Pull request review thread | The review state check when a thread is resolved or reopened. GitHub Actions has no trigger for this one |
+| Issue comment | Review requests, Force review ticks, commands and questions |
+| Workflow run | The end of a dispatched run. Every other run is ignored |
+
+### Cost on the Workers Free plan
+
+The Free plan includes [100,000 Worker requests a day](https://developers.cloudflare.com/workers/platform/pricing/) and [100,000 Durable Object requests a day](https://developers.cloudflare.com/durable-objects/platform/pricing/), counting each RPC call and each alarm, plus 100,000 SQLite rows written. Past a limit, calls fail until 00:00 UTC.
+
+- Every delivery is one Worker request, including `workflow_run` for every CI run in every installed repository, which is ignored after the signature check.
+- A routed delivery adds one coordinator call and usually one or two alarms.
+- A dispatched run adds an alarm for each poll, every 2 minutes or less often after errors.
+- The cron adds 288 requests a day, plus one call for each PR it checks.
+
+Watch the daily request counts in the dashboard as more repositories opt in.
 
 ## Configuration
 

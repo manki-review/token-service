@@ -25,7 +25,8 @@ function summarize(route: Route): Record<string, unknown> {
 }
 
 /**
- * Verifies a GitHub App webhook delivery, logs its route and hands work and closes to the PR's `PrCoordinator`.
+ * Verifies a GitHub App webhook delivery, logs its route and hands work, closes and run ends to the PR's
+ * `PrCoordinator`.
  * The 202 leaves only once the coordinator stored the delivery, so a failure there makes GitHub record a failed
  * delivery that can be redelivered.
  */
@@ -64,9 +65,11 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
 
   const route = routeDelivery(event, payload);
   log('webhook', { delivery, event, action: payload.action ?? null, ...summarize(route) });
-  if (route.type === 'work' || route.type === 'close') {
+  if (route.type !== 'ignore') {
+    const coordinator = env.PR_COORDINATOR.getByName(`${route.target.repositoryId}:${route.target.number}`);
     try {
-      await env.PR_COORDINATOR.getByName(`${route.target.repositoryId}:${route.target.number}`).receive(delivery, route);
+      if (route.type === 'run_completed') await coordinator.runCompleted(delivery, route.runId, route.conclusion);
+      else await coordinator.receive(delivery, route);
     } catch (error) {
       log('webhook_coordinator_error', { delivery, error: String(error) });
       return Response.json({ error: 'Could not queue the delivery' }, { status: 500 });

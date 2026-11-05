@@ -1,4 +1,5 @@
 import { parse } from 'yaml';
+import { DISPATCH_INPUT_NAMES } from './dispatch';
 import { githubGraphql } from './github';
 import { DISPATCH_WORKFLOW, type Target } from './routing';
 
@@ -27,18 +28,29 @@ const EVENT_TRIGGERS = new Set([
 const MANKI_WORKFLOW = /uses:\s*['"]?manki-review\/manki[@/'"\s]|manki-review\[bot\]/i;
 const LOCAL_REUSABLE = /uses:\s*['"]?\.\/\.github\/workflows\/([^\s'"@]+)/gi;
 
-function triggers(text: string): Set<string> | null {
-  let workflow: unknown;
+function parseOn(text: string): { on: unknown } | null {
   try {
-    workflow = parse(text);
+    return { on: (parse(text) as { on?: unknown } | null)?.on };
   } catch {
     return null;
   }
-  const on = (workflow as { on?: unknown } | null)?.on;
+}
+
+function triggers(text: string): Set<string> | null {
+  const parsed = parseOn(text);
+  if (parsed === null) return null;
+  const { on } = parsed;
   if (typeof on === 'string') return new Set([on]);
   if (Array.isArray(on)) return new Set(on.filter((name): name is string => typeof name === 'string'));
   if (on && typeof on === 'object') return new Set(Object.keys(on));
   return new Set();
+}
+
+/** Returns the dispatch inputs the workflow's `workflow_dispatch` trigger does not declare. */
+function missingInputs(text: string): string[] {
+  const on = parseOn(text)?.on as { workflow_dispatch?: { inputs?: Record<string, unknown> } | null } | undefined;
+  const declared = on && typeof on === 'object' ? on.workflow_dispatch?.inputs ?? {} : {};
+  return DISPATCH_INPUT_NAMES.filter((name) => !Object.hasOwn(declared, name));
 }
 
 function isWorkflowFile(name: string): boolean {
@@ -76,6 +88,10 @@ export function classifyWorkflows(files: WorkflowFile[]): OptIn {
   // Any other trigger would start Manki on events the Worker also dispatches.
   if (dispatchTriggers.size > 1) {
     return { optedIn: false, reason: `${DISPATCH_WORKFLOW} runs on more than workflow_dispatch` };
+  }
+  const missing = missingInputs(dispatch.text);
+  if (missing.length > 0) {
+    return { optedIn: false, reason: `${DISPATCH_WORKFLOW} does not declare the inputs ${missing.join(', ')}` };
   }
 
   const manki = mankiWorkflows(files);

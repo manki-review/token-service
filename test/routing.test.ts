@@ -122,6 +122,8 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['a finished dispatch run', 'workflow_run', workflowRunEvent(), 'run_completed'],
   ['a started dispatch run', 'workflow_run', workflowRunEvent({}, 'in_progress'), 'ignore'],
   ['a finished CI run', 'workflow_run', workflowRunEvent({ event: 'pull_request', path: '.github/workflows/ci.yml' }), 'ignore'],
+  ['a dispatch run whose path names the ref', 'workflow_run', workflowRunEvent({ path: '.github/workflows/manki-dispatch.yml@refs/heads/main' }), 'run_completed'],
+  ['a run of a workflow whose name only starts the same', 'workflow_run', workflowRunEvent({ path: '.github/workflows/manki-dispatch.yml.bak' }), 'ignore'],
   ['a dispatch run that only differs in its event', 'workflow_run', workflowRunEvent({ event: 'push' }), 'ignore'],
   ['a dispatch of another workflow', 'workflow_run', workflowRunEvent({ path: '.github/workflows/deploy.yml' }), 'ignore'],
   ['a dispatch run without a PR in its name', 'workflow_run', workflowRunEvent({ display_title: 'Manki dispatch' }), 'ignore'],
@@ -136,6 +138,19 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
 describe('routeDelivery', () => {
   it.each(cases)('routes %s', (_case, event, payload, expected) => {
     expect(verdict(routeDelivery(event, payload))).toBe(expected);
+  });
+
+  it('drops a comment event that arrives over 6 hours after the comment was written or edited', () => {
+    const now = Date.parse('2030-01-01T12:00:00Z');
+    const at = (iso: string) => ({ created_at: '2030-01-01T00:00:00Z', updated_at: iso });
+    const issueComment = (iso: string) => {
+      const payload = issueCommentEvent('@manki explain');
+      return { ...payload, comment: { ...payload.comment, ...at(iso) } };
+    };
+    expect(verdict(routeDelivery('issue_comment', issueComment('2030-01-01T06:00:00Z'), now))).toBe('chat:comment');
+    expect(routeDelivery('issue_comment', issueComment('2030-01-01T05:59:59Z'), now)).toEqual({ type: 'ignore', reason: 'comment is over 6 hours old' });
+    expect(verdict(routeDelivery('pull_request_review_comment', reviewCommentEvent('ok', { in_reply_to_id: 1, ...at('2030-01-01T05:00:00Z') }), now))).toBe('ignore');
+    expect(verdict(routeDelivery('pull_request_review', { ...reviewEvent('submitted'), comment: at('2030-01-01T00:00:00Z') }, now))).toBe('state:review_state');
   });
 
   it('names the target from the payload', () => {
