@@ -1,7 +1,9 @@
 import { jwtVerify, createRemoteJWKSet } from 'jose';
 
 const GITHUB_OIDC_ISSUER = 'https://token.actions.githubusercontent.com';
-const GITHUB_JWKS_URL = new URL(`${GITHUB_OIDC_ISSUER}/.well-known/jwks`);
+
+// Created once per isolate so GitHub's keys are cached across requests instead of fetched on every one.
+const GITHUB_JWKS = createRemoteJWKSet(new URL(`${GITHUB_OIDC_ISSUER}/.well-known/jwks`));
 
 interface OIDCClaims {
   repository: string;
@@ -10,9 +12,7 @@ interface OIDCClaims {
 }
 
 export async function verifyGitHubOIDC(token: string, expectedRepo: string): Promise<OIDCClaims> {
-  const JWKS = createRemoteJWKSet(GITHUB_JWKS_URL);
-
-  const { payload } = await jwtVerify(token, JWKS, {
+  const { payload } = await jwtVerify(token, GITHUB_JWKS, {
     issuer: GITHUB_OIDC_ISSUER,
     audience: 'manki-api.dustinface.me',
   });
