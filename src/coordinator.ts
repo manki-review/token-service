@@ -20,7 +20,6 @@ export const OPT_IN_TTL_MS = 5 * MINUTE;
 export const FINISHED_RETENTION_MS = 7 * DAY;
 /** How long an alarm may hold an item in `dispatching` before another pass takes it back. */
 const LEASE_MS = 5 * MINUTE;
-const RETRY_MS = MINUTE;
 const LANES: readonly Lane[] = ['state', 'chat'];
 
 /** The wait before each retry of a dispatch that failed with a 5xx or a network error. */
@@ -61,13 +60,14 @@ export interface WorkRow extends Record<string, string | number | null> {
   check_at: number | null;
   ended_at: number | null;
   conclusion: string | null;
-  poll_errors: number;
+  /** Consecutive failed starts or polls, which set how long the next try waits. */
+  errors: number;
 }
 
 export type ReceiveResult = { accepted: false; reason: string } | { accepted: true; effect: string };
 
 // Each entry runs once, in order. Append new entries; never edit a shipped one.
-const MIGRATIONS = [
+export const MIGRATIONS = [
   `CREATE TABLE deliveries (id TEXT PRIMARY KEY, received_at INTEGER NOT NULL);
    CREATE TABLE work (
      id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,11 +91,16 @@ const MIGRATIONS = [
    ALTER TABLE work ADD COLUMN check_at INTEGER;
    ALTER TABLE work ADD COLUMN ended_at INTEGER;
    ALTER TABLE work ADD COLUMN conclusion TEXT;
-   ALTER TABLE work ADD COLUMN poll_errors INTEGER NOT NULL DEFAULT 0;
+   ALTER TABLE work ADD COLUMN errors INTEGER NOT NULL DEFAULT 0;
    CREATE INDEX work_by_run ON work (run_id);`,
 ];
 
 const ACTIVE = `status IN ('dispatching', 'running')`;
+
+/** The wait before the next try after `errors` failures in a row: 2, 4, 8, then at most 16 minutes. */
+export function backoff(errors: number): number {
+  return POLL_MS * 2 ** Math.min(errors, 3);
+}
 
 /** Whether a 403 is GitHub's rate limit, which passes, rather than a refusal. */
 function isRateLimited(response: Response): boolean {
@@ -350,8 +355,11 @@ export class PrCoordinator extends DurableObject<Env> {
       }
       await this.dispatch(item);
     } catch (error) {
-      // The lease runs out after `RETRY_MS`, and the next pass takes the item again.
-      this.sql.exec(`UPDATE work SET lease_until = ? WHERE id = ? AND status = 'dispatching'`, Date.now() + RETRY_MS, item.id);
+      // The lease runs out after the backoff, and the next pass takes the item again.
+      this.sql.exec(
+        `UPDATE work SET lease_until = ?, errors = errors + 1 WHERE id = ? AND status = 'dispatching'`,
+        Date.now() + backoff(item.errors), item.id,
+      );
       log('coordinator_start_error', { ...this.logFields(), work_id: item.id, error: String(error) });
     }
   }
@@ -458,7 +466,7 @@ export class PrCoordinator extends DurableObject<Env> {
   private markRunning(item: WorkRow, runId: number | null, note: string): void {
     const now = Date.now();
     this.sql.exec(
-      `UPDATE work SET status = 'running', run_id = ?, dispatched_at = ?, check_at = ?, lease_until = NULL, note = ? WHERE id = ?`,
+      `UPDATE work SET status = 'running', run_id = ?, dispatched_at = ?, check_at = ?, lease_until = NULL, errors = 0, note = ? WHERE id = ?`,
       runId, now, now + POLL_MS, note, item.id,
     );
     log('coordinator_dispatched', { ...this.logFields(), ...this.describe(this.row(item.id)!), run_id: runId, note });
@@ -494,8 +502,8 @@ export class PrCoordinator extends DurableObject<Env> {
     const dispatchedAt = item.dispatched_at ?? now;
     // Moved forward before any GitHub call, so a failing call backs off instead of firing the alarm again at once.
     this.sql.exec(
-      'UPDATE work SET check_at = ?, poll_errors = poll_errors + 1 WHERE id = ?',
-      now + POLL_MS * 2 ** Math.min(item.poll_errors, 3), item.id,
+      'UPDATE work SET check_at = ?, errors = errors + 1 WHERE id = ?',
+      now + backoff(item.errors), item.id,
     );
     if (now - dispatchedAt > RUN_DEADLINE_MS) {
       this.finish(item.id, 'timed_out', 'no end of the run seen in time');
@@ -540,7 +548,7 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /** Records a poll that reached GitHub, so the next one comes after the normal interval. */
   private polled(id: number): void {
-    this.sql.exec('UPDATE work SET poll_errors = 0, check_at = ? WHERE id = ?', Date.now() + POLL_MS, id);
+    this.sql.exec('UPDATE work SET errors = 0, check_at = ? WHERE id = ?', Date.now() + POLL_MS, id);
   }
 
   /** Cancels a run that overran. A failed cancel keeps the item running, so the next poll tries again. */

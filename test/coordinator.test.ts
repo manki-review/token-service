@@ -2,6 +2,7 @@ import { runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DELIVERY_RETENTION_MS,
+  MIGRATIONS,
   DISPATCH_BACKOFF_MS,
   DISPATCHES_PER_HOUR,
   FINISHED_RETENTION_MS,
@@ -287,19 +288,50 @@ describe('PrCoordinator.alarm', () => {
     expect(logged(log, 'coordinator_would_dispatch')).toMatchObject([{ opted_in: false, opt_in_reason: 'token mint refused with 422' }]);
   });
 
-  it('retries an item a minute after the opt-in read failed', async () => {
+  it('retries a start that keeps failing with a growing backoff, capped at 16 minutes', async () => {
     stubGitHub({ api: { 'POST /graphql': { status: 502, body: {} } } });
     const pr = pullRequest();
     await pr.send('pull_request', pr.push(SHA_1));
-    await runDurableObjectAlarm(pr.stub);
-    expect(logged(log, 'coordinator_start_error')).toMatchObject([{ work_id: 1, error: 'Error: GraphQL request failed with 502' }]);
-    expect(await workRows(pr.stub)).toMatchObject([{ status: 'dispatching', lease_until: Date.now() + 60_000 }]);
-    expect(await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm())).toBe(Date.now() + 60_000);
+    const waits: number[] = [];
+    for (let attempt = 0; attempt < 5; attempt++) {
+      await runDurableObjectAlarm(pr.stub);
+      const alarm = await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm());
+      waits.push((alarm! - Date.now()) / MINUTE);
+      advanceClock(alarm! - Date.now());
+    }
+    expect(waits).toEqual([2, 4, 8, 16, 16]);
+    expect(logged(log, 'coordinator_start_error')[0]).toMatchObject({ work_id: 1, error: 'Error: GraphQL request failed with 502' });
 
     stubGitHub(OPTED_IN);
-    advanceClock(60_000);
     await runDurableObjectAlarm(pr.stub);
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped' }]);
+  });
+
+  it('upgrades the tables of an older object on its first alarm', async () => {
+    stubGitHub(OPTED_IN);
+    const pr = pullRequest();
+    // The state an object left by the first schema version, before this instance touched it.
+    await runInDurableObject(pr.stub, (_instance, state) => {
+      const sql = state.storage.sql;
+      sql.exec('CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
+      sql.exec(MIGRATIONS[0]);
+      sql.exec(`INSERT INTO meta (key, value) VALUES ('schema_version', '1')`);
+      sql.exec(`INSERT INTO deliveries (id, received_at) VALUES ('d-old', ?)`, Date.now());
+      sql.exec(
+        `INSERT INTO meta (key, value) VALUES ('target', ?)`,
+        JSON.stringify({ installationId: 987, repositoryId: REPOSITORY_ID, owner: 'manki-review', repo: 'manki', defaultBranch: 'main', number: pr.number }),
+      );
+      sql.exec(
+        `INSERT INTO work (lane, kind, event, head_sha, object_id, sender, delivery, enqueued_at, status)
+         VALUES ('chat', 'comment', 'issue_comment.created', NULL, 1001, 'alice', 'd-old', ?, 'queued')`,
+        Date.now(),
+      );
+    });
+    expect(await runDurableObjectAlarm(pr.stub)).toBe(false);
+    await runInDurableObject(pr.stub, (_instance, state) => state.storage.setAlarm(Date.now()));
+    await runDurableObjectAlarm(pr.stub);
+    expect(logged(log, 'coordinator_lane_error')).toEqual([]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped', errors: 0 }]);
   });
 
   it('starts nothing else in a lane while an item there is dispatching', async () => {
@@ -808,6 +840,23 @@ describe('PrCoordinator dispatch', () => {
     advanceClock(POLL_MS);
     await runDurableObjectAlarm(pr.stub);
     expect(await alarmAt()).toBe(Date.now() + 2 * POLL_MS);
+  });
+
+  it('caps the poll backoff at 16 minutes', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    await runDurableObjectAlarm(pr.stub);
+    github.runReadStatus = 500;
+    const waits: number[] = [];
+    for (let poll = 0; poll < 5; poll++) {
+      const alarm = await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm());
+      advanceClock(alarm! - Date.now());
+      await runDurableObjectAlarm(pr.stub);
+      waits.push(((await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm()))! - Date.now()) / MINUTE);
+    }
+    expect(waits).toEqual([2, 4, 8, 16, 16]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'running', errors: 5 }]);
   });
 
   it('ends a running item at the deadline whatever its polls return', async () => {
