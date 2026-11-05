@@ -2,6 +2,7 @@ import type { Env } from './env';
 import { routeDelivery, type Route, type WebhookPayload } from './routing';
 import { verifyWebhookSignature } from './signature';
 
+const MAX_BODY_BYTES = 25 * 1024 * 1024;
 const DELIVERY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function summarize(route: Route): Record<string, unknown> {
@@ -30,6 +31,11 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
   if (!env.WEBHOOK_SECRET) {
     console.error('WEBHOOK_SECRET is not set, refusing webhook deliveries');
     return Response.json({ error: 'Webhook secret not configured' }, { status: 500 });
+  }
+
+  // GitHub caps webhook payloads at 25 MB, so anything larger is not a delivery.
+  if (Number(request.headers.get('Content-Length') ?? 0) > MAX_BODY_BYTES) {
+    return Response.json({ error: 'Payload too large' }, { status: 413 });
   }
 
   const body = await request.arrayBuffer();

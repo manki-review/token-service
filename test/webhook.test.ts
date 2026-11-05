@@ -105,6 +105,15 @@ describe('/webhook', () => {
     expect((await postWebhook(options)).status).toBe(400);
   });
 
+  it('refuses a body over 25 MiB with 413 before reading it', async () => {
+    const response = await worker.fetch(new Request(`https://${OIDC_AUDIENCE}/webhook`, {
+      method: 'POST',
+      headers: { 'Content-Length': String(25 * 1024 * 1024 + 1) },
+      body: new ReadableStream({ pull: () => { throw new Error('the body must not be read'); } }),
+    }), TEST_ENV);
+    expect(response.status).toBe(413);
+  });
+
   it('answers 500 while no webhook secret is set', async () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
     const response = await postWebhook({ env: { ...TEST_ENV, WEBHOOK_SECRET: undefined } });
