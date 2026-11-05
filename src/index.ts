@@ -30,16 +30,17 @@ export default {
     }
     const oidcToken = authHeader.slice(7);
 
-    let body: { owner?: string; repo?: string };
+    let parsed: { owner?: unknown; repo?: unknown } | null;
     try {
-      body = await request.json();
+      parsed = await request.json();
     } catch {
       return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
     }
 
-    if (!body.owner || !body.repo) {
+    if (typeof parsed?.owner !== 'string' || typeof parsed?.repo !== 'string' || !parsed.owner || !parsed.repo) {
       return Response.json({ error: 'owner and repo are required' }, { status: 400 });
     }
+    const body = { owner: parsed.owner, repo: parsed.repo };
 
     const expectedRepo = `${body.owner}/${body.repo}`;
 

@@ -94,6 +94,10 @@ describe('/token', () => {
     ['an invalid JSON body', 'not json'],
     ['a body without a repo', { owner: OWNER }],
     ['a body without an owner', { repo: REPO }],
+    ['a null body', 'null'],
+    ['a body that is a string', '"manki"'],
+    ['a body with a numeric owner', { owner: 1, repo: REPO }],
+    ['a body with an empty repo', { owner: OWNER, repo: '' }],
   ])('rejects %s', async (_case, body) => {
     const requests = stubGitHub();
     const response = await postToken({ body });
