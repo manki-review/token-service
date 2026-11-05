@@ -1,0 +1,47 @@
+name: Manki
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, closed]
+  pull_request_review:
+    types: [submitted, dismissed]
+  issue_comment:
+    types: [created, edited]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  contents: read          # read repo files and diffs
+  pull-requests: write    # post review comments and approvals
+  issues: write           # post progress comments and app warnings on PRs
+  id-token: write         # OIDC token for GitHub App identity
+  actions: read           # verify workflow run is legitimate
+  checks: read            # read CI annotations as review evidence
+
+jobs:
+  review:
+    if: >-
+      github.actor != 'manki-review[bot]'
+      && github.event.sender.type != 'Bot'
+      && github.event.review.user.type != 'Bot'
+      && (github.event.action != 'closed' || github.event.pull_request.merged)
+      && (github.event_name != 'issue_comment' || contains(github.event.comment.body, '@manki') || contains(github.event.comment.body, '/manki') || contains(github.event.comment.body, '- [x] Force review'))
+      && (!github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository)
+      && (github.event_name != 'issue_comment' || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) || (github.event.issue.pull_request && github.event.action == 'edited' && github.event.comment.user.login == 'manki-review[bot]'))
+      && (github.event_name != 'pull_request_review_comment' || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    concurrency:
+      group: manki-${{ (github.event_name == 'pull_request' || (github.event_name == 'issue_comment' && (contains(github.event.comment.body, 'manki review') || contains(github.event.comment.body, '- [x] Force review')))) && 'review' || 'reply' }}-${{ github.event.pull_request.number || github.event.issue.number }}
+      queue: max
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '24'
+      - name: Manki Review
+        uses: manki-review/manki@34d5ccac632381365545e2214ff0f0e1b746c3c1  # v6.0.1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

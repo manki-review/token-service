@@ -1,0 +1,27 @@
+# Manki configuration: https://github.com/manki-review/manki
+
+instructions: |
+  This is a Cloudflare Worker that mints GitHub App installation tokens for Manki
+  and receives the App's webhooks. A bug here can leak a token with write access
+  to every repository of an installation, or let a forged request start workflow
+  runs in someone else's repository.
+  Pay special attention to:
+  - OIDC validation (issuer, audience, algorithm, required claims) and the
+    repository claim matching the request
+  - Token scope: requested permissions, repositories, and that nothing widens them
+  - Webhook signature checks, delivery replay, and that a delivery for one
+    installation never touches another installation's repositories
+  - Durable Object state: ordering, alarms that can loop, storage that never
+    gets deleted, and Free-plan request and subrequest limits
+  - Secrets or tokens reaching responses or logs
+
+# Read from the base branch only, so a PR cannot weaken its own review.
+review:
+  classes:
+    security:
+      match: { paths_any: ["src/**", "wrangler.toml", ".github/workflows/**", "package.json", "package-lock.json"] }
+
+static_analysis:
+  analyzers:
+    secrets: true
+    dependencies: true
