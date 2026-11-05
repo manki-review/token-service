@@ -7,6 +7,7 @@ import {
   DISPATCHES_PER_HOUR,
   FINISHED_RETENTION_MS,
   OPT_IN_TTL_MS,
+  backoff,
   POLL_MS,
   QUEUED_MAX_AGE_MS,
   QUEUED_RUN_TIMEOUT_MS,
@@ -475,6 +476,8 @@ describe('PrCoordinator.alarm', () => {
   });
 });
 
+type Reply = number | { status: number; headers: Record<string, string> };
+
 interface FakeRun {
   status: string;
   conclusion?: string | null;
@@ -489,7 +492,7 @@ function fakeGitHub(number: number) {
     prState: 'open',
     draft: false,
     /** Replies the next dispatches get, in order. Afterwards 200 with a new run id. */
-    dispatchStatuses: [] as Array<number | { status: number; headers: Record<string, string> }>,
+    dispatchStatuses: [] as Reply[],
     /** Statuses the next cancels answer with, in order. Afterwards 202. */
     cancelStatuses: [] as number[],
     listRunsStatus: 200,
@@ -502,6 +505,13 @@ function fakeGitHub(number: number) {
     dispatches: [] as Array<{ ref: string; inputs: Record<string, string>; return_run_details: boolean }>,
     cancels: [] as number[],
     graphqlCalls: 0,
+    /** The repository `GET /repositories/<id>` names, and its status. */
+    repository: { name: REPO, owner: { login: OWNER }, default_branch: 'main' },
+    /** Failures the next mints for a permission get, in order: a status, a status with headers, or a network error. */
+    mintFailures: [] as Array<{ permission: string; reply: Reply | 'network' }>,
+    graphqlVariables: [] as Array<Record<string, string>>,
+    repositoryStatus: 200,
+    repositoryReads: 0,
   };
   const workflowsBody = workflowsReply({ 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML }).body;
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
@@ -511,13 +521,25 @@ function fakeGitHub(number: number) {
     if (route === `POST /app/installations/${INSTALLATION_ID}/access_tokens`) {
       const body = await request.json() as (typeof state.mints)[number];
       state.mints.push(body);
+      const failure = state.mintFailures.findIndex((entry) => Object.hasOwn(body.permissions, entry.permission));
+      if (failure >= 0) {
+        const [{ reply }] = state.mintFailures.splice(failure, 1);
+        if (reply === 'network') throw new TypeError('Network connection lost');
+        const { status, headers } = typeof reply === 'number' ? { status: reply, headers: {} } : reply;
+        return Response.json({ message: 'no' }, { status, headers });
+      }
       if (state.refuseActionsWrite && body.permissions.actions === 'write') {
         return Response.json({ message: 'The permissions requested are not granted to this installation.' }, { status: 422 });
       }
       return Response.json({ token: 'ghs_repo', expires_at: '2030-01-01T01:00:00Z' }, { status: 201 });
     }
+    if (route === `GET /repositories/${REPOSITORY_ID}`) {
+      state.repositoryReads++;
+      return Response.json(state.repository, { status: state.repositoryStatus });
+    }
     if (route === 'POST /graphql') {
       state.graphqlCalls++;
+      state.graphqlVariables.push(((await request.json()) as { variables: Record<string, string> }).variables);
       return Response.json(workflowsBody);
     }
     if (route === `GET ${repo}/pulls/${number}`) {
@@ -715,19 +737,28 @@ describe('PrCoordinator dispatch', () => {
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'done', note: 'run deleted' }]);
   });
 
-  it('cancels a run that never started and moves the lane on', async () => {
+  it('cancels a run that never started, dispatches it once more, then moves the lane on', async () => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
-    await pr.send('issue_comment', pr.comment('@manki explain'));
+    await pr.send('issue_comment', pr.comment('@manki explain'), 'd-explain');
     await pr.send('issue_comment', pr.comment('@manki help'));
     await runDurableObjectAlarm(pr.stub);
     advanceClock(QUEUED_RUN_TIMEOUT_MS + 1);
     await runDurableObjectAlarm(pr.stub);
     expect(github.cancels).toEqual([9000]);
-    expect(github.dispatches).toHaveLength(2);
+    expect(github.dispatches.map((dispatch) => dispatch.inputs.delivery_id)).toEqual(['d-explain', 'd-explain']);
+    expect(logged(log, 'coordinator_requeued')).toMatchObject([{ run_id: 9000, reason: 'run never started' }]);
     expect(await workRows(pr.stub)).toMatchObject([
-      { status: 'timed_out', note: 'run never started, cancel requested' },
-      { status: 'running', run_id: 9001 },
+      { status: 'running', run_id: 9001, requeues: 1, attempts: 1 },
+      { status: 'queued' },
+    ]);
+
+    advanceClock(QUEUED_RUN_TIMEOUT_MS + 1);
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.cancels).toEqual([9000, 9001]);
+    expect(await workRows(pr.stub)).toMatchObject([
+      { status: 'timed_out', note: 'run never started, cancel requested', run_id: 9001 },
+      { status: 'running', run_id: 9002 },
     ]);
   });
 
@@ -1010,19 +1041,50 @@ describe('PrCoordinator dispatch', () => {
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'running', errors: 5 }]);
   });
 
-  it('ends a running item at the deadline whatever its polls return', async () => {
+  it('cancels a run at the deadline whatever its polls return, and holds the lane until the cancel succeeds', async () => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
     await pr.send('issue_comment', pr.comment('@manki explain'));
     await pr.send('issue_comment', pr.comment('@manki help'));
     await runDurableObjectAlarm(pr.stub);
     github.runReadStatus = 500;
+    github.cancelStatuses = [500];
     advanceClock(RUN_DEADLINE_MS - MINUTE);
     await runDurableObjectAlarm(pr.stub);
-    expect(await workRows(pr.stub)).toMatchObject([{ status: 'running' }, { status: 'queued' }]);
+    expect(github.cancels).toEqual([]);
     advanceClock(2 * MINUTE);
     await runDurableObjectAlarm(pr.stub);
-    expect(await workRows(pr.stub)).toMatchObject([{ status: 'timed_out', note: 'no end of the run seen in time' }, { status: 'running' }]);
+    expect(github.cancels).toEqual([9000]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'running' }, { status: 'queued' }]);
+    advanceClock(4 * MINUTE);
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.cancels).toEqual([9000, 9000]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'timed_out', note: 'no end of the run seen in time, cancel requested' }, { status: 'running' }]);
+  });
+
+  it('ends a run past the deadline once it is seen completed', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    await runDurableObjectAlarm(pr.stub);
+    github.runs.set(9000, { status: 'completed', conclusion: 'success' });
+    advanceClock(RUN_DEADLINE_MS + MINUTE);
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.cancels).toEqual([]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'done', conclusion: 'success' }]);
+  });
+
+  it('ends a run past the deadline without a cancel once the installation lacks actions: write', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    await runDurableObjectAlarm(pr.stub);
+    github.runs.set(9000, { status: 'in_progress', run_started_at: new Date().toISOString() });
+    github.refuseActionsWrite = true;
+    advanceClock(RUN_DEADLINE_MS + MINUTE);
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.cancels).toEqual([]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'timed_out', note: 'no end of the run seen in time, cannot cancel without actions: write' }]);
   });
 
   it('keeps the lane busy and retries a cancel that failed', async () => {
@@ -1040,7 +1102,143 @@ describe('PrCoordinator dispatch', () => {
     advanceClock(POLL_MS);
     await runDurableObjectAlarm(pr.stub);
     expect(github.cancels).toEqual([9000, 9000]);
-    expect(await workRows(pr.stub)).toMatchObject([{ status: 'timed_out', note: 'run never started, cancel requested' }, { status: 'running' }]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'running', run_id: 9001, requeues: 1 }, { status: 'queued' }]);
+  });
+
+  const TRANSIENT: Array<[string, Reply | 'network']> = [
+    ['a 500', 500],
+    ['a 502', 502],
+    ['a 429', 429],
+    ['a 403 with retry-after', { status: 403, headers: { 'retry-after': '30' } }],
+    ['a 403 with no rate limit left', { status: 403, headers: { 'x-ratelimit-remaining': '0' } }],
+    ['a network error', 'network'],
+  ];
+
+  it.each(TRANSIENT)('retries the opt-in after %s from the token mint instead of caching it as not opted in', async (_case, reply) => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    github.mintFailures = [{ permission: 'contents', reply }];
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    await runDurableObjectAlarm(pr.stub);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'dispatching', errors: 1 }]);
+    expect(logged(log, 'coordinator_opt_in')).toEqual([]);
+    advanceClock(backoff(0));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches).toHaveLength(1);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'running' }]);
+  });
+
+  it.each(TRANSIENT)('retries the dispatch after %s from the actions: write mint', async (_case, reply) => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    github.mintFailures = [{ permission: 'actions', reply }];
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    await runDurableObjectAlarm(pr.stub);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'dispatching', errors: 1 }]);
+    expect(logged(log, 'coordinator_lacks_actions_write')).toEqual([]);
+    advanceClock(backoff(0));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches).toHaveLength(1);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'running' }]);
+  });
+
+  it.each<[string, Reply]>([
+    ['a plain 403', 403],
+    ['a 404', 404],
+    ['a 422', 422],
+  ])('counts %s from the token mint as a refusal', async (_case, reply) => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    github.mintFailures = [{ permission: 'actions', reply }];
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    await runDurableObjectAlarm(pr.stub);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped', note: 'installation lacks actions: write' }]);
+
+    const other = pullRequest();
+    const otherGitHub = fakeGitHub(other.number);
+    otherGitHub.mintFailures = [{ permission: 'contents', reply }];
+    await other.send('issue_comment', other.comment('@manki explain'));
+    await runDurableObjectAlarm(other.stub);
+    expect(await workRows(other.stub)).toMatchObject([{ status: 'skipped', note: `not opted in: token mint refused with ${typeof reply === 'number' ? reply : reply.status}` }]);
+  });
+
+  it('takes the owner, name and default branch from the repository id, never from the payload', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    github.repository = { ...github.repository, default_branch: 'trunk' };
+    const forged = pr.push(SHA_1);
+    forged.repository = { ...forged.repository, name: 'forged', owner: { login: 'mallory' }, default_branch: 'attacker-branch' };
+    await pr.send('pull_request', forged);
+    await runDurableObjectAlarm(pr.stub);
+    // The fake serves `manki-review/manki` only, so a call under the forged names would throw.
+    expect(github.graphqlVariables).toEqual([{ owner: OWNER, name: REPO, expression: 'trunk:.github/workflows' }]);
+    expect(github.dispatches.map((dispatch) => dispatch.ref)).toEqual(['trunk']);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'running' }]);
+
+    // A poll and a cancel use the same names.
+    advanceClock(QUEUED_RUN_TIMEOUT_MS + 1);
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.cancels).toEqual([9000]);
+    expect(github.repositoryReads).toBe(2);
+  });
+
+  it('reads the repository again with the opt-in once the TTL runs out', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    await runDurableObjectAlarm(pr.stub);
+    await pr.stub.runCompleted(key('d-end'), 9000, 'success');
+    advanceClock(OPT_IN_TTL_MS + 1);
+    await pr.send('issue_comment', pr.comment('@manki help'));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.repositoryReads).toBe(2);
+    expect(github.dispatches).toHaveLength(2);
+  });
+
+  it('counts a repository GitHub does not show as not opted in, and retries one it fails to read', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    github.repositoryStatus = 404;
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    await runDurableObjectAlarm(pr.stub);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped', note: 'not opted in: repository not found' }]);
+
+    const other = pullRequest();
+    const otherGitHub = fakeGitHub(other.number);
+    otherGitHub.repositoryStatus = 502;
+    await other.send('issue_comment', other.comment('@manki explain'));
+    await runDurableObjectAlarm(other.stub);
+    expect(await workRows(other.stub)).toMatchObject([{ status: 'dispatching', errors: 1 }]);
+    otherGitHub.repositoryStatus = 200;
+    advanceClock(backoff(0));
+    await runDurableObjectAlarm(other.stub);
+    expect(await workRows(other.stub)).toMatchObject([{ status: 'running' }]);
+  });
+
+  it('reads the repository again for an opt-in cached without it', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    await runInDurableObject(pr.stub, (_instance, state) => {
+      state.storage.sql.exec(
+        'INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)',
+        'opt_in', JSON.stringify({ optedIn: true, reason: 'cached before the repository was read', expires: Date.now() + OPT_IN_TTL_MS }),
+      );
+    });
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.repositoryReads).toBe(1);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'running' }]);
+  });
+
+  it('ends a running item once GitHub no longer shows its repository', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    await runDurableObjectAlarm(pr.stub);
+    github.repositoryStatus = 404;
+    advanceClock(OPT_IN_TTL_MS + 1);
+    await runDurableObjectAlarm(pr.stub);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'timed_out', note: 'the repository can no longer be read' }]);
   });
 
   it('does not dispatch for a repository that has not opted in', async () => {

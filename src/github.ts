@@ -51,9 +51,22 @@ export async function createInstallationToken(
   );
 }
 
+/** Whether a 403 is GitHub's rate limit, which passes, rather than a refusal. */
+export function isRateLimited(response: Response): boolean {
+  return response.status === 403 && (response.headers.has('retry-after') || response.headers.get('x-ratelimit-remaining') === '0');
+}
+
+/**
+ * Whether GitHub refused the request for good: a 403 that is not a rate limit, a 404 or a 422. Any other failure,
+ * such as a 5xx or a 429, may pass on a retry.
+ */
+export function isRefusal(response: Response): boolean {
+  return (response.status === 403 && !isRateLimited(response)) || response.status === 404 || response.status === 422;
+}
+
 export type MintResult =
   | { ok: true; token: string; expiresAt: number }
-  | { ok: false; status: number; message: string };
+  | { ok: false; status: number; message: string; refused: boolean };
 
 /** Mints a token for one repository of an installation, holding only `permissions`. */
 export async function mintRepositoryToken(
@@ -65,7 +78,7 @@ export async function mintRepositoryToken(
   const jwt = await createAppJWT(env.APP_ID, env.APP_PRIVATE_KEY);
   const response = await createInstallationToken(jwt, installationId, permissions, { repository_ids: [repositoryId] });
   if (!response.ok) {
-    return { ok: false, status: response.status, message: await response.text() };
+    return { ok: false, status: response.status, message: await response.text(), refused: isRefusal(response) };
   }
   const { token, expires_at } = await response.json() as { token: string; expires_at: string };
   return { ok: true, token, expiresAt: Date.parse(expires_at) };
