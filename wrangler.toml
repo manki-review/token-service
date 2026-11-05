@@ -18,6 +18,8 @@ new_sqlite_classes = ["PrCoordinator"]
 
 [vars]
 DISPATCH_ENABLED = "false"
+# manki-review/manki, manki-review/token-service and manki-review/review-memory.
+WEBHOOK_REPOS = "1190216666,1202459902,1202454534"
 
 [observability]
 enabled = true

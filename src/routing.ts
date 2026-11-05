@@ -245,6 +245,8 @@ function routeIssueComment(target: Target, payload: WebhookPayload): Route {
  */
 function routeWorkflowRun(payload: WebhookPayload): Route {
   const run = payload.workflow_run;
+  // Every run in every installed repository sends one, so anything the App did not start is dropped first.
+  if (payload.sender?.login !== BOT_LOGIN) return ignore('run was not started by Manki');
   if (payload.action !== 'completed') return ignore(`workflow_run action ${payload.action}`);
   const path = `.github/workflows/${DISPATCH_WORKFLOW}`;
   // The path can carry the ref, as in `.github/workflows/manki-dispatch.yml@refs/heads/main`.

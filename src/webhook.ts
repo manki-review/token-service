@@ -24,6 +24,37 @@ function summarize(route: Route): Record<string, unknown> {
   }
 }
 
+/** Returns the repository ids in `WEBHOOK_REPOS`. An unset or empty list allows none. */
+function allowedRepos(env: Env): Set<number> {
+  const ids = (env.WEBHOOK_REPOS ?? '').split(',').map((id) => id.trim()).filter((id) => /^[1-9][0-9]*$/.test(id));
+  return new Set(ids.map(Number));
+}
+
+/** Reads the body, refusing it once it passes `MAX_BODY_BYTES`. Returns null when it is too large. */
+async function readBody(request: Request): Promise<ArrayBuffer | null> {
+  if (!request.body) return new ArrayBuffer(0);
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MAX_BODY_BYTES) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
+  const body = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body.buffer;
+}
+
 /**
  * Verifies a GitHub App webhook delivery, logs its route and hands work, closes and run ends to the PR's
  * `PrCoordinator`.
@@ -36,12 +67,12 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
     return Response.json({ error: 'Webhook secret not configured' }, { status: 500 });
   }
 
-  // GitHub caps webhook payloads at 25 MB, so anything larger is not a delivery.
-  if (Number(request.headers.get('Content-Length') ?? 0) > MAX_BODY_BYTES) {
-    return Response.json({ error: 'Payload too large' }, { status: 413 });
-  }
-
-  const body = await request.arrayBuffer();
+  // GitHub caps webhook payloads at 25 MB, so anything larger is not a delivery. A chunked body has no
+  // `Content-Length`, so the limit is also enforced while reading.
+  const tooLarge = () => Response.json({ error: 'Payload too large' }, { status: 413 });
+  if (Number(request.headers.get('Content-Length') ?? 0) > MAX_BODY_BYTES) return tooLarge();
+  const body = await readBody(request);
+  if (body === null) return tooLarge();
   if (!(await verifyWebhookSignature(env.WEBHOOK_SECRET, body, request.headers.get('X-Hub-Signature-256')))) {
     return Response.json({ error: 'Invalid signature' }, { status: 401 });
   }
@@ -63,7 +94,12 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
     return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
   }
 
-  const route = routeDelivery(event, payload);
+  const routed = routeDelivery(event, payload);
+  // Every routed delivery writes Durable Object storage, which the account's daily row quota pays for. Only the
+  // listed repositories may spend it, so a script on another installation cannot use it up.
+  const route: Route = routed.type !== 'ignore' && !allowedRepos(env).has(routed.target.repositoryId)
+    ? { type: 'ignore', reason: `repository ${routed.target.repositoryId} is not in WEBHOOK_REPOS` }
+    : routed;
   log('webhook', { delivery, event, action: payload.action ?? null, ...summarize(route) });
   if (route.type !== 'ignore') {
     const coordinator = env.PR_COORDINATOR.getByName(`${route.target.repositoryId}:${route.target.number}`);

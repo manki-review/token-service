@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { verifyWebhookSignature } from '../src/signature';
 import worker from '../src/index';
 import { coordinator, DELIVERY_ID, freezeClock, OIDC_AUDIENCE, postWebhook, signWebhook, stubGitHub, TEST_ENV, workRows } from './helpers';
-import { HEAD_SHA, issueCommentEvent, PR_NUMBER, pullRequestEvent, REPOSITORY_ID } from './payloads';
+import { HEAD_SHA, issueCommentEvent, PR_NUMBER, pullRequestEvent, REPOSITORY_ID, workflowRunEvent } from './payloads';
 
 const encoder = new TextEncoder();
 
@@ -102,6 +102,28 @@ describe('/webhook', () => {
     expect(response.status).toBe(500);
   });
 
+  it.each([
+    ['a repository missing from WEBHOOK_REPOS', '1,2'],
+    ['an empty WEBHOOK_REPOS', ''],
+    ['an unset WEBHOOK_REPOS', undefined],
+  ])('answers 202 without touching a coordinator for %s', async (_case, repos) => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const untouched = { getByName: () => { throw new Error('no coordinator may be called'); } };
+    const env = { ...TEST_ENV, WEBHOOK_REPOS: repos, PR_COORDINATOR: untouched as unknown as typeof TEST_ENV.PR_COORDINATOR };
+    for (const [event, payload] of [['pull_request', pullRequestEvent('synchronize')], ['workflow_run', workflowRunEvent()]] as const) {
+      expect((await postWebhook({ event, payload, env })).status).toBe(202);
+    }
+    const reason = `repository ${REPOSITORY_ID} is not in WEBHOOK_REPOS`;
+    expect(logged(log)).toMatchObject([{ route: 'ignore', reason }, { route: 'ignore', reason }]);
+  });
+
+  it('accepts a repository anywhere in WEBHOOK_REPOS', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const env = { ...TEST_ENV, WEBHOOK_REPOS: ` 1, ${REPOSITORY_ID} ,3` };
+    expect((await postWebhook({ event: 'issue_comment', payload: issueCommentEvent('@manki explain', { number: 33 }), env })).status).toBe(202);
+    expect(await workRows(coordinator(REPOSITORY_ID, 33))).toHaveLength(1);
+  });
+
   it('leaves the coordinator alone for an ignored delivery', async () => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
     expect((await postWebhook({ event: 'issue_comment', payload: issueCommentEvent('LGTM', { number: 32 }) })).status).toBe(202);
@@ -156,6 +178,46 @@ describe('/webhook', () => {
       body: new ReadableStream({ pull: () => { throw new Error('the body must not be read'); } }),
     }), TEST_ENV);
     expect(response.status).toBe(413);
+  });
+
+  it('refuses a streamed body over 25 MiB with 413 once it passes the limit', async () => {
+    const chunk = new Uint8Array(1024 * 1024);
+    let pulls = 0;
+    const response = await worker.fetch(new Request(`https://${OIDC_AUDIENCE}/webhook`, {
+      method: 'POST',
+      body: new ReadableStream({
+        pull: (controller) => {
+          pulls++;
+          controller.enqueue(chunk);
+          if (pulls === 30) controller.close();
+        },
+      }),
+    }), TEST_ENV);
+    expect(response.status).toBe(413);
+    expect(pulls).toBeLessThan(30);
+  });
+
+  it('accepts a streamed body under 25 MiB', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const body = JSON.stringify({ zen: 'Half measures are as bad as nothing at all.' });
+    const bytes = new TextEncoder().encode(body);
+    const response = await worker.fetch(new Request(`https://${OIDC_AUDIENCE}/webhook`, {
+      method: 'POST',
+      headers: {
+        'X-GitHub-Event': 'ping',
+        'X-GitHub-Delivery': crypto.randomUUID(),
+        'X-GitHub-Hook-Installation-Target-ID': TEST_ENV.APP_ID,
+        'X-Hub-Signature-256': await signWebhook(body),
+      },
+      body: new ReadableStream({
+        start: (controller) => {
+          controller.enqueue(bytes.slice(0, 10));
+          controller.enqueue(bytes.slice(10));
+          controller.close();
+        },
+      }),
+    }), TEST_ENV);
+    expect(response.status).toBe(202);
   });
 
   it('answers 500 while no webhook secret is set', async () => {
