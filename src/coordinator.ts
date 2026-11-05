@@ -1,9 +1,12 @@
 import { DurableObject } from 'cloudflare:workers';
+import { dispatchInputs, runTitle } from './dispatch';
 import type { Env } from './env';
-import { mintRepositoryToken } from './github';
+import { githubApi, mintRepositoryToken } from './github';
 import { log } from './log';
+import { BOT_LOGIN } from './manki';
 import { type OptIn, readOptIn } from './opt-in';
-import type { Lane, Route, Target, Work } from './routing';
+import type { Permissions } from './permissions';
+import { DISPATCH_WORKFLOW, type Lane, type Route, type Target, type Work } from './routing';
 
 const MINUTE = 60_000;
 const DAY = 24 * 60 * MINUTE;
@@ -20,6 +23,20 @@ const LEASE_MS = 5 * MINUTE;
 const RETRY_MS = MINUTE;
 const LANES: readonly Lane[] = ['state', 'chat'];
 
+/** The wait before each retry of a dispatch that failed with a 5xx or a network error. */
+export const DISPATCH_BACKOFF_MS = [15_000, MINUTE, 5 * MINUTE];
+/** The safety net behind the `workflow_run` webhook, which normally reports a run's end within seconds. */
+export const POLL_MS = 2 * MINUTE;
+/** A run still waiting for a runner after this is cancelled. */
+export const QUEUED_RUN_TIMEOUT_MS = 30 * MINUTE;
+/** A run going this long outlived the dispatch workflow's `timeout-minutes: 30`, so it is cancelled. */
+export const RUNNING_RUN_TIMEOUT_MS = 40 * MINUTE;
+/** A dispatch answered without a run id fails once no matching run turned up in this time. */
+const RUN_LOOKUP_TIMEOUT_MS = 10 * MINUTE;
+/** Stops a comment loop from starting runs without end. */
+export const DISPATCHES_PER_HOUR = 30;
+const NOT_STARTED = new Set(['queued', 'requested', 'waiting', 'pending']);
+
 export type WorkStatus = 'queued' | 'dispatching' | 'running' | 'done' | 'failed' | 'timed_out' | 'dropped' | 'skipped';
 
 export interface WorkRow extends Record<string, string | number | null> {
@@ -35,6 +52,13 @@ export interface WorkRow extends Record<string, string | number | null> {
   status: WorkStatus;
   lease_until: number | null;
   note: string | null;
+  attempts: number;
+  first_attempt_at: number | null;
+  run_id: number | null;
+  dispatched_at: number | null;
+  check_at: number | null;
+  ended_at: number | null;
+  conclusion: string | null;
 }
 
 export type ReceiveResult = { accepted: false; reason: string } | { accepted: true; effect: string };
@@ -57,6 +81,14 @@ const MIGRATIONS = [
      note TEXT
    );
    CREATE INDEX work_by_lane ON work (lane, status, id);`,
+  `ALTER TABLE work ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+   ALTER TABLE work ADD COLUMN first_attempt_at INTEGER;
+   ALTER TABLE work ADD COLUMN run_id INTEGER;
+   ALTER TABLE work ADD COLUMN dispatched_at INTEGER;
+   ALTER TABLE work ADD COLUMN check_at INTEGER;
+   ALTER TABLE work ADD COLUMN ended_at INTEGER;
+   ALTER TABLE work ADD COLUMN conclusion TEXT;
+   CREATE INDEX work_by_run ON work (run_id);`,
 ];
 
 const ACTIVE = `status IN ('dispatching', 'running')`;
@@ -221,6 +253,8 @@ export class PrCoordinator extends DurableObject<Env> {
     );
     this.sql.exec(`UPDATE work SET status = 'queued', lease_until = NULL WHERE status = 'dispatching' AND lease_until <= ?`, now);
     await Promise.all(LANES.map(async (lane) => {
+      const running = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'running'`, lane).toArray()[0];
+      if (running && (running.check_at ?? 0) <= now) await this.poll(running);
       if (this.sql.exec(`SELECT 1 FROM work WHERE lane = ? AND ${ACTIVE}`, lane).toArray().length > 0) return;
       const next = this.sql.exec<WorkRow>(
         `SELECT * FROM work WHERE lane = ? AND status = 'queued' ORDER BY id LIMIT 1`, lane,
@@ -237,26 +271,65 @@ export class PrCoordinator extends DurableObject<Env> {
     return this.sql.exec<WorkRow>('SELECT * FROM work WHERE id = ?', id).toArray()[0];
   }
 
-  private finish(id: number, status: WorkStatus, note: string): void {
-    this.sql.exec('UPDATE work SET status = ?, note = ?, lease_until = NULL WHERE id = ?', status, note, id);
+  private isDispatching(id: number): boolean {
+    return this.row(id)?.status === 'dispatching';
+  }
+
+  private finish(id: number, status: WorkStatus, note: string, conclusion: string | null = null): void {
+    this.sql.exec(
+      'UPDATE work SET status = ?, note = ?, conclusion = ?, lease_until = NULL, check_at = NULL, ended_at = ? WHERE id = ?',
+      status, note, conclusion, Date.now(), id,
+    );
+    log('coordinator_finished', { ...this.logFields(), work_id: id, status, note, conclusion });
+  }
+
+  private target(): Target {
+    const target = this.getMeta<Target>('target');
+    if (!target) throw new Error('no target recorded');
+    return target;
+  }
+
+  /** Mints a token for this repository alone. Returns null when GitHub refuses, which it does for an ungranted permission. */
+  private async token(permissions: Permissions): Promise<string | null> {
+    const target = this.target();
+    const mint = await mintRepositoryToken(this.env, target.installationId, target.repositoryId, permissions);
+    if (mint.ok) return mint.token;
+    log('coordinator_token_refused', { ...this.logFields(), permissions, status: mint.status, message: mint.message });
+    return null;
   }
 
   private async start(item: WorkRow): Promise<void> {
     this.sql.exec(`UPDATE work SET status = 'dispatching', lease_until = ? WHERE id = ?`, Date.now() + LEASE_MS, item.id);
-    let optIn: OptIn;
     try {
-      optIn = await this.optIn();
+      const optIn = await this.optIn();
+      // A close may have dropped the item while the opt-in was read.
+      if (!this.isDispatching(item.id)) return;
+      if (this.env.DISPATCH_ENABLED !== 'true') {
+        log('coordinator_would_dispatch', { ...this.logFields(), ...this.describe(item), opted_in: optIn.optedIn, opt_in_reason: optIn.reason });
+        this.finish(item.id, 'skipped', 'dispatch is not enabled');
+        return;
+      }
+      if (!optIn.optedIn) {
+        this.finish(item.id, 'skipped', `not opted in: ${optIn.reason}`);
+        return;
+      }
+      const recent = this.sql.exec<{ count: number }>(
+        'SELECT COUNT(*) AS count FROM work WHERE dispatched_at > ?', Date.now() - 60 * MINUTE,
+      ).one().count;
+      if (recent >= DISPATCHES_PER_HOUR) {
+        this.finish(item.id, 'dropped', `over ${DISPATCHES_PER_HOUR} dispatches in the last hour`);
+        return;
+      }
+      await this.dispatch(item);
     } catch (error) {
       // The lease runs out after `RETRY_MS`, and the next pass takes the item again.
-      this.sql.exec('UPDATE work SET lease_until = ? WHERE id = ? AND status = ?', Date.now() + RETRY_MS, item.id, 'dispatching');
-      log('coordinator_opt_in_error', { ...this.logFields(), work_id: item.id, error: String(error) });
-      return;
+      this.sql.exec(`UPDATE work SET lease_until = ? WHERE id = ? AND status = 'dispatching'`, Date.now() + RETRY_MS, item.id);
+      log('coordinator_start_error', { ...this.logFields(), work_id: item.id, error: String(error) });
     }
-    // A close may have dropped the item while the opt-in was read.
-    if (this.row(item.id)?.status !== 'dispatching') return;
+  }
 
-    log('coordinator_would_dispatch', {
-      ...this.logFields(),
+  private describe(item: WorkRow): Record<string, unknown> {
+    return {
       work_id: item.id,
       lane: item.lane,
       kind: item.kind,
@@ -265,10 +338,196 @@ export class PrCoordinator extends DurableObject<Env> {
       object_id: item.object_id,
       sender: item.sender,
       delivery: item.delivery,
-      opted_in: optIn.optedIn,
-      opt_in_reason: optIn.reason,
+    };
+  }
+
+  /** Starts a run for `item`. Every GitHub call is followed by a fresh read of the row before anything is written. */
+  private async dispatch(item: WorkRow): Promise<void> {
+    const target = this.target();
+    if (item.kind === 'review' && !(await this.refreshReview(item, target))) return;
+
+    const current = this.row(item.id);
+    if (current?.status !== 'dispatching') return;
+    if (current.attempts > 0) {
+      const runId = await this.findRun(current, target);
+      if (!this.isDispatching(item.id)) return;
+      if (runId !== null) {
+        this.markRunning(current, runId, 'recovered the run of an earlier attempt');
+        return;
+      }
+    }
+
+    const token = await this.token({ actions: 'write' });
+    if (!this.isDispatching(item.id)) return;
+    if (token === null) {
+      log('coordinator_lacks_actions_write', { ...this.logFields(), work_id: item.id });
+      this.setMeta('opt_in', { optedIn: false, reason: 'installation lacks actions: write', expires: Date.now() + OPT_IN_TTL_MS });
+      this.finish(item.id, 'skipped', 'installation lacks actions: write');
+      return;
+    }
+
+    const now = Date.now();
+    this.sql.exec(
+      'UPDATE work SET attempts = attempts + 1, first_attempt_at = COALESCE(first_attempt_at, ?) WHERE id = ?',
+      now, item.id,
+    );
+    const attempts = current.attempts + 1;
+    let response: Response | null = null;
+    try {
+      response = await githubApi(token, `/repos/${target.owner}/${target.repo}/actions/workflows/${DISPATCH_WORKFLOW}/dispatches`, {
+        method: 'POST',
+        body: { ref: target.defaultBranch, inputs: dispatchInputs(current, target.number), return_run_details: true },
+      });
+    } catch (error) {
+      log('coordinator_dispatch_error', { ...this.logFields(), work_id: item.id, attempts, error: String(error) });
+    }
+    const latest = this.row(item.id);
+    if (latest?.status !== 'dispatching') return;
+
+    if (response?.status === 200) {
+      const { workflow_run_id } = await response.json() as { workflow_run_id?: number };
+      this.markRunning(latest, workflow_run_id ?? null, 'dispatched');
+    } else if (response?.status === 204) {
+      this.markRunning(latest, null, 'dispatched without run details');
+    } else if (response === null || response.status >= 500 || response.status === 429) {
+      if (attempts > DISPATCH_BACKOFF_MS.length) {
+        this.finish(item.id, 'failed', `dispatch failed ${attempts} times, last with ${response?.status ?? 'a network error'}`);
+      } else {
+        this.sql.exec('UPDATE work SET lease_until = ? WHERE id = ?', Date.now() + DISPATCH_BACKOFF_MS[attempts - 1], item.id);
+        log('coordinator_dispatch_retry', { ...this.logFields(), work_id: item.id, attempts, status: response?.status ?? null });
+      }
+    } else {
+      // 403, 404 and 422 mean the permission, the file or its `workflow_dispatch` trigger is missing.
+      this.sql.exec(`DELETE FROM meta WHERE key = 'opt_in'`);
+      this.finish(item.id, 'failed', `dispatch refused with ${response.status}: ${(await response.text()).slice(0, 200)}`);
+    }
+  }
+
+  /** Re-reads the PR before a review starts. Returns false when the review was dropped. */
+  private async refreshReview(item: WorkRow, target: Target): Promise<boolean> {
+    const token = await this.token({ pull_requests: 'read' });
+    if (token === null) throw new Error('could not mint a token to read the pull request');
+    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/pulls/${target.number}`);
+    if (!response.ok) throw new Error(`reading the pull request failed with ${response.status}`);
+    const pr = await response.json() as { state: string; draft?: boolean; head: { sha: string } };
+    if (!this.isDispatching(item.id)) return false;
+    if (pr.state !== 'open') {
+      this.finish(item.id, 'dropped', 'pull request closed');
+      return false;
+    }
+    if (item.event.startsWith('pull_request.')) {
+      if (pr.draft) {
+        this.finish(item.id, 'dropped', 'pull request is a draft');
+        return false;
+      }
+      this.sql.exec('UPDATE work SET head_sha = ? WHERE id = ?', pr.head.sha, item.id);
+    }
+    return true;
+  }
+
+  private markRunning(item: WorkRow, runId: number | null, note: string): void {
+    const now = Date.now();
+    this.sql.exec(
+      `UPDATE work SET status = 'running', run_id = ?, dispatched_at = ?, check_at = ?, lease_until = NULL, note = ? WHERE id = ?`,
+      runId, now, now + POLL_MS, note, item.id,
+    );
+    log('coordinator_dispatched', { ...this.logFields(), ...this.describe(this.row(item.id)!), run_id: runId, note });
+  }
+
+  /**
+   * Finds the run an earlier attempt started when its response was lost. It must carry the exact `display_title`,
+   * come from the App, start after the first attempt and belong to no other item.
+   */
+  private async findRun(item: WorkRow, target: Target): Promise<number | null> {
+    const token = await this.token({ actions: 'read' });
+    if (token === null) return null;
+    const since = new Date((item.first_attempt_at ?? Date.now()) - MINUTE).toISOString();
+    const response = await githubApi(
+      token,
+      `/repos/${target.owner}/${target.repo}/actions/workflows/${DISPATCH_WORKFLOW}/runs?event=workflow_dispatch&created=${encodeURIComponent(`>=${since}`)}&per_page=50`,
+    );
+    if (!response.ok) throw new Error(`listing dispatch runs failed with ${response.status}`);
+    const { workflow_runs: runs } = await response.json() as {
+      workflow_runs: Array<{ id: number; display_title: string; created_at: string; actor?: { login?: string } }>;
+    };
+    const known = new Set(this.sql.exec<{ run_id: number }>('SELECT run_id FROM work WHERE run_id IS NOT NULL').toArray().map((row) => row.run_id));
+    const title = runTitle(item, target.number);
+    const match = runs
+      .filter((run) => run.display_title === title && run.actor?.login === BOT_LOGIN && !known.has(run.id))
+      .sort((a, b) => a.created_at.localeCompare(b.created_at))[0];
+    return match?.id ?? null;
+  }
+
+  /** Checks a running item's run, the safety net for a missed `workflow_run` delivery and runs that never start. */
+  private async poll(item: WorkRow): Promise<void> {
+    const now = Date.now();
+    const target = this.target();
+    const later = () => this.sql.exec(`UPDATE work SET check_at = ? WHERE id = ? AND status = 'running'`, Date.now() + POLL_MS, item.id);
+
+    if (item.run_id === null) {
+      const runId = await this.findRun({ ...item, first_attempt_at: item.first_attempt_at ?? item.dispatched_at }, target);
+      if (this.row(item.id)?.status !== 'running') return;
+      if (runId !== null) this.sql.exec('UPDATE work SET run_id = ? WHERE id = ?', runId, item.id);
+      else if (now - (item.dispatched_at ?? now) > RUN_LOOKUP_TIMEOUT_MS) this.finish(item.id, 'failed', 'no run found for the dispatch');
+      later();
+      return;
+    }
+
+    const token = await this.token({ actions: 'read' });
+    if (token === null) {
+      later();
+      return;
+    }
+    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/actions/runs/${item.run_id}`);
+    if (this.row(item.id)?.status !== 'running') return;
+    if (response.status === 404) {
+      this.finish(item.id, 'done', 'run deleted');
+      return;
+    }
+    if (!response.ok) {
+      later();
+      return;
+    }
+    const run = await response.json() as { status: string; conclusion: string | null; run_started_at?: string };
+    if (run.status === 'completed') {
+      this.finish(item.id, 'done', 'run completed (poll)', run.conclusion);
+      return;
+    }
+    const startedAt = run.run_started_at ? Date.parse(run.run_started_at) : item.dispatched_at ?? now;
+    if (NOT_STARTED.has(run.status) && now - (item.dispatched_at ?? now) > QUEUED_RUN_TIMEOUT_MS) {
+      await this.cancel(item, target, 'run never started');
+    } else if (!NOT_STARTED.has(run.status) && now - startedAt > RUNNING_RUN_TIMEOUT_MS) {
+      await this.cancel(item, target, 'run went past its timeout');
+    } else {
+      later();
+    }
+  }
+
+  private async cancel(item: WorkRow, target: Target, reason: string): Promise<void> {
+    const token = await this.token({ actions: 'write' });
+    const response = token === null
+      ? null
+      : await githubApi(token, `/repos/${target.owner}/${target.repo}/actions/runs/${item.run_id}/cancel`, { method: 'POST' });
+    if (this.row(item.id)?.status !== 'running') return;
+    this.finish(item.id, 'timed_out', `${reason}, cancel ${response?.ok ? 'requested' : 'failed'}`);
+  }
+
+  /** Ends the item whose run finished, from the `workflow_run` webhook, and frees its lane. */
+  async runCompleted(delivery: string, runId: number, conclusion: string | null): Promise<ReceiveResult> {
+    const now = Date.now();
+    const result = this.ctx.storage.transactionSync((): ReceiveResult => {
+      if (this.sql.exec('SELECT 1 FROM deliveries WHERE id = ?', delivery).toArray().length > 0) {
+        return { accepted: false, reason: 'duplicate delivery' };
+      }
+      const [item] = this.sql.exec<{ id: number }>(`SELECT id FROM work WHERE run_id = ? AND status = 'running'`, runId).toArray();
+      if (!item) return { accepted: false, reason: `no running item for run ${runId}` };
+      this.sql.exec('INSERT INTO deliveries (id, received_at) VALUES (?, ?)', delivery, now);
+      this.finish(item.id, 'done', 'run completed', conclusion);
+      return { accepted: true, effect: `finished work ${item.id}` };
     });
-    this.finish(item.id, 'skipped', 'dispatch is not enabled');
+    log('coordinator_run_completed', { ...this.logFields(), delivery, run_id: runId, conclusion, ...result });
+    if (result.accepted) await this.ctx.storage.setAlarm(now);
+    return result;
   }
 
   /** Returns whether the repository opted in to webhook mode, read at most every `OPT_IN_TTL_MS`. */
@@ -296,10 +555,10 @@ export class PrCoordinator extends DurableObject<Env> {
     const now = Date.now();
     const times: number[] = [];
     for (const lane of LANES) {
-      const active = this.sql.exec<{ lease_until: number | null }>(
-        `SELECT lease_until FROM work WHERE lane = ? AND ${ACTIVE}`, lane,
+      const active = this.sql.exec<{ at: number | null }>(
+        `SELECT COALESCE(lease_until, check_at) AS at FROM work WHERE lane = ? AND ${ACTIVE}`, lane,
       ).toArray()[0];
-      if (active?.lease_until) times.push(active.lease_until);
+      if (active?.at) times.push(active.at);
       else if (!active && this.hasQueued(lane)) times.push(now);
     }
     const newest = this.sql.exec<{ at: number | null }>('SELECT MAX(received_at) AS at FROM deliveries').one().at;

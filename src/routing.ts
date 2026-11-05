@@ -1,3 +1,4 @@
+import { numberFromRunTitle } from './dispatch';
 import {
   BOT_LOGIN,
   detectTickedMarker,
@@ -230,8 +231,6 @@ function routeIssueComment(target: Target, payload: WebhookPayload): Route {
   return { type: 'work', target, work: work(lane, 'comment', payload, 'issue_comment', objectId) };
 }
 
-const RUN_NAME_PR = /\bPR (\d+)\b/;
-
 /**
  * Routes the end of a dispatched run to its PR. The dispatch workflow's `run-name` puts the PR number in the run's
  * `display_title`. The coordinator matches the run id, so a title naming the wrong PR is ignored there.
@@ -239,11 +238,12 @@ const RUN_NAME_PR = /\bPR (\d+)\b/;
 function routeWorkflowRun(payload: WebhookPayload): Route {
   const run = payload.workflow_run;
   if (payload.action !== 'completed') return ignore(`workflow_run action ${payload.action}`);
-  if (run?.id === undefined || run.event !== 'workflow_dispatch' || run.path !== `.github/workflows/${DISPATCH_WORKFLOW}`) {
+  const path = `.github/workflows/${DISPATCH_WORKFLOW}`;
+  // The path can carry the ref, as in `.github/workflows/manki-dispatch.yml@refs/heads/main`.
+  if (run?.id === undefined || run.event !== 'workflow_dispatch' || (run.path !== path && !run.path?.startsWith(`${path}@`))) {
     return ignore('not a Manki dispatch run');
   }
-  const match = run.display_title?.match(RUN_NAME_PR);
-  const target = targetOf(payload, match ? Number(match[1]) : undefined);
+  const target = targetOf(payload, numberFromRunTitle(run.display_title));
   if (!target) return ignore('run name or payload lacks the PR');
   return { type: 'run_completed', target, runId: run.id, conclusion: run.conclusion ?? null };
 }

@@ -206,3 +206,8 @@ export function coordinator(repositoryId: number, number: number): DurableObject
 export async function workRows(stub: DurableObjectStub<PrCoordinator>): Promise<WorkRow[]> {
   return runInDurableObject(stub, (_instance, state) => state.storage.sql.exec<WorkRow>('SELECT * FROM work ORDER BY id').toArray());
 }
+
+/** Switches dispatch on or off for the Durable Objects, which read `DISPATCH_ENABLED` from the runtime env. */
+export function setDispatchEnabled(enabled: boolean): void {
+  RUNTIME_ENV.DISPATCH_ENABLED = enabled ? 'true' : 'false';
+}
