@@ -30,6 +30,8 @@ function verdict(route: Route): string {
       return `${route.work.lane}:${route.work.kind}`;
     case 'close':
       return route.merged ? 'close+merged' : 'close';
+    case 'seen':
+      return 'seen';
     case 'run_completed':
       return 'run_completed';
   }
@@ -43,8 +45,11 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['a push to a draft', 'pull_request', pullRequestEvent('synchronize', { draft: true }), 'ignore'],
   ['a push to a fork PR', 'pull_request', forkPullRequestEvent('synchronize'), 'ignore'],
   ['a push to a PR whose fork was deleted', 'pull_request', pullRequestEvent('synchronize', { head: { sha: HEAD_SHA, repo: null } }), 'ignore'],
-  ['a push by a bot', 'pull_request', pullRequestEvent('synchronize', {}, BOT_SENDER), 'ignore'],
-  ['a push by the Manki App', 'pull_request', pullRequestEvent('synchronize', {}, { login: 'manki-review[bot]', type: 'User' }), 'ignore'],
+  ['a push by a bot', 'pull_request', pullRequestEvent('synchronize', {}, BOT_SENDER), 'seen'],
+  ['a PR opened by a bot', 'pull_request', pullRequestEvent('opened', {}, BOT_SENDER), 'seen'],
+  ['a push by the Manki App', 'pull_request', pullRequestEvent('synchronize', {}, { login: 'manki-review[bot]', type: 'User' }), 'seen'],
+  ['a bot push to a fork PR', 'pull_request', { ...forkPullRequestEvent('synchronize'), sender: BOT_SENDER }, 'ignore'],
+  ['a PR labeled by a bot', 'pull_request', pullRequestEvent('labeled', {}, BOT_SENDER), 'ignore'],
   ['a labeled PR', 'pull_request', pullRequestEvent('labeled'), 'ignore'],
   ['a reopened PR', 'pull_request', pullRequestEvent('reopened'), 'ignore'],
   ['a merge', 'pull_request', pullRequestEvent('closed', { merged: true }), 'close+merged'],

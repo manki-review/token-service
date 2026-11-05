@@ -17,7 +17,7 @@ import {
   type Delivery,
   UNTRUSTED_DISPATCHES_PER_HOUR,
 } from '../src/coordinator';
-import { routeDelivery, type WebhookPayload } from '../src/routing';
+import { routeDelivery, type Target, type WebhookPayload } from '../src/routing';
 import {
   apiRequests,
   coordinator,
@@ -286,6 +286,51 @@ describe('PrCoordinator.receive', () => {
     await pr.send('pull_request', pr.push(SHA_1));
     expect(await pr.send('pull_request', pr.close(false))).toEqual({ accepted: true, effect: 'closed, dropped 1' });
     expect((await workRows(pr.stub)).map((row) => row.status)).toEqual(['dropped']);
+  });
+});
+
+describe('PrCoordinator catch-up state', () => {
+  const target = (number: number): Target => ({
+    installationId: INSTALLATION_ID, repositoryId: REPOSITORY_ID, owner: 'manki-review', repo: 'manki', defaultBranch: 'main', number,
+  });
+
+  it('reports a head as needed until a review of it is queued, and again once that review is dropped', async () => {
+    const pr = pullRequest();
+    expect(await pr.stub.catchUpState(SHA_1)).toBe('needed');
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    expect(await pr.stub.catchUpState(SHA_1)).toBe('needed');
+    await pr.send('pull_request', pr.push(SHA_1));
+    expect(await pr.stub.catchUpState(SHA_1)).toBe('pending');
+    expect(await pr.stub.catchUpState(SHA_2)).toBe('needed');
+    await pr.send('pull_request', pr.close(false));
+    expect(await pr.stub.catchUpState(SHA_1)).toBe('needed');
+  });
+
+  it('reports a head as needed again when its review was skipped', async () => {
+    stubGitHub(OPTED_IN);
+    const pr = pullRequest();
+    await pr.send('pull_request', pr.push(SHA_1));
+    await runDurableObjectAlarm(pr.stub);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped' }]);
+    expect(await pr.stub.catchUpState(SHA_1)).toBe('needed');
+  });
+
+  it('stores a catch-up like a delivery and refuses the same head again', async () => {
+    const pr = pullRequest();
+    expect(await pr.stub.catchUp(target(pr.number), SHA_1)).toEqual({ accepted: true, effect: 'queued work 1' });
+    const deliveries = await runInDurableObject(pr.stub, (_instance, state) =>
+      state.storage.sql.exec<{ id: string; received_at: number }>('SELECT id, received_at FROM deliveries').toArray());
+    expect(deliveries).toEqual([{ id: `catch-up-${SHA_1.slice(0, 12)}`, received_at: Date.now() }]);
+    expect(await pr.stub.catchUp(target(pr.number), SHA_1)).toEqual({ accepted: false, reason: 'head already handled' });
+  });
+
+  it('marks a bot head as handled without work, refuses the same delivery twice and sets its cleanup alarm', async () => {
+    const pr = pullRequest();
+    expect(await pr.stub.markSeen('d-bot', target(pr.number), SHA_1)).toEqual({ accepted: true, effect: 'head marked as seen' });
+    expect(await pr.stub.markSeen('d-bot', target(pr.number), SHA_1)).toEqual({ accepted: false, reason: 'duplicate delivery' });
+    expect(await workRows(pr.stub)).toEqual([]);
+    expect(await pr.stub.catchUpState(SHA_1)).toBe('handled');
+    expect(await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm())).toBe(Date.now() + DELIVERY_RETENTION_MS);
   });
 });
 
@@ -689,6 +734,48 @@ describe('PrCoordinator dispatch', () => {
       { kind: 'comment', status: 'running', run_id: 9000 },
       { kind: 'merged', status: 'queued' },
     ]);
+  });
+
+  it('does not review a head again for a late redelivery of its push', async () => {
+    const pr = pullRequest();
+    fakeGitHub(pr.number);
+    await pr.stub.catchUp(
+      { installationId: INSTALLATION_ID, repositoryId: REPOSITORY_ID, owner: OWNER, repo: REPO, defaultBranch: 'main', number: pr.number },
+      SHA_1,
+    );
+    await runDurableObjectAlarm(pr.stub);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'running', head_sha: SHA_1 }]);
+    expect(await pr.send('pull_request', pr.push(SHA_1))).toEqual({ accepted: true, effect: 'head already reviewed or under review' });
+
+    await pr.stub.runCompleted('d-end', 9000, 'success');
+    expect(await pr.stub.catchUpState(SHA_1)).toBe('handled');
+    expect(await pr.send('pull_request', pr.push(SHA_1))).toEqual({ accepted: true, effect: 'head already reviewed or under review' });
+    expect(await pr.send('pull_request', pr.push(SHA_2))).toEqual({ accepted: true, effect: 'queued work 2' });
+  });
+
+  it.each([
+    ['failed', 'failure'],
+    ['was cancelled', 'cancelled'],
+  ])('reviews a head again when its run %s', async (_case, conclusion) => {
+    const pr = pullRequest();
+    fakeGitHub(pr.number);
+    await pr.send('pull_request', pr.push(SHA_1));
+    await runDurableObjectAlarm(pr.stub);
+    await pr.stub.runCompleted('d-end', 9000, conclusion);
+    expect(await pr.stub.catchUpState(SHA_1)).toBe('needed');
+    expect(await pr.send('pull_request', pr.push(SHA_1))).toEqual({ accepted: true, effect: 'queued work 2' });
+  });
+
+  it('reviews a head again when its run was deleted', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    await pr.send('pull_request', pr.push(SHA_1));
+    await runDurableObjectAlarm(pr.stub);
+    github.runs.delete(9000);
+    advanceClock(POLL_MS);
+    await runDurableObjectAlarm(pr.stub);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'done', note: 'run deleted' }]);
+    expect(await pr.stub.catchUpState(SHA_1)).toBe('needed');
   });
 
   it('queues a review of a new head pushed while a review runs', async () => {

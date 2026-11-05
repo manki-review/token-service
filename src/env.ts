@@ -1,4 +1,5 @@
 import type { PrCoordinator } from './coordinator';
+import type { Reconciler } from './reconciler';
 
 export interface Env {
   APP_ID: string;
@@ -11,4 +12,11 @@ export interface Env {
   /** Comma-separated ids of the repositories whose deliveries reach a coordinator. Any other is logged and dropped. */
   WEBHOOK_REPOS?: string;
   PR_COORDINATOR: DurableObjectNamespace<PrCoordinator>;
+  RECONCILER: DurableObjectNamespace<Reconciler>;
+}
+
+/** Returns the repository ids in `WEBHOOK_REPOS`. An unset or empty list allows none. */
+export function allowedRepos(env: Env): Set<number> {
+  const ids = (env.WEBHOOK_REPOS ?? '').split(',').map((id) => id.trim()).filter((id) => /^[1-9][0-9]*$/.test(id));
+  return new Set(ids.map(Number));
 }

@@ -1,4 +1,4 @@
-import type { Env } from './env';
+import { allowedRepos, type Env } from './env';
 import { log } from './log';
 import { routeDelivery, type Route, type WebhookPayload } from './routing';
 import { sha256Hex, verifyWebhookSignature } from './signature';
@@ -19,15 +19,11 @@ function summarize(route: Route): Record<string, unknown> {
     }
     case 'close':
       return { route: 'close', pr: route.target.number, repository_id: route.target.repositoryId, merged: route.merged !== null };
+    case 'seen':
+      return { route: 'seen', pr: route.target.number, repository_id: route.target.repositoryId, head_sha: route.headSha };
     case 'run_completed':
       return { route: 'run_completed', pr: route.target.number, run_id: route.runId, conclusion: route.conclusion };
   }
-}
-
-/** Returns the repository ids in `WEBHOOK_REPOS`. An unset or empty list allows none. */
-function allowedRepos(env: Env): Set<number> {
-  const ids = (env.WEBHOOK_REPOS ?? '').split(',').map((id) => id.trim()).filter((id) => /^[1-9][0-9]*$/.test(id));
-  return new Set(ids.map(Number));
 }
 
 /** Reads the body, refusing it once it passes `MAX_BODY_BYTES`. Returns null when it is too large. */
@@ -112,6 +108,7 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
     const key = { id: delivery, bodyHash: event === 'pull_request_review_thread' ? null : await sha256Hex(body) };
     try {
       if (route.type === 'run_completed') await coordinator.runCompleted(key, route.runId, route.conclusion);
+      else if (route.type === 'seen') await coordinator.markSeen(key, route.target, route.headSha);
       else await coordinator.receive(key, route);
     } catch (error) {
       log('webhook_coordinator_error', { delivery, error: String(error) });

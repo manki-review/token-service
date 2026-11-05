@@ -12,9 +12,20 @@ routes = [
 name = "PR_COORDINATOR"
 class_name = "PrCoordinator"
 
+[[durable_objects.bindings]]
+name = "RECONCILER"
+class_name = "Reconciler"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["PrCoordinator"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["Reconciler"]
+
+[triggers]
+crons = ["*/5 * * * *"]
 
 [vars]
 DISPATCH_ENABLED = "false"
