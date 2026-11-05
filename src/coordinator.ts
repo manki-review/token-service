@@ -517,13 +517,14 @@ export class PrCoordinator extends DurableObject<Env> {
     // A run that started is tracked even when a close dropped the item meanwhile, so the lane waits for it.
     const started = response?.status === 200 || response?.status === 204;
     if (!latest || (latest.status !== 'dispatching' && !started)) return;
+    const failure = response && !started ? await response.text() : '';
 
     if (response?.status === 200) {
       const { workflow_run_id } = await response.json() as { workflow_run_id?: number };
       this.markRunning(latest, workflow_run_id ?? null, 'dispatched');
     } else if (response?.status === 204) {
       this.markRunning(latest, null, 'dispatched without run details');
-    } else if (response === null || response.status >= 500 || response.status === 429 || isRateLimited(response)) {
+    } else if (response === null || response.status >= 500 || response.status === 429 || isRateLimited(response, failure)) {
       if (attempts > DISPATCH_BACKOFF_MS.length) {
         this.finish(item.id, 'failed', `dispatch failed ${attempts} times, last with ${response?.status ?? 'a network error'}`);
       } else {
@@ -533,7 +534,7 @@ export class PrCoordinator extends DurableObject<Env> {
     } else {
       // 403, 404 and 422 mean the permission, the file or its `workflow_dispatch` trigger is missing.
       this.sql.exec(`DELETE FROM meta WHERE key = 'opt_in'`);
-      this.finish(item.id, 'failed', `dispatch refused with ${response.status}: ${(await response.text()).slice(0, 200)}`);
+      this.finish(item.id, 'failed', `dispatch refused with ${response.status}: ${failure.slice(0, 200)}`);
     }
   }
 
@@ -603,8 +604,9 @@ export class PrCoordinator extends DurableObject<Env> {
     );
     const target = await this.verifiedTarget();
     if (!target) {
-      // Nothing is dispatched while the repository cannot be read, so ending the item cannot let two runs overlap.
-      this.finish(item.id, 'timed_out', 'the repository can no longer be read');
+      // The run cannot be read or cancelled without the repository's names, so the item waits for them to come back.
+      // Past the deadline it ends, since no cancel is possible and a started run is past the workflow's `timeout-minutes`.
+      if (now - dispatchedAt > RUN_DEADLINE_MS) this.finish(item.id, 'timed_out', 'the repository can no longer be read');
       return;
     }
 

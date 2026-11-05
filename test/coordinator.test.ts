@@ -476,7 +476,19 @@ describe('PrCoordinator.alarm', () => {
   });
 });
 
-type Reply = number | { status: number; headers: Record<string, string> };
+type Reply = number | { status: number; headers?: Record<string, string>; body?: string };
+
+/** The status, headers and body a `Reply` answers with. */
+function replyParts(reply: Reply): { status: number; headers: Record<string, string>; body: string } {
+  return typeof reply === 'number'
+    ? { status: reply, headers: {}, body: '{"message":"no"}' }
+    : { headers: {}, body: '{"message":"no"}', ...reply };
+}
+
+const SECONDARY_RATE_LIMIT: Reply = {
+  status: 403,
+  body: '{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again."}',
+};
 
 interface FakeRun {
   status: string;
@@ -525,8 +537,8 @@ function fakeGitHub(number: number) {
       if (failure >= 0) {
         const [{ reply }] = state.mintFailures.splice(failure, 1);
         if (reply === 'network') throw new TypeError('Network connection lost');
-        const { status, headers } = typeof reply === 'number' ? { status: reply, headers: {} } : reply;
-        return Response.json({ message: 'no' }, { status, headers });
+        const { status, headers, body: text } = replyParts(reply);
+        return new Response(text, { status, headers });
       }
       if (state.refuseActionsWrite && body.permissions.actions === 'write') {
         return Response.json({ message: 'The permissions requested are not granted to this installation.' }, { status: 422 });
@@ -548,9 +560,9 @@ function fakeGitHub(number: number) {
     if (route === `POST ${repo}/actions/workflows/manki-dispatch.yml/dispatches`) {
       state.dispatches.push(await request.json() as (typeof state.dispatches)[number]);
       const next = state.dispatchStatuses.shift() ?? 200;
-      const { status, headers } = typeof next === 'number' ? { status: next, headers: {} } : next;
+      const { status, headers, body: text } = replyParts(next);
       if (status === 204) return new Response(null, { status });
-      if (status !== 200) return new Response('{"message":"no"}', { status, headers });
+      if (status !== 200) return new Response(text, { status, headers });
       const id = state.nextRunId++;
       state.runs.set(id, { status: 'queued' });
       return Response.json({ workflow_run_id: id, run_url: `https://api.github.com${repo}/actions/runs/${id}`, html_url: 'https://github.com' });
@@ -946,10 +958,11 @@ describe('PrCoordinator dispatch', () => {
     expect(actionsWrites()).toBe(2);
   });
 
-  it.each<[string, number | { status: number; headers: Record<string, string> }]>([
+  it.each<[string, Reply]>([
     ['a 429', 429],
     ['a 403 with retry-after', { status: 403, headers: { 'retry-after': '30' } }],
     ['a 403 with no rate limit left', { status: 403, headers: { 'x-ratelimit-remaining': '0' } }],
+    ['a 403 that names a secondary rate limit', SECONDARY_RATE_LIMIT],
   ])('retries a dispatch refused with %s', async (_case, reply) => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
@@ -1111,6 +1124,7 @@ describe('PrCoordinator dispatch', () => {
     ['a 429', 429],
     ['a 403 with retry-after', { status: 403, headers: { 'retry-after': '30' } }],
     ['a 403 with no rate limit left', { status: 403, headers: { 'x-ratelimit-remaining': '0' } }],
+    ['a 403 that names a secondary rate limit', SECONDARY_RATE_LIMIT],
     ['a network error', 'network'],
   ];
 
@@ -1230,15 +1244,33 @@ describe('PrCoordinator dispatch', () => {
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'running' }]);
   });
 
-  it('ends a running item once GitHub no longer shows its repository', async () => {
+  it('keeps a running item while GitHub does not show its repository, and ends it at the deadline', async () => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
     await pr.send('issue_comment', pr.comment('@manki explain'));
+    await pr.send('issue_comment', pr.comment('@manki help'));
     await runDurableObjectAlarm(pr.stub);
     github.repositoryStatus = 404;
     advanceClock(OPT_IN_TTL_MS + 1);
     await runDurableObjectAlarm(pr.stub);
-    expect(await workRows(pr.stub)).toMatchObject([{ status: 'timed_out', note: 'the repository can no longer be read' }]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'running' }, { status: 'queued' }]);
+
+    // Once the repository shows again, the poll can cancel the run that never started.
+    github.repositoryStatus = 200;
+    advanceClock(QUEUED_RUN_TIMEOUT_MS);
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.cancels).toEqual([9000]);
+    expect(github.dispatches).toHaveLength(2);
+
+    github.repositoryStatus = 404;
+    advanceClock(RUN_DEADLINE_MS + 1);
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.cancels).toEqual([9000]);
+    expect(await workRows(pr.stub)).toMatchObject([
+      { status: 'timed_out', note: 'the repository can no longer be read', run_id: 9001 },
+      { status: 'skipped', note: 'not opted in: repository not found' },
+    ]);
+    expect(github.dispatches).toHaveLength(2);
   });
 
   it('does not dispatch for a repository that has not opted in', async () => {
