@@ -18,8 +18,8 @@ export interface Installation {
 
 export async function getInstallation(jwt: string, owner: string, repo: string): Promise<Installation | null> {
   const response = await fetch(
-    `https://api.github.com/repos/${owner}/${repo}/installation`,
-    { headers: githubHeaders(jwt) },
+    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/installation`,
+    { headers: githubHeaders(jwt), redirect: 'manual' },
   );
 
   if (!response.ok) {
@@ -30,19 +30,23 @@ export async function getInstallation(jwt: string, owner: string, repo: string):
   return { id: data.id, permissions: data.permissions ?? {} };
 }
 
-/** Mints an installation token with `permissions`. `repositoryIds` narrows it to those repositories. */
+/** The repositories a token is limited to, by id or by name under the installation's account. */
+export type RepositoryScope = { repository_ids: number[] } | { repositories: string[] };
+
+/** Mints an installation token with `permissions` for the repositories in `scope`. */
 export async function createInstallationToken(
   jwt: string,
   installationId: number,
   permissions: Permissions,
-  repositoryIds?: number[],
+  scope: RepositoryScope,
 ): Promise<Response> {
   return fetch(
     `https://api.github.com/app/installations/${installationId}/access_tokens`,
     {
       method: 'POST',
       headers: { ...githubHeaders(jwt), 'Content-Type': 'application/json' },
-      body: JSON.stringify(repositoryIds ? { permissions, repository_ids: repositoryIds } : { permissions }),
+      body: JSON.stringify({ permissions, ...scope }),
+      redirect: 'manual',
     },
   );
 }
@@ -59,7 +63,7 @@ export async function mintRepositoryToken(
   permissions: Permissions,
 ): Promise<MintResult> {
   const jwt = await createAppJWT(env.APP_ID, env.APP_PRIVATE_KEY);
-  const response = await createInstallationToken(jwt, installationId, permissions, [repositoryId]);
+  const response = await createInstallationToken(jwt, installationId, permissions, { repository_ids: [repositoryId] });
   if (!response.ok) {
     return { ok: false, status: response.status, message: await response.text() };
   }
@@ -75,6 +79,7 @@ export async function githubApi(token: string, path: string, init: { method?: st
     method: init.method ?? 'GET',
     headers,
     body: init.body === undefined ? undefined : JSON.stringify(init.body),
+    redirect: 'manual',
   });
 }
 

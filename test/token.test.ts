@@ -17,6 +17,7 @@ import {
   REPO,
   stubGitHub,
   TEST_ENV,
+  type StubReply,
 } from './helpers';
 
 const otherKeys = await generateKeyPair('RS256', { extractable: true });
@@ -28,6 +29,23 @@ function paths(requests: Request[]): string[] {
 const LOOKUP = `GET /repos/${OWNER}/${REPO}/installation`;
 const MINT = `POST /app/installations/${INSTALLATION_ID}/access_tokens`;
 
+const MEMORY_TOKEN = { token: 'ghs_memory', expires_at: '2026-11-05T13:30:00Z', permissions: { contents: 'write', metadata: 'read' } };
+
+/** Stubs GitHub so the review mint returns `ghs_test` and the mint for named repositories answers with `memory`. */
+function stubMemoryMint(memory: StubReply = {}): Request[] {
+  return stubGitHub({
+    api: {
+      [MINT]: async (request) => {
+        const body = await request.json() as { repositories?: string[] };
+        if (!body.repositories) {
+          return Response.json({ token: 'ghs_test', expires_at: '2026-11-05T13:00:00Z', permissions: {} }, { status: 201 });
+        }
+        return Response.json(memory.body ?? MEMORY_TOKEN, { status: memory.status ?? 201 });
+      },
+    },
+  });
+}
+
 describe('/token', () => {
   it('returns an installation token for a verified workflow', async () => {
     const requests = stubGitHub();
@@ -35,6 +53,19 @@ describe('/token', () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ token: 'ghs_test', expires_at: '2026-11-05T13:00:00Z' });
     expect(paths(requests)).toEqual([LOOKUP, MINT]);
+    expect(apiRequests(requests).map((request) => request.redirect)).toEqual(['manual', 'manual']);
+  });
+
+  it('encodes the owner and repo into the installation lookup path', async () => {
+    const repo = 'x/../../app';
+    const lookup = `GET /repos/${OWNER}/${encodeURIComponent(repo)}/installation`;
+    const requests = stubGitHub({ api: { [lookup]: { status: 404 } } });
+    const response = await postToken({
+      token: await oidcToken({ claims: { repository: `${OWNER}/${repo}` } }),
+      body: { owner: OWNER, repo },
+    });
+    expect(response.status).toBe(404);
+    expect(paths(requests)).toEqual([lookup]);
   });
 
   it.each([
@@ -98,6 +129,7 @@ describe('/token', () => {
     ['a body that is a string', '"manki"'],
     ['a body with a numeric owner', { owner: 1, repo: REPO }],
     ['a body with an empty repo', { owner: OWNER, repo: '' }],
+    ['a body with a string memory flag', { owner: OWNER, repo: REPO, memory: 'true' }],
   ])('rejects %s', async (_case, body) => {
     const requests = stubGitHub();
     const response = await postToken({ body });
@@ -114,6 +146,13 @@ describe('/token', () => {
     ['a token without an expiry', { omit: ['exp'] as Array<'exp' | 'iat'> }],
     ['a token without an issue time', { omit: ['iat'] as Array<'exp' | 'iat'> }],
     ['a token without a repository claim', { claims: { repository: undefined } }],
+    ['a token without a repository_id claim', { claims: { repository_id: undefined } }],
+    ['a token without a repository_owner_id claim', { claims: { repository_owner_id: undefined } }],
+    ['a token with a numeric repository_id claim', { claims: { repository_id: 424242 } }],
+    ['a token with a non-numeric repository_id claim', { claims: { repository_id: '42,43' } }],
+    ['a token with a zero repository_id claim', { claims: { repository_id: '0' } }],
+    ['a token with a non-numeric repository_owner_id claim', { claims: { repository_owner_id: 'manki-review' } }],
+    ['a token issued more than 10 minutes ago', { issuedAt: Math.floor(Date.now() / 1000) - 11 * 60 }],
   ])('refuses %s', async (_case, options) => {
     const requests = stubGitHub();
     const response = await postToken({ token: await oidcToken(options) });
@@ -151,5 +190,58 @@ describe('/token', () => {
     expect(response.status).toBe(500);
     expect(((await response.json()) as { error: string }).error).toMatch(/^Token generation failed/);
     expect(apiRequests(requests)).toEqual([]);
+  });
+});
+
+describe('/token memory token', () => {
+  it('mints no memory token unless the request asks for one', async () => {
+    const requests = stubMemoryMint();
+    const response = await postToken();
+    expect(response.status).toBe(200);
+    const body = await response.json() as Record<string, unknown>;
+    expect(body).not.toHaveProperty('memory_token');
+    expect(body).not.toHaveProperty('memory_expires_at');
+    expect(paths(requests)).toEqual([LOOKUP, MINT]);
+  });
+
+  it('returns a memory token next to the review token', async () => {
+    const requests = stubMemoryMint();
+    const response = await postToken({ body: { owner: OWNER, repo: REPO, memory: true } });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      token: 'ghs_test',
+      expires_at: '2026-11-05T13:00:00Z',
+      permissions: {},
+      memory_token: 'ghs_memory',
+      memory_expires_at: '2026-11-05T13:30:00Z',
+    });
+    expect(paths(requests)).toEqual([LOOKUP, MINT, MINT]);
+  });
+
+  it.each([403, 404, 422, 500])('returns the review token without a memory token when GitHub answers the memory mint with %i', async (status) => {
+    stubMemoryMint({ status, body: { message: 'There is at least one repository that does not exist or is not accessible' } });
+    const response = await postToken({ body: { owner: OWNER, repo: REPO, memory: true } });
+    expect(response.status).toBe(200);
+    const body = await response.json() as Record<string, unknown>;
+    expect(body.token).toBe('ghs_test');
+    expect(body).not.toHaveProperty('memory_token');
+    expect(body).not.toHaveProperty('memory_expires_at');
+  });
+
+  it('skips the memory mint when the installation grants no contents', async () => {
+    const requests = stubGitHub({
+      installation: { body: { id: INSTALLATION_ID, permissions: { issues: 'write', metadata: 'read', pull_requests: 'write' } } },
+    });
+    const response = await postToken({ body: { owner: OWNER, repo: REPO, memory: true } });
+    expect(response.status).toBe(200);
+    expect(await response.json()).not.toHaveProperty('memory_token');
+    expect(paths(requests)).toEqual([LOOKUP, MINT]);
+  });
+
+  it('mints no memory token when the review mint fails', async () => {
+    const requests = stubGitHub({ accessToken: { status: 422, body: { message: 'GitHub said no' } } });
+    const response = await postToken({ body: { owner: OWNER, repo: REPO, memory: true } });
+    expect(response.status).toBe(422);
+    expect(paths(requests)).toEqual([LOOKUP, MINT]);
   });
 });

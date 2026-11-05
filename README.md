@@ -7,10 +7,16 @@ Workflows authenticate via [GitHub's OIDC provider](https://docs.github.com/en/a
 ## How it works
 
 1. A GitHub Actions workflow requests an OIDC token with audience `manki-api.dustinface.me`
-2. The workflow POSTs to `https://manki-api.dustinface.me/token` with the OIDC token as a Bearer token and `{ owner, repo }` in the body
-3. The service verifies the OIDC token against GitHub's JWKS and checks the repository claim matches
-4. It creates a GitHub App JWT, looks up the installation for the repository, and requests an installation token limited to the permissions Manki uses (see `src/permissions.ts`), each at no more than the installation grants. `actions` never goes above `read`
+2. The workflow POSTs to `https://manki-api.dustinface.me/token` with the OIDC token as a Bearer token and `{ owner, repo }` in the body, plus `memory: true` to also get a memory token
+3. The service verifies the OIDC token against GitHub's JWKS, checks that the repository claim matches, and refuses a token issued more than 10 minutes ago
+4. It creates a GitHub App JWT, looks up the installation for the repository, and requests an installation token for the requesting repository only (`repository_ids` from the OIDC `repository_id` claim). The token holds only the permissions Manki uses (see `src/permissions.ts`), each at no more than the installation grants. `contents` and `actions` never go above `read`
 5. The installation token, its expiry and the permissions GitHub reports for it are returned to the workflow
+
+### Memory token
+
+With `memory: true`, the service mints a second token that holds only `contents: write` on the `review-memory` repository of the same installation account, and returns it as `memory_token` with `memory_expires_at`. Manki reads and writes review memory with it. When `review-memory` is not part of the installation, or the installation grants no `contents`, GitHub refuses the mint and the response has no memory token. The review token is returned either way.
+
+The repository name is fixed. A memory repo with any other name (`memory.repo` in `.manki.yml`) cannot get a token from this service and needs Manki's `memory_repo_token` input.
 
 ## Webhook
 
