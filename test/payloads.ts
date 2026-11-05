@@ -99,7 +99,13 @@ run-name: Manki \${{ inputs.event }}.\${{ inputs.action }} on #\${{ inputs.pr }}
 on:
   workflow_dispatch:
     inputs:
+      event: { type: string, required: true }
+      action: { type: string, required: true }
       pr: { type: string, required: true }
+      head_sha: { type: string, required: false }
+      comment_id: { type: string, required: false }
+      review_id: { type: string, required: false }
+      delivery_id: { type: string, required: false }
 jobs:
   review:
     runs-on: ubuntu-latest

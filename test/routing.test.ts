@@ -122,6 +122,8 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['a finished dispatch run', 'workflow_run', workflowRunEvent(), 'run_completed'],
   ['a started dispatch run', 'workflow_run', workflowRunEvent({}, 'in_progress'), 'ignore'],
   ['a finished CI run', 'workflow_run', workflowRunEvent({ event: 'pull_request', path: '.github/workflows/ci.yml' }), 'ignore'],
+  ['a dispatch run whose path names the ref', 'workflow_run', workflowRunEvent({ path: '.github/workflows/manki-dispatch.yml@refs/heads/main' }), 'run_completed'],
+  ['a run of a workflow whose name only starts the same', 'workflow_run', workflowRunEvent({ path: '.github/workflows/manki-dispatch.yml.bak' }), 'ignore'],
   ['a dispatch run that only differs in its event', 'workflow_run', workflowRunEvent({ event: 'push' }), 'ignore'],
   ['a dispatch of another workflow', 'workflow_run', workflowRunEvent({ path: '.github/workflows/deploy.yml' }), 'ignore'],
   ['a dispatch run without a PR in its name', 'workflow_run', workflowRunEvent({ display_title: 'Manki dispatch' }), 'ignore'],

@@ -202,9 +202,19 @@ export function coordinator(repositoryId: number, number: number): DurableObject
   return RUNTIME_ENV.PR_COORDINATOR.getByName(`${repositoryId}:${number}`);
 }
 
-/** Returns the coordinator's work items in queue order. */
+/** Returns the coordinator's work items in queue order, or none when it holds no state. */
 export async function workRows(stub: DurableObjectStub<PrCoordinator>): Promise<WorkRow[]> {
-  return runInDurableObject(stub, (_instance, state) => state.storage.sql.exec<WorkRow>('SELECT * FROM work ORDER BY id').toArray());
+  return runInDurableObject(stub, (_instance, state) => {
+    const sql = state.storage.sql;
+    if (sql.exec(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'work'`).toArray().length === 0) return [];
+    return sql.exec<WorkRow>('SELECT * FROM work ORDER BY id').toArray();
+  });
+}
+
+/** Returns the names of the tables the object's storage holds. */
+export async function tableNames(stub: DurableObjectStub): Promise<string[]> {
+  return runInDurableObject(stub, (_instance, state) =>
+    state.storage.sql.exec<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '\\_%' ESCAPE '\\'`).toArray().map((row) => row.name));
 }
 
 /** Switches dispatch on or off for the Durable Objects, which read `DISPATCH_ENABLED` from the runtime env. */

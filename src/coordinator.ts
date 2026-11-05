@@ -31,8 +31,10 @@ export const POLL_MS = 2 * MINUTE;
 export const QUEUED_RUN_TIMEOUT_MS = 30 * MINUTE;
 /** A run going this long outlived the dispatch workflow's `timeout-minutes: 30`, so it is cancelled. */
 export const RUNNING_RUN_TIMEOUT_MS = 40 * MINUTE;
+/** A running item ends as `timed_out` this long after its dispatch, whatever its polls returned. */
+export const RUN_DEADLINE_MS = 75 * MINUTE;
 /** A dispatch answered without a run id fails once no matching run turned up in this time. */
-const RUN_LOOKUP_TIMEOUT_MS = 10 * MINUTE;
+export const RUN_LOOKUP_TIMEOUT_MS = 10 * MINUTE;
 /** Stops a comment loop from starting runs without end. */
 export const DISPATCHES_PER_HOUR = 30;
 const NOT_STARTED = new Set(['queued', 'requested', 'waiting', 'pending']);
@@ -59,6 +61,7 @@ export interface WorkRow extends Record<string, string | number | null> {
   check_at: number | null;
   ended_at: number | null;
   conclusion: string | null;
+  poll_errors: number;
 }
 
 export type ReceiveResult = { accepted: false; reason: string } | { accepted: true; effect: string };
@@ -88,10 +91,16 @@ const MIGRATIONS = [
    ALTER TABLE work ADD COLUMN check_at INTEGER;
    ALTER TABLE work ADD COLUMN ended_at INTEGER;
    ALTER TABLE work ADD COLUMN conclusion TEXT;
+   ALTER TABLE work ADD COLUMN poll_errors INTEGER NOT NULL DEFAULT 0;
    CREATE INDEX work_by_run ON work (run_id);`,
 ];
 
 const ACTIVE = `status IN ('dispatching', 'running')`;
+
+/** Whether a 403 is GitHub's rate limit, which passes, rather than a refusal. */
+function isRateLimited(response: Response): boolean {
+  return response.status === 403 && (response.headers.has('retry-after') || response.headers.get('x-ratelimit-remaining') === '0');
+}
 
 /**
  * Orders the Manki work of one pull request or issue, named `<repository id>:<number>`. Request handlers only touch
@@ -102,10 +111,23 @@ export class PrCoordinator extends DurableObject<Env> {
   /** The opt-in read in flight, shared by both lanes of one alarm pass. */
   private optInRead: Promise<OptIn> | null = null;
 
+  /** Whether this instance created or upgraded its tables. They are created on first use, not in the constructor. */
+  private schemaReady = false;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+  }
+
+  /** Whether the object holds any state. Reading this writes nothing, so an unknown PR gets no storage. */
+  private hasState(): boolean {
+    return this.sql.exec(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'`).toArray().length > 0;
+  }
+
+  private ensureSchema(): void {
+    if (this.schemaReady) return;
     this.migrate();
+    this.schemaReady = true;
   }
 
   private migrate(): void {
@@ -135,6 +157,7 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /** Records a routed delivery and queues its work. A delivery id seen before is refused, which stops replays. */
   async receive(delivery: string, route: Extract<Route, { type: 'work' | 'close' }>): Promise<ReceiveResult> {
+    this.ensureSchema();
     const now = Date.now();
     const result = this.ctx.storage.transactionSync((): ReceiveResult => {
       this.sql.exec('DELETE FROM deliveries WHERE received_at < ?', now - DELIVERY_RETENTION_MS);
@@ -220,6 +243,7 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   override async alarm(): Promise<void> {
+    this.ensureSchema();
     try {
       if (await this.cleanUpWhenIdle()) return;
       await this.advance();
@@ -236,8 +260,8 @@ export class PrCoordinator extends DurableObject<Env> {
     if (pending || (newest !== null && Date.now() - newest < DELIVERY_RETENTION_MS)) return false;
     log('coordinator_deleted', this.logFields());
     await this.ctx.storage.deleteAll();
-    // The object can stay in memory after `deleteAll()`, so its tables must exist again for the next delivery.
-    this.migrate();
+    // The instance can stay in memory, so the next delivery must create the tables again.
+    this.schemaReady = false;
     return true;
   }
 
@@ -253,13 +277,17 @@ export class PrCoordinator extends DurableObject<Env> {
     );
     this.sql.exec(`UPDATE work SET status = 'queued', lease_until = NULL WHERE status = 'dispatching' AND lease_until <= ?`, now);
     await Promise.all(LANES.map(async (lane) => {
-      const running = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'running'`, lane).toArray()[0];
-      if (running && (running.check_at ?? 0) <= now) await this.poll(running);
-      if (this.sql.exec(`SELECT 1 FROM work WHERE lane = ? AND ${ACTIVE}`, lane).toArray().length > 0) return;
-      const next = this.sql.exec<WorkRow>(
-        `SELECT * FROM work WHERE lane = ? AND status = 'queued' ORDER BY id LIMIT 1`, lane,
-      ).toArray()[0];
-      if (next) await this.start(next);
+      try {
+        const running = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'running'`, lane).toArray()[0];
+        if (running && (running.check_at ?? 0) <= now) await this.poll(running);
+        if (this.sql.exec(`SELECT 1 FROM work WHERE lane = ? AND ${ACTIVE}`, lane).toArray().length > 0) return;
+        const next = this.sql.exec<WorkRow>(
+          `SELECT * FROM work WHERE lane = ? AND status = 'queued' ORDER BY id LIMIT 1`, lane,
+        ).toArray()[0];
+        if (next) await this.start(next);
+      } catch (error) {
+        log('coordinator_lane_error', { ...this.logFields(), lane, error: String(error) });
+      }
     }));
   }
 
@@ -391,7 +419,7 @@ export class PrCoordinator extends DurableObject<Env> {
       this.markRunning(latest, workflow_run_id ?? null, 'dispatched');
     } else if (response?.status === 204) {
       this.markRunning(latest, null, 'dispatched without run details');
-    } else if (response === null || response.status >= 500 || response.status === 429) {
+    } else if (response === null || response.status >= 500 || response.status === 429 || isRateLimited(response)) {
       if (attempts > DISPATCH_BACKOFF_MS.length) {
         this.finish(item.id, 'failed', `dispatch failed ${attempts} times, last with ${response?.status ?? 'a network error'}`);
       } else {
@@ -463,59 +491,79 @@ export class PrCoordinator extends DurableObject<Env> {
   /** Checks a running item's run, the safety net for a missed `workflow_run` delivery and runs that never start. */
   private async poll(item: WorkRow): Promise<void> {
     const now = Date.now();
+    const dispatchedAt = item.dispatched_at ?? now;
+    // Moved forward before any GitHub call, so a failing call backs off instead of firing the alarm again at once.
+    this.sql.exec(
+      'UPDATE work SET check_at = ?, poll_errors = poll_errors + 1 WHERE id = ?',
+      now + POLL_MS * 2 ** Math.min(item.poll_errors, 3), item.id,
+    );
+    if (now - dispatchedAt > RUN_DEADLINE_MS) {
+      this.finish(item.id, 'timed_out', 'no end of the run seen in time');
+      return;
+    }
     const target = this.target();
-    const later = () => this.sql.exec(`UPDATE work SET check_at = ? WHERE id = ? AND status = 'running'`, Date.now() + POLL_MS, item.id);
 
     if (item.run_id === null) {
-      const runId = await this.findRun({ ...item, first_attempt_at: item.first_attempt_at ?? item.dispatched_at }, target);
+      if (now - dispatchedAt > RUN_LOOKUP_TIMEOUT_MS) {
+        this.finish(item.id, 'failed', 'no run found for the dispatch');
+        return;
+      }
+      const runId = await this.findRun({ ...item, first_attempt_at: item.first_attempt_at ?? dispatchedAt }, target);
       if (this.row(item.id)?.status !== 'running') return;
+      this.polled(item.id);
       if (runId !== null) this.sql.exec('UPDATE work SET run_id = ? WHERE id = ?', runId, item.id);
-      else if (now - (item.dispatched_at ?? now) > RUN_LOOKUP_TIMEOUT_MS) this.finish(item.id, 'failed', 'no run found for the dispatch');
-      later();
       return;
     }
 
     const token = await this.token({ actions: 'read' });
-    if (token === null) {
-      later();
-      return;
-    }
+    if (token === null) return;
     const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/actions/runs/${item.run_id}`);
     if (this.row(item.id)?.status !== 'running') return;
     if (response.status === 404) {
       this.finish(item.id, 'done', 'run deleted');
       return;
     }
-    if (!response.ok) {
-      later();
-      return;
-    }
+    if (!response.ok) return;
+    this.polled(item.id);
     const run = await response.json() as { status: string; conclusion: string | null; run_started_at?: string };
     if (run.status === 'completed') {
       this.finish(item.id, 'done', 'run completed (poll)', run.conclusion);
       return;
     }
-    const startedAt = run.run_started_at ? Date.parse(run.run_started_at) : item.dispatched_at ?? now;
-    if (NOT_STARTED.has(run.status) && now - (item.dispatched_at ?? now) > QUEUED_RUN_TIMEOUT_MS) {
+    const startedAt = run.run_started_at ? Date.parse(run.run_started_at) : dispatchedAt;
+    if (NOT_STARTED.has(run.status) && now - dispatchedAt > QUEUED_RUN_TIMEOUT_MS) {
       await this.cancel(item, target, 'run never started');
     } else if (!NOT_STARTED.has(run.status) && now - startedAt > RUNNING_RUN_TIMEOUT_MS) {
       await this.cancel(item, target, 'run went past its timeout');
-    } else {
-      later();
     }
   }
 
+  /** Records a poll that reached GitHub, so the next one comes after the normal interval. */
+  private polled(id: number): void {
+    this.sql.exec('UPDATE work SET poll_errors = 0, check_at = ? WHERE id = ?', Date.now() + POLL_MS, id);
+  }
+
+  /** Cancels a run that overran. A failed cancel keeps the item running, so the next poll tries again. */
   private async cancel(item: WorkRow, target: Target, reason: string): Promise<void> {
     const token = await this.token({ actions: 'write' });
     const response = token === null
       ? null
       : await githubApi(token, `/repos/${target.owner}/${target.repo}/actions/runs/${item.run_id}/cancel`, { method: 'POST' });
     if (this.row(item.id)?.status !== 'running') return;
-    this.finish(item.id, 'timed_out', `${reason}, cancel ${response?.ok ? 'requested' : 'failed'}`);
+    if (response?.ok) {
+      this.finish(item.id, 'timed_out', `${reason}, cancel requested`);
+    } else {
+      log('coordinator_cancel_failed', { ...this.logFields(), work_id: item.id, run_id: item.run_id, reason, status: response?.status ?? null });
+    }
   }
 
   /** Ends the item whose run finished, from the `workflow_run` webhook, and frees its lane. */
   async runCompleted(delivery: string, runId: number, conclusion: string | null): Promise<ReceiveResult> {
+    if (!this.hasState()) {
+      log('coordinator_run_completed', { delivery, run_id: runId, accepted: false, reason: 'no coordinator state' });
+      return { accepted: false, reason: 'no coordinator state' };
+    }
+    this.ensureSchema();
     const now = Date.now();
     const result = this.ctx.storage.transactionSync((): ReceiveResult => {
       if (this.sql.exec('SELECT 1 FROM deliveries WHERE id = ?', delivery).toArray().length > 0) {

@@ -1,6 +1,9 @@
 // The `workflow_dispatch` contract with Manki's dispatch adapter (`readDispatchInputs` in manki `src/dispatch.ts`)
 // and the dispatch workflow in its `SETUP.md`. A change on either side must be made on both.
 
+/** Every input the dispatch can send. A workflow that does not declare one refuses the dispatch with a 422. */
+export const DISPATCH_INPUT_NAMES = ['event', 'action', 'pr', 'head_sha', 'comment_id', 'review_id', 'delivery_id'] as const;
+
 export interface DispatchItem {
   /** `<event>.<action>`, such as `pull_request.synchronize`. */
   event: string;

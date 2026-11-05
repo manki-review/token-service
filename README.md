@@ -20,6 +20,30 @@ Workflows authenticate via [GitHub's OIDC provider](https://docs.github.com/en/a
 
 With `DISPATCH_ENABLED` (in `wrangler.toml`) set to anything but `"true"`, the coordinators only log what they would dispatch.
 
+### App events
+
+The GitHub App subscribes to these events. They all arrive at `/webhook`:
+
+| Event | Used for |
+|---|---|
+| Pull request | Reviews on open, push and ready for review. A close clears the queue, and a merge records the fix rate |
+| Pull request review | The review state check (auto-approve) |
+| Pull request review comment | Thread replies and thread commands |
+| Pull request review thread | The review state check when a thread is resolved or reopened. GitHub Actions has no trigger for this one |
+| Issue comment | Review requests, Force review ticks, commands and questions |
+| Workflow run | The end of a dispatched run. Every other run is ignored |
+
+### Cost on the Workers Free plan
+
+The Free plan includes [100,000 Worker requests a day](https://developers.cloudflare.com/workers/platform/pricing/) and [100,000 Durable Object requests a day](https://developers.cloudflare.com/durable-objects/platform/pricing/), counting each RPC call and each alarm, plus 100,000 SQLite rows written. Past a limit, calls fail until 00:00 UTC.
+
+- Every delivery is one Worker request, including `workflow_run` for every CI run in every installed repository, which is ignored after the signature check.
+- A routed delivery adds one coordinator call and usually one or two alarms.
+- A dispatched run adds an alarm for each poll, every 2 minutes or less often after errors.
+- The cron adds 288 requests a day, plus one call for each PR it checks.
+
+Watch the daily request counts in the dashboard as more repositories opt in.
+
 ## Configuration
 
 The following secrets must be set in the Cloudflare Worker environment:
