@@ -15,6 +15,8 @@ export default defineConfig({
         WEBHOOK_SECRET: 'test-webhook-secret',
         // `REPOSITORY_ID` of `test/payloads.ts`, in place of the real ids in `wrangler.toml`.
         WEBHOOK_REPOS: '4242',
+        // Pinned so the value in `wrangler.toml` never changes the tests. A test that needs dispatch turns it on.
+        DISPATCH_ENABLED: 'false',
       },
     },
   })],

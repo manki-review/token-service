@@ -7,9 +7,10 @@ import {
 } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
+import { RUN_DEADLINE_MS } from '../src/coordinator';
 import { CATCH_UP_WINDOW_MS, MAX_DELIVERY_PAGES, MAX_REDELIVERIES, RECONCILER_NAME, REDELIVERY_WINDOW_MS, SUBREQUEST_BUDGET } from '../src/reconciler';
 import { routeDelivery, type Target } from '../src/routing';
-import { coordinator, freezeClock, INSTALLATION_ID, OWNER, postWebhook, RUNTIME_ENV, tableNames, TEST_ENV, workRows } from './helpers';
+import { coordinator, freezeClock, INSTALLATION_ID, OWNER, postWebhook, RUNTIME_ENV, setDispatchEnabled, tableNames, TEST_ENV, workRows } from './helpers';
 import { DISPATCH_WORKFLOW_YAML, EVENT_WORKFLOW_YAML, pullRequestEvent, workflowsReply } from './payloads';
 
 const MINUTE = 60_000;
@@ -65,6 +66,8 @@ function fakeGitHub() {
     graphqlCalls: 0,
     calls: 0,
     deliveryListCalls: 0,
+    dispatches: 0,
+    cancels: [] as number[],
     /** The repositories whose open PRs were listed, in order. */
     pullListCalls: [] as string[],
     /** Statuses the next redelivery requests answer with, in order. Afterwards 202. */
@@ -100,6 +103,22 @@ function fakeGitHub() {
       if (Number(mint[1]) !== INSTALLATION_ID) return Response.json({ message: 'Not Found' }, { status: 404 });
       return Response.json({ token: 'ghs_repo', expires_at: '2030-01-01T01:00:00Z' }, { status: 201 });
     }
+    const single = url.pathname.match(/^\/repos\/[^/]+\/([^/]+)\/pulls\/(\d+)$/);
+    if (single && request.method === 'GET') {
+      const found = (state.pulls.get(single[1]) ?? []).find((candidate) => candidate.number === Number(single[2]));
+      return Response.json({ state: 'open', draft: false, head: { sha: found?.head.sha } });
+    }
+    if (url.pathname.endsWith('/actions/workflows/manki-dispatch.yml/dispatches') && request.method === 'POST') {
+      state.dispatches++;
+      return Response.json({ workflow_run_id: 7000 + state.dispatches });
+    }
+    const cancel = url.pathname.match(/\/actions\/runs\/(\d+)\/cancel$/);
+    if (cancel && request.method === 'POST') {
+      state.cancels.push(Number(cancel[1]));
+      return new Response(null, { status: 202 });
+    }
+    // Run reads fail, so only the deadline can end a dispatched item.
+    if (/\/actions\/runs\/\d+$/.test(url.pathname)) return Response.json({ message: 'no' }, { status: 500 });
     const pulls = url.pathname.match(/^\/repos\/[^/]+\/([^/]+)\/pulls$/);
     if (pulls && request.method === 'GET') {
       state.pullListCalls.push(pulls[1]);
@@ -137,6 +156,7 @@ let log: ReturnType<typeof vi.spyOn>;
 beforeEach(() => {
   advanceClock = freezeClock();
   log = vi.spyOn(console, 'log').mockImplementation(() => {});
+  setDispatchEnabled(false);
 });
 
 const realCoordinators = RUNTIME_ENV.PR_COORDINATOR;
@@ -150,6 +170,7 @@ afterEach(() => {
   vi.useRealTimers();
   RUNTIME_ENV.PR_COORDINATOR = realCoordinators;
   RUNTIME_ENV.WEBHOOK_REPOS = realAllowlist;
+  setDispatchEnabled(false);
 });
 
 /**
@@ -596,13 +617,41 @@ describe('Reconciler catch-up', () => {
     const pr = coordinator(target.repositoryId, 1);
     expect(await pr.catchUpState(SHA_1)).toBe('pending');
 
-    // With dispatch off the review ends skipped, which does not count as handled.
+    // Dispatch is off here, so the review ends skipped, which does not count as handled.
     await runDurableObjectAlarm(pr);
     expect(await pr.catchUpState(SHA_1)).toBe('needed');
     await stub.reconcile();
     expect(logged(log, 'reconciler_caught_up')).toHaveLength(1);
 
     advanceClock(CATCH_UP_WINDOW_MS + MINUTE);
+    github.pulls.set(target.repo, [pull(1, SHA_1, { repo: target.repo })]);
+    await stub.reconcile();
+    expect(logged(log, 'reconciler_caught_up')).toHaveLength(2);
+  });
+
+  it('with dispatch on, ends a caught-up review whose run never finishes and catches the head up a day later', async () => {
+    setDispatchEnabled(true);
+    const { stub, repo } = setup();
+    const target = repo();
+    await stub.recordOptIn(target, true);
+    const github = fakeGitHub();
+    github.pulls.set(target.repo, [pull(1, SHA_1, { repo: target.repo })]);
+    await stub.reconcile();
+    const pr = coordinator(target.repositoryId, 1);
+    await runDurableObjectAlarm(pr);
+    expect(github.dispatches).toBe(1);
+    expect(await workRows(pr)).toMatchObject([{ status: 'running', run_id: 7001 }]);
+    expect(await pr.catchUpState(SHA_1)).toBe('pending');
+
+    advanceClock(RUN_DEADLINE_MS + MINUTE);
+    await runDurableObjectAlarm(pr);
+    expect(github.cancels).toEqual([7001]);
+    expect(await workRows(pr)).toMatchObject([{ status: 'timed_out', note: 'no end of the run seen in time, cancel requested' }]);
+    expect(await pr.catchUpState(SHA_1)).toBe('needed');
+    await stub.reconcile();
+    expect(logged(log, 'reconciler_caught_up')).toHaveLength(1);
+
+    advanceClock(CATCH_UP_WINDOW_MS);
     github.pulls.set(target.repo, [pull(1, SHA_1, { repo: target.repo })]);
     await stub.reconcile();
     expect(logged(log, 'reconciler_caught_up')).toHaveLength(2);
