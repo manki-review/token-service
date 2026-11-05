@@ -78,7 +78,6 @@ export interface WebhookPayload {
   issue?: { number?: number; pull_request?: unknown };
   comment?: { id?: number; body?: string; user?: User; in_reply_to_id?: number };
   review?: { id?: number; commit_id?: string; user?: User };
-  changes?: { body?: { from?: string } };
   workflow_run?: { id?: number; event?: string; path?: string; display_title?: string; conclusion?: string | null };
 }
 
@@ -180,10 +179,8 @@ function routeReviewComment(target: Target, payload: WebhookPayload): Route {
   const body = comment?.body ?? '';
   if (comment?.user?.type === 'Bot' || body.includes(MANKI_COMMENT_MARKER)) return ignore('comment is from a bot');
   if (!comment?.in_reply_to_id && !hasBotMention(body)) return ignore('comment is neither a reply nor a mention');
-  // A plain reply or `dismiss` changes a thread. The other commands only post an answer.
-  const command = parseCommandType(body);
-  const lane: Lane = command === 'generic' || command === 'dismiss' ? 'state' : 'chat';
-  return { type: 'work', target, work: work(lane, 'thread', payload, 'pull_request_review_comment', comment?.id ?? null) };
+  // Every thread command ends with Manki's auto-approve check, so none may run beside a review.
+  return { type: 'work', target, work: work('state', 'thread', payload, 'pull_request_review_comment', comment?.id ?? null) };
 }
 
 function routeIssueComment(target: Target, payload: WebhookPayload): Route {
@@ -193,19 +190,15 @@ function routeIssueComment(target: Target, payload: WebhookPayload): Route {
   const objectId = comment?.id ?? null;
   const onPullRequest = Boolean(payload.issue?.pull_request);
 
-  const tickedOwnComment = action === 'edited' && detectTickedMarker(body) !== null
-    && MANKI_LOGINS.includes(comment?.user?.login ?? '');
-  if (tickedOwnComment) {
-    return onPullRequest
-      ? { type: 'work', target, work: work('state', 'review', payload, 'issue_comment', objectId) }
-      : ignore('Force review ticked on an issue');
+  // Manki decides whether the comment's author is one of its identities. Only a tick on a comment by its default
+  // logins becomes a review trigger. Any other tick queues on its own, so it cannot replace a queued push review.
+  if (onPullRequest && action === 'edited' && detectTickedMarker(body) !== null) {
+    const kind = MANKI_LOGINS.includes(comment?.user?.login ?? '') ? 'review' : 'comment';
+    return { type: 'work', target, work: work('state', kind, payload, 'issue_comment', objectId) };
   }
 
+  // An edit that keeps an earlier mention is forwarded too. Manki's eyes reaction check skips one it answered.
   if (!hasBotMention(body)) return ignore('comment does not mention Manki');
-  const previous = payload.changes?.body?.from;
-  if (action === 'edited' && previous !== undefined && hasBotMention(previous)) {
-    return ignore('edit keeps an earlier mention');
-  }
 
   if (!onPullRequest) {
     if (comment?.user?.type === 'Bot' || body.includes(MANKI_COMMENT_MARKER)) return ignore('comment is from a bot');
