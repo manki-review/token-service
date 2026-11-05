@@ -5,6 +5,8 @@ import { verifyGitHubOIDC } from './oidc';
 import { cappedPermissions, type Permissions } from './permissions';
 import { handleWebhook } from './webhook';
 
+export { PrCoordinator } from './coordinator';
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     if (request.method === 'OPTIONS') {

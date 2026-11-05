@@ -1,4 +1,5 @@
 import type { Env } from './env';
+import { log } from './log';
 import { routeDelivery, type Route, type WebhookPayload } from './routing';
 import { verifyWebhookSignature } from './signature';
 
@@ -24,8 +25,9 @@ function summarize(route: Route): Record<string, unknown> {
 }
 
 /**
- * Verifies a GitHub App webhook delivery and logs where it would be routed. Shadow mode: nothing is queued or
- * dispatched yet, so every verified delivery gets 202.
+ * Verifies a GitHub App webhook delivery, logs its route and hands work and closes to the PR's `PrCoordinator`.
+ * The 202 leaves only once the coordinator stored the delivery, so a failure there makes GitHub record a failed
+ * delivery that can be redelivered.
  */
 export async function handleWebhook(request: Request, env: Env): Promise<Response> {
   if (!env.WEBHOOK_SECRET) {
@@ -61,6 +63,14 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
   }
 
   const route = routeDelivery(event, payload);
-  console.log(JSON.stringify({ msg: 'webhook', delivery, event, action: payload.action ?? null, ...summarize(route) }));
+  log('webhook', { delivery, event, action: payload.action ?? null, ...summarize(route) });
+  if (route.type === 'work' || route.type === 'close') {
+    try {
+      await env.PR_COORDINATOR.getByName(`${route.target.repositoryId}:${route.target.number}`).receive(delivery, route);
+    } catch (error) {
+      log('webhook_coordinator_error', { delivery, error: String(error) });
+      return Response.json({ error: 'Could not queue the delivery' }, { status: 500 });
+    }
+  }
   return new Response(null, { status: 202 });
 }

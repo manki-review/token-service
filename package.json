@@ -17,6 +17,7 @@
     "wrangler": "^4.158.0"
   },
   "dependencies": {
-    "jose": "^6.2.2"
+    "jose": "^6.2.2",
+    "yaml": "^2.9.1"
   }
 }

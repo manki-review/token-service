@@ -17,6 +17,7 @@ import {
   REVIEW_ID,
   reviewCommentEvent,
   reviewEvent,
+  reviewThreadEvent,
   workflowRunEvent,
 } from './payloads';
 
@@ -58,6 +59,16 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['a review by a bot', 'pull_request_review', reviewEvent('submitted', { user: MANKI_AUTHOR }), 'ignore'],
   ['a review on a stale commit', 'pull_request_review', reviewEvent('submitted', { commit_id: 'b'.repeat(40) }), 'ignore'],
   ['a review on a fork PR', 'pull_request_review', { ...reviewEvent('submitted'), pull_request: forkPullRequestEvent('x').pull_request }, 'ignore'],
+
+  // pull_request_review_thread
+  ['a resolved thread', 'pull_request_review_thread', reviewThreadEvent('resolved'), 'state:review_state'],
+  ['a reopened thread', 'pull_request_review_thread', reviewThreadEvent('unresolved'), 'state:review_state'],
+  ['another thread action', 'pull_request_review_thread', reviewThreadEvent('created'), 'ignore'],
+  ['a thread resolved by a bot', 'pull_request_review_thread', reviewThreadEvent('resolved', {}, BOT_SENDER), 'ignore'],
+  ['a thread resolved by the Manki App', 'pull_request_review_thread', reviewThreadEvent('resolved', {}, { login: 'manki-review[bot]', type: 'Bot' }), 'ignore'],
+  ['a thread on a fork PR', 'pull_request_review_thread', reviewThreadEvent('resolved', { head: { sha: HEAD_SHA, repo: { full_name: 'mallory/manki' } } }), 'ignore'],
+  ['a thread on a closed PR', 'pull_request_review_thread', reviewThreadEvent('resolved', { state: 'closed' }), 'ignore'],
+  ['a thread on a PR without a state', 'pull_request_review_thread', reviewThreadEvent('resolved', { state: undefined }), 'ignore'],
 
   // pull_request_review_comment
   ['a reply in a thread', 'pull_request_review_comment', reviewCommentEvent('Fixed in the last push', { in_reply_to_id: 1 }), 'state:thread'],
@@ -137,6 +148,7 @@ describe('routeDelivery', () => {
   it.each<[string, string, WebhookPayload, object]>([
     ['a push', 'pull_request', pullRequestEvent('synchronize'), { event: 'pull_request.synchronize', headSha: HEAD_SHA, objectId: null, sender: 'alice' }],
     ['a review', 'pull_request_review', reviewEvent('submitted'), { event: 'pull_request_review.submitted', headSha: HEAD_SHA, objectId: REVIEW_ID }],
+    ['a resolved thread', 'pull_request_review_thread', reviewThreadEvent('resolved'), { event: 'pull_request_review_thread.resolved', headSha: HEAD_SHA, objectId: null, sender: 'alice' }],
     ['a thread reply', 'pull_request_review_comment', reviewCommentEvent('ok', { in_reply_to_id: 1 }), { event: 'pull_request_review_comment.created', objectId: COMMENT_ID }],
     ['a review request', 'issue_comment', issueCommentEvent('@manki review'), { event: 'issue_comment.created', headSha: null, objectId: COMMENT_ID }],
     ['a Force review tick', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { action: 'edited', author: MANKI_AUTHOR }), { event: 'issue_comment.edited', sender: 'alice' }],

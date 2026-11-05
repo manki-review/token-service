@@ -44,7 +44,7 @@ describe('/token', () => {
   ])('signs the App JWT with a %s key', async (_format, privateKey) => {
     const requests = stubGitHub();
     const before = Math.floor(Date.now() / 1000);
-    const response = await postToken({ env: { APP_ID, APP_PRIVATE_KEY: privateKey } });
+    const response = await postToken({ env: { ...TEST_ENV, APP_PRIVATE_KEY: privateKey } });
     expect(response.status).toBe(200);
 
     const github = apiRequests(requests);
@@ -147,7 +147,7 @@ describe('/token', () => {
 
   it('returns 500 when the App key cannot be read', async () => {
     const requests = stubGitHub();
-    const response = await postToken({ env: { APP_ID, APP_PRIVATE_KEY: 'not a key' } });
+    const response = await postToken({ env: { ...TEST_ENV, APP_PRIVATE_KEY: 'not a key' } });
     expect(response.status).toBe(500);
     expect(((await response.json()) as { error: string }).error).toMatch(/^Token generation failed/);
     expect(apiRequests(requests)).toEqual([]);

@@ -22,7 +22,7 @@ export type Lane = 'state' | 'chat';
  * The Manki handler a work item ends up in. Only `review` items coalesce.
  * - `review`: `handlePullRequest` or `handleCommentTrigger`
  * - `merged`: `handleMergedPullRequest`
- * - `review_state`: `handleReviewStateCheck`
+ * - `review_state`: `handleReviewStateCheck`, also for a resolved or reopened thread
  * - `thread`: `handleReviewCommentInteraction`
  * - `comment`: `handleInteraction`
  * - `issue`: `handleIssueInteraction`
@@ -66,6 +66,7 @@ interface PullRequest {
   number?: number;
   draft?: boolean;
   merged?: boolean;
+  state?: string;
   head?: { sha?: string; repo?: { full_name?: string } | null };
 }
 
@@ -126,7 +127,8 @@ function work(lane: Lane, kind: WorkKind, payload: WebhookPayload, event: string
  */
 export function routeDelivery(event: string, payload: WebhookPayload): Route {
   if (event === 'workflow_run') return routeWorkflowRun(payload);
-  if (event !== 'pull_request' && event !== 'pull_request_review' && event !== 'pull_request_review_comment' && event !== 'issue_comment') {
+  const handled = ['pull_request', 'pull_request_review', 'pull_request_review_comment', 'pull_request_review_thread', 'issue_comment'];
+  if (!handled.includes(event)) {
     return ignore(`unhandled event ${event}`);
   }
 
@@ -150,6 +152,8 @@ export function routeDelivery(event: string, payload: WebhookPayload): Route {
       return routeReview(target, payload);
     case 'pull_request_review_comment':
       return routeReviewComment(target, payload);
+    case 'pull_request_review_thread':
+      return routeReviewThread(target, payload);
     default:
       return routeIssueComment(target, payload);
   }
@@ -171,6 +175,17 @@ function routeReview(target: Target, payload: WebhookPayload): Route {
   const headSha = payload.pull_request?.head?.sha;
   if (review?.commit_id && headSha && review.commit_id !== headSha) return ignore('review is for a stale commit');
   return { type: 'work', target, work: work('state', 'review_state', payload, 'pull_request_review', review?.id ?? null) };
+}
+
+/**
+ * A resolved or reopened thread can change whether the PR may be approved, so it runs the review state check.
+ * GitHub Actions has no trigger for this event, so only webhook mode reacts to it.
+ */
+function routeReviewThread(target: Target, payload: WebhookPayload): Route {
+  const { action } = payload;
+  if (action !== 'resolved' && action !== 'unresolved') return ignore(`pull_request_review_thread action ${action}`);
+  if (payload.pull_request?.state !== 'open') return ignore('pull request is closed');
+  return { type: 'work', target, work: work('state', 'review_state', payload, 'pull_request_review_thread') };
 }
 
 function routeReviewComment(target: Target, payload: WebhookPayload): Route {
