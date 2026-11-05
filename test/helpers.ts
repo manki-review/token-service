@@ -1,5 +1,8 @@
 import { exportJWK, exportPKCS8, generateKeyPair, SignJWT, type JWTPayload } from 'jose';
+import { runInDurableObject } from 'cloudflare:test';
+import { env } from 'cloudflare:workers';
 import { vi } from 'vitest';
+import type { PrCoordinator, WorkRow } from '../src/coordinator';
 import type { Env } from '../src/env';
 import worker from '../src/index';
 
@@ -22,7 +25,25 @@ const oidcJwk = { ...(await exportJWK(oidcKeys.publicKey)), kid: OIDC_KID, alg: 
 
 export const WEBHOOK_SECRET = 'test-webhook-secret';
 
-export const TEST_ENV: Env = { APP_ID, APP_PRIVATE_KEY: appPrivateKeyPkcs1, WEBHOOK_SECRET };
+/** The runtime env from `vitest.config.ts`, which holds the bindings and the secrets the Durable Objects see. */
+export const RUNTIME_ENV = env as unknown as Env;
+
+export const TEST_ENV: Env = { ...RUNTIME_ENV, APP_ID, APP_PRIVATE_KEY: appPrivateKeyPkcs1, WEBHOOK_SECRET };
+
+/**
+ * Pins `Date` to a fixed time far ahead of the real clock. An alarm set for "now" then lies in the real future, so it
+ * runs only when a test calls `runDurableObjectAlarm`. Returns a function that moves the clock forward.
+ */
+export function freezeClock(start = Date.UTC(2030, 0, 1)): (ms: number) => number {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  let now = start;
+  vi.setSystemTime(now);
+  return (ms: number) => {
+    now += ms;
+    vi.setSystemTime(now);
+    return now;
+  };
+}
 
 function derLengthSize(der: Uint8Array, offset: number): number {
   return der[offset] & 0x80 ? 1 + (der[offset] & 0x7f) : 1;
@@ -74,6 +95,11 @@ export interface StubReply {
 export interface GitHubStub {
   installation?: StubReply;
   accessToken?: StubReply;
+  /**
+   * Replies keyed by `<METHOD> <path>`, such as `POST /graphql`. They take precedence over the defaults. A function
+   * runs in the caller's context, so it can read a request body sent from inside a Durable Object.
+   */
+  api?: Record<string, StubReply | ((request: Request) => Response | Promise<Response>)>;
 }
 
 function reply(stub: StubReply | undefined, fallback: unknown): Response {
@@ -87,6 +113,9 @@ export function stubGitHub(stub: GitHubStub = {}): Request[] {
     const request = new Request(input, init);
     requests.push(request.clone());
     const url = new URL(request.url);
+    const handler = stub.api?.[`${request.method} ${url.pathname}`];
+    if (typeof handler === 'function') return handler(request);
+    if (handler) return reply(handler, {});
     if (request.url === JWKS_URL) {
       return Response.json({ keys: [oidcJwk] });
     }
@@ -143,6 +172,7 @@ export interface PostWebhookOptions {
   payload?: unknown;
   /** The raw body, when it must differ from the JSON of `payload`. */
   body?: string;
+  /** A missing value means a fresh delivery id, `null` no header. */
   delivery?: string | null;
   /** The `X-Hub-Signature-256` header. A missing value means the correct signature, `null` no header. */
   signature?: string | null;
@@ -156,7 +186,7 @@ export async function postWebhook(options: PostWebhookOptions = {}): Promise<Res
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   const values: Record<string, string | null> = {
     'X-GitHub-Event': options.event === undefined ? 'ping' : options.event,
-    'X-GitHub-Delivery': options.delivery === undefined ? DELIVERY_ID : options.delivery,
+    'X-GitHub-Delivery': options.delivery === undefined ? crypto.randomUUID() : options.delivery,
     'X-GitHub-Hook-Installation-Target-ID': options.targetId === undefined ? APP_ID : options.targetId,
     'X-Hub-Signature-256': options.signature === undefined ? await signWebhook(body) : options.signature,
   };
@@ -165,4 +195,14 @@ export async function postWebhook(options: PostWebhookOptions = {}): Promise<Res
   }
   const request = new Request(`https://${OIDC_AUDIENCE}/webhook`, { method: 'POST', headers, body });
   return worker.fetch(request, options.env ?? TEST_ENV);
+}
+
+/** Returns the coordinator stub for a PR of the test repository, named as the Worker names it. */
+export function coordinator(repositoryId: number, number: number): DurableObjectStub<PrCoordinator> {
+  return RUNTIME_ENV.PR_COORDINATOR.getByName(`${repositoryId}:${number}`);
+}
+
+/** Returns the coordinator's work items in queue order. */
+export async function workRows(stub: DurableObjectStub<PrCoordinator>): Promise<WorkRow[]> {
+  return runInDurableObject(stub, (_instance, state) => state.storage.sql.exec<WorkRow>('SELECT * FROM work ORDER BY id').toArray());
 }

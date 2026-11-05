@@ -7,3 +7,14 @@ preview_urls = false
 routes = [
   { pattern = "manki-api.dustinface.me/*", zone_name = "dustinface.me" }
 ]
+
+[[durable_objects.bindings]]
+name = "PR_COORDINATOR"
+class_name = "PrCoordinator"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PrCoordinator"]
+
+[observability]
+enabled = true

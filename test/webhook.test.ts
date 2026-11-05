@@ -1,7 +1,7 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { verifyWebhookSignature } from '../src/signature';
 import worker from '../src/index';
-import { DELIVERY_ID, OIDC_AUDIENCE, postWebhook, signWebhook, stubGitHub, TEST_ENV } from './helpers';
+import { coordinator, DELIVERY_ID, freezeClock, OIDC_AUDIENCE, postWebhook, signWebhook, stubGitHub, TEST_ENV, workRows } from './helpers';
 import { HEAD_SHA, issueCommentEvent, PR_NUMBER, pullRequestEvent, REPOSITORY_ID } from './payloads';
 
 const encoder = new TextEncoder();
@@ -42,10 +42,18 @@ function logged(spy: { mock: { calls: unknown[][] } }): Record<string, unknown>[
 }
 
 describe('/webhook', () => {
-  it('logs the route of a verified delivery and answers 202 without calling GitHub', async () => {
+  beforeEach(() => {
+    freezeClock();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('logs the route, queues the work and answers 202 without calling GitHub', async () => {
     const requests = stubGitHub();
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
-    const response = await postWebhook({ event: 'pull_request', payload: pullRequestEvent('synchronize') });
+    const response = await postWebhook({ event: 'pull_request', payload: pullRequestEvent('synchronize'), delivery: DELIVERY_ID });
     expect(response.status).toBe(202);
     expect(logged(log)).toEqual([{
       msg: 'webhook',
@@ -60,8 +68,36 @@ describe('/webhook', () => {
       head_sha: HEAD_SHA,
       object_id: null,
       sender: 'alice',
+    }, {
+      msg: 'coordinator_receive',
+      repo: 'manki-review/manki',
+      pr: PR_NUMBER,
+      delivery: DELIVERY_ID,
+      accepted: true,
+      effect: 'queued work 1',
     }]);
     expect(requests).toEqual([]);
+    expect(await workRows(coordinator(REPOSITORY_ID, PR_NUMBER))).toMatchObject([
+      { lane: 'state', kind: 'review', event: 'pull_request.synchronize', head_sha: HEAD_SHA, delivery: DELIVERY_ID, status: 'queued' },
+    ]);
+  });
+
+  it('refuses a replayed delivery without queuing it again', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const delivery = { event: 'issue_comment', payload: issueCommentEvent('@manki explain', { number: 31 }), delivery: crypto.randomUUID() };
+    expect((await postWebhook(delivery)).status).toBe(202);
+    expect((await postWebhook(delivery)).status).toBe(202);
+    expect(logged(log).filter((line) => line.msg === 'coordinator_receive')).toMatchObject([
+      { accepted: true },
+      { accepted: false, reason: 'duplicate delivery' },
+    ]);
+    expect(await workRows(coordinator(REPOSITORY_ID, 31))).toHaveLength(1);
+  });
+
+  it('leaves the coordinator alone for an ignored delivery', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    expect((await postWebhook({ event: 'issue_comment', payload: issueCommentEvent('LGTM', { number: 32 }) })).status).toBe(202);
+    expect(await workRows(coordinator(REPOSITORY_ID, 32))).toEqual([]);
   });
 
   it.each([

@@ -55,13 +55,14 @@ export interface IssueCommentOptions {
   author?: { login: string; type: string };
   sender?: { login: string; type: string };
   previousBody?: string;
+  number?: number;
 }
 
 export function issueCommentEvent(body: string, options: IssueCommentOptions = {}): WebhookPayload {
   return {
     ...base(options.action ?? 'created'),
     sender: options.sender ?? HUMAN,
-    issue: { number: PR_NUMBER, ...(options.onIssue ? {} : { pull_request: { url: 'https://api.github.com/x' } }) },
+    issue: { number: options.number ?? PR_NUMBER, ...(options.onIssue ? {} : { pull_request: { url: 'https://api.github.com/x' } }) },
     comment: { id: COMMENT_ID, body, user: options.author ?? HUMAN },
     ...(options.previousBody === undefined ? {} : { changes: { body: { from: options.previousBody } } }),
   };
@@ -87,4 +88,37 @@ export function workflowRunEvent(run: Record<string, unknown> = {}, action = 'co
       ...run,
     },
   };
+}
+
+export const DISPATCH_WORKFLOW_YAML = `name: Manki dispatch
+run-name: Manki \${{ inputs.event }} on PR \${{ inputs.pr }} (work \${{ inputs.work_id }})
+on:
+  workflow_dispatch:
+    inputs:
+      pr: { type: string, required: true }
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: manki-review/manki@v6
+`;
+
+export const EVENT_WORKFLOW_YAML = `name: Manki
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, closed]
+  issue_comment:
+    types: [created, edited]
+jobs:
+  review:
+    if: github.actor != 'manki-review[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: manki-review/manki@v6
+`;
+
+/** The GraphQL reply listing `.github/workflows` with `files` as name to text. */
+export function workflowsReply(files: Record<string, string>): { body: unknown } {
+  const entries = Object.entries(files).map(([name, text]) => ({ name, object: { text } }));
+  return { body: { data: { repository: { object: { entries } } } } };
 }

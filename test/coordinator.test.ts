@@ -1,0 +1,252 @@
+import { runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { DELIVERY_RETENTION_MS, OPT_IN_TTL_MS, QUEUED_MAX_AGE_MS } from '../src/coordinator';
+import { routeDelivery, type WebhookPayload } from '../src/routing';
+import { apiRequests, coordinator, freezeClock, type GitHubStub, INSTALLATION_ID, stubGitHub, workRows } from './helpers';
+import {
+  DISPATCH_WORKFLOW_YAML,
+  EVENT_WORKFLOW_YAML,
+  issueCommentEvent,
+  pullRequestEvent,
+  REPOSITORY_ID,
+  reviewCommentEvent,
+  reviewEvent,
+  workflowsReply,
+} from './payloads';
+
+const SHA_1 = '1'.repeat(40);
+const SHA_2 = '2'.repeat(40);
+const SHA_3 = '3'.repeat(40);
+
+const OPTED_IN: GitHubStub = { api: { 'POST /graphql': workflowsReply({ 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML }) } };
+
+// Storage outlives a single test, so each test works on its own PR number.
+let nextNumber = 100;
+
+function pullRequest() {
+  const number = nextNumber++;
+  const stub = coordinator(REPOSITORY_ID, number);
+  return {
+    stub,
+    push: (sha: string, action = 'synchronize') => pullRequestEvent(action, { number, head: { sha, repo: { full_name: 'manki-review/manki' } } }),
+    comment: (body: string, action = 'created') => issueCommentEvent(body, { number, action }),
+    review: () => reviewEvent('submitted', {}, { number }),
+    reply: (body: string) => reviewCommentEvent(body, { in_reply_to_id: 1 }, 'created', { number }),
+    close: (merged: boolean) => pullRequestEvent('closed', { number, merged }),
+    async send(event: string, payload: WebhookPayload, delivery: string = crypto.randomUUID()) {
+      const route = routeDelivery(event, payload);
+      if (route.type !== 'work' && route.type !== 'close') throw new Error(`Route ${route.type} is not for the coordinator`);
+      return stub.receive(delivery, route);
+    },
+  };
+}
+
+function logged(spy: { mock: { calls: unknown[][] } }, msg: string): Record<string, unknown>[] {
+  return spy.mock.calls.map((call) => JSON.parse(String(call[0]))).filter((line) => line.msg === msg);
+}
+
+let advanceClock: (ms: number) => number;
+let log: ReturnType<typeof vi.spyOn>;
+
+beforeEach(() => {
+  advanceClock = freezeClock();
+  log = vi.spyOn(console, 'log').mockImplementation(() => {});
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe('PrCoordinator.receive', () => {
+  it('refuses a delivery it has seen until the retention runs out', async () => {
+    const pr = pullRequest();
+    expect(await pr.send('pull_request', pr.push(SHA_1), 'd-1')).toEqual({ accepted: true, effect: 'queued work 1' });
+    expect(await pr.send('pull_request', pr.push(SHA_1), 'd-1')).toEqual({ accepted: false, reason: 'duplicate delivery' });
+    advanceClock(DELIVERY_RETENTION_MS + 1);
+    expect(await pr.send('pull_request', pr.push(SHA_1), 'd-1')).toMatchObject({ accepted: true });
+  });
+
+  it('sets an alarm for now once the work is stored', async () => {
+    const pr = pullRequest();
+    await pr.send('pull_request', pr.push(SHA_1));
+    expect(await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm())).toBe(Date.now());
+  });
+
+  it('coalesces pushes into one review of the newest head', async () => {
+    const pr = pullRequest();
+    await pr.send('pull_request', pr.push(SHA_1, 'opened'));
+    expect(await pr.send('pull_request', pr.push(SHA_2), 'd-2')).toEqual({ accepted: true, effect: 'merged into work 1' });
+    await pr.send('pull_request', pr.push(SHA_3), 'd-3');
+    expect(await workRows(pr.stub)).toMatchObject([
+      { id: 1, kind: 'review', event: 'pull_request.synchronize', head_sha: SHA_3, delivery: 'd-3', status: 'queued' },
+    ]);
+  });
+
+  it('turns a queued push review into a comment-triggered review that keeps its place', async () => {
+    const pr = pullRequest();
+    await pr.send('pull_request', pr.push(SHA_1));
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    await pr.send('issue_comment', pr.comment('@manki review'), 'd-request');
+    await pr.send('pull_request', pr.push(SHA_2));
+    expect(await workRows(pr.stub)).toMatchObject([
+      { id: 1, lane: 'state', kind: 'review', event: 'issue_comment.created', head_sha: SHA_2, object_id: 1001, delivery: 'd-request' },
+      { id: 2, lane: 'chat', kind: 'comment', event: 'issue_comment.created' },
+    ]);
+  });
+
+  it('queues thread work in arrival order behind the review', async () => {
+    const pr = pullRequest();
+    await pr.send('pull_request', pr.push(SHA_1));
+    await pr.send('pull_request_review_comment', pr.reply('Fixed'));
+    await pr.send('issue_comment', pr.comment('@manki check'));
+    await pr.send('issue_comment', pr.comment('@manki remember tabs'));
+    expect((await workRows(pr.stub)).map((row) => `${row.lane}:${row.kind}`)).toEqual([
+      'state:review', 'state:thread', 'state:comment', 'chat:comment',
+    ]);
+  });
+
+  it('skips a review state check that a queued reply already covers', async () => {
+    const pr = pullRequest();
+    await pr.send('pull_request_review_comment', pr.reply('Fixed'));
+    expect(await pr.send('pull_request_review', pr.review())).toEqual({ accepted: true, effect: 'covered by work 1' });
+    expect(await workRows(pr.stub)).toHaveLength(1);
+  });
+
+  it('drops a queued review state check when a thread reply follows', async () => {
+    const pr = pullRequest();
+    await pr.send('pull_request_review', pr.review());
+    expect(await pr.send('pull_request_review', pr.review())).toEqual({ accepted: true, effect: 'covered by work 1' });
+    await pr.send('pull_request_review_comment', pr.reply('Fixed'));
+    expect(await workRows(pr.stub)).toMatchObject([
+      { kind: 'review_state', status: 'dropped', note: 'covered by a later thread reply' },
+      { kind: 'thread', status: 'queued' },
+    ]);
+  });
+
+  it('drops queued work on a merge and queues the fix rate run', async () => {
+    const pr = pullRequest();
+    await pr.send('pull_request', pr.push(SHA_1));
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    expect(await pr.send('pull_request', pr.close(true))).toEqual({ accepted: true, effect: 'closed, dropped 2, queued work 3' });
+    expect(await workRows(pr.stub)).toMatchObject([
+      { status: 'dropped', note: 'pull request closed' },
+      { status: 'dropped', note: 'pull request closed' },
+      { kind: 'merged', event: 'pull_request.closed', status: 'queued' },
+    ]);
+  });
+
+  it('drops queued work on a close without merge and queues nothing', async () => {
+    const pr = pullRequest();
+    await pr.send('pull_request', pr.push(SHA_1));
+    expect(await pr.send('pull_request', pr.close(false))).toEqual({ accepted: true, effect: 'closed, dropped 1' });
+    expect((await workRows(pr.stub)).map((row) => row.status)).toEqual(['dropped']);
+  });
+});
+
+describe('PrCoordinator.alarm', () => {
+  it('logs what it would dispatch, one item per lane, and marks it skipped', async () => {
+    const mints: unknown[] = [];
+    stubGitHub({
+      api: {
+        ...OPTED_IN.api,
+        [`POST /app/installations/${INSTALLATION_ID}/access_tokens`]: async (request) => {
+          mints.push(await request.json());
+          return Response.json({ token: 'ghs_repo' }, { status: 201 });
+        },
+      },
+    });
+    const pr = pullRequest();
+    await pr.send('pull_request', pr.push(SHA_1), 'd-push');
+    await pr.send('pull_request_review_comment', pr.reply('Fixed'));
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+
+    expect(await runDurableObjectAlarm(pr.stub)).toBe(true);
+    expect((await workRows(pr.stub)).map((row) => `${row.kind}:${row.status}`)).toEqual(['review:skipped', 'thread:queued', 'comment:skipped']);
+    expect(logged(log, 'coordinator_would_dispatch')).toEqual([
+      expect.objectContaining({ work_id: 1, lane: 'state', kind: 'review', event: 'pull_request.synchronize', head_sha: SHA_1, delivery: 'd-push', opted_in: true }),
+      expect.objectContaining({ work_id: 3, lane: 'chat', kind: 'comment', event: 'issue_comment.created', object_id: 1001, sender: 'alice' }),
+    ]);
+
+    expect(mints).toEqual([{ permissions: { contents: 'read', metadata: 'read' }, repository_ids: [REPOSITORY_ID] }]);
+
+    expect(await runDurableObjectAlarm(pr.stub)).toBe(true);
+    expect((await workRows(pr.stub)).map((row) => row.status)).toEqual(['skipped', 'skipped', 'skipped']);
+  });
+
+  it('logs the reason a repository is not opted in', async () => {
+    stubGitHub({ api: { 'POST /graphql': workflowsReply({ 'manki.yml': EVENT_WORKFLOW_YAML, 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML }) } });
+    const pr = pullRequest();
+    await pr.send('pull_request', pr.push(SHA_1));
+    await runDurableObjectAlarm(pr.stub);
+    expect(logged(log, 'coordinator_would_dispatch')).toMatchObject([
+      { opted_in: false, opt_in_reason: 'event-driven Manki workflow manki.yml is next to manki-dispatch.yml' },
+    ]);
+  });
+
+  it('reads the opt-in at most once per TTL', async () => {
+    const requests = stubGitHub(OPTED_IN);
+    const pr = pullRequest();
+    const graphqlCalls = () => apiRequests(requests).filter((request) => request.url.endsWith('/graphql')).length;
+
+    await pr.send('pull_request', pr.push(SHA_1));
+    await runDurableObjectAlarm(pr.stub);
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    await runDurableObjectAlarm(pr.stub);
+    expect(graphqlCalls()).toBe(1);
+
+    advanceClock(OPT_IN_TTL_MS);
+    await pr.send('issue_comment', pr.comment('@manki help'));
+    await runDurableObjectAlarm(pr.stub);
+    expect(graphqlCalls()).toBe(2);
+  });
+
+  it('counts a refused token as not opted in', async () => {
+    stubGitHub({ accessToken: { status: 422, body: { message: 'permissions not granted' } } });
+    const pr = pullRequest();
+    await pr.send('pull_request', pr.push(SHA_1));
+    await runDurableObjectAlarm(pr.stub);
+    expect(logged(log, 'coordinator_would_dispatch')).toMatchObject([{ opted_in: false, opt_in_reason: 'token mint refused with 422' }]);
+  });
+
+  it('retries an item a minute after the opt-in read failed', async () => {
+    stubGitHub({ api: { 'POST /graphql': { status: 502, body: {} } } });
+    const pr = pullRequest();
+    await pr.send('pull_request', pr.push(SHA_1));
+    await runDurableObjectAlarm(pr.stub);
+    expect(logged(log, 'coordinator_opt_in_error')).toMatchObject([{ work_id: 1, error: 'Error: GraphQL request failed with 502' }]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'dispatching', lease_until: Date.now() + 60_000 }]);
+    expect(await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm())).toBe(Date.now() + 60_000);
+
+    stubGitHub(OPTED_IN);
+    advanceClock(60_000);
+    await runDurableObjectAlarm(pr.stub);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped' }]);
+  });
+
+  it('drops work that stayed queued for more than a day', async () => {
+    stubGitHub(OPTED_IN);
+    const pr = pullRequest();
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    advanceClock(QUEUED_MAX_AGE_MS + 1);
+    await runDurableObjectAlarm(pr.stub);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'dropped', note: 'queued too long' }]);
+    expect(logged(log, 'coordinator_would_dispatch')).toEqual([]);
+  });
+
+  it('deletes its storage and alarm a week after the last delivery', async () => {
+    stubGitHub(OPTED_IN);
+    const pr = pullRequest();
+    await pr.send('pull_request', pr.push(SHA_1));
+    await runDurableObjectAlarm(pr.stub);
+    const alarm = await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm());
+    expect(alarm).toBe(Date.now() + DELIVERY_RETENTION_MS);
+
+    advanceClock(DELIVERY_RETENTION_MS);
+    await runDurableObjectAlarm(pr.stub);
+    expect(await runInDurableObject(pr.stub, (_instance, state) => [
+      state.storage.sql.exec('SELECT name FROM sqlite_master WHERE type = ?', 'table').toArray().length,
+    ])).toEqual([0]);
+    expect(await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm())).toBeNull();
+    expect(logged(log, 'coordinator_deleted')).toHaveLength(1);
+  });
+});
