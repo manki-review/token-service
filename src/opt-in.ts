@@ -13,14 +13,13 @@ export interface WorkflowFile {
 }
 
 // The triggers of an event-driven Manki workflow. Any of them next to the dispatch workflow would review twice.
-// `workflow_call` counts too: such a reusable workflow runs whenever another workflow is triggered.
+// A local reusable workflow (`workflow_call`) only runs through a caller, whose own triggers are checked.
 const EVENT_TRIGGERS = new Set([
   'pull_request',
   'pull_request_target',
   'pull_request_review',
   'pull_request_review_comment',
   'issue_comment',
-  'workflow_call',
 ]);
 
 // The Manki action, or the job `if` from `SETUP.md`, which manki's own workflow also carries with `uses: ./`.
@@ -70,8 +69,13 @@ function mankiWorkflows(files: WorkflowFile[]): Set<string> {
 export function classifyWorkflows(files: WorkflowFile[]): OptIn {
   const dispatch = files.find((file) => file.name === DISPATCH_WORKFLOW);
   if (!dispatch?.text) return { optedIn: false, reason: `no ${DISPATCH_WORKFLOW}` };
-  if (!triggers(dispatch.text)?.has('workflow_dispatch')) {
+  const dispatchTriggers = triggers(dispatch.text);
+  if (!dispatchTriggers?.has('workflow_dispatch')) {
     return { optedIn: false, reason: `${DISPATCH_WORKFLOW} does not run on workflow_dispatch` };
+  }
+  // Any other trigger would start Manki on events the Worker also dispatches.
+  if (dispatchTriggers.size > 1) {
+    return { optedIn: false, reason: `${DISPATCH_WORKFLOW} runs on more than workflow_dispatch` };
   }
 
   const manki = mankiWorkflows(files);

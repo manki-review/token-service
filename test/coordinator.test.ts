@@ -152,6 +152,17 @@ describe('PrCoordinator.receive', () => {
     ]);
   });
 
+  it('restarts the age of a queued comment-triggered review on a push', async () => {
+    stubGitHub(OPTED_IN);
+    const pr = pullRequest();
+    await pr.send('issue_comment', pr.comment('@manki review'));
+    advanceClock(QUEUED_MAX_AGE_MS - MINUTE);
+    await pr.send('pull_request', pr.push(SHA_2));
+    advanceClock(2 * MINUTE);
+    await runDurableObjectAlarm(pr.stub);
+    expect(await workRows(pr.stub)).toMatchObject([{ event: 'issue_comment.created', head_sha: SHA_2, status: 'skipped' }]);
+  });
+
   it('restarts the age of a queued review on every push', async () => {
     stubGitHub(OPTED_IN);
     const pr = pullRequest();
