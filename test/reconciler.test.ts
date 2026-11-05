@@ -26,6 +26,7 @@ function setup() {
   const stub = RUNTIME_ENV.RECONCILER.getByName(name);
   const repo = (suffix = '') => {
     const id = nextId++;
+    RUNTIME_ENV.WEBHOOK_REPOS = `${RUNTIME_ENV.WEBHOOK_REPOS},${id}`;
     const target: Target = { installationId: INSTALLATION_ID, repositoryId: id, owner: OWNER, repo: `repo-${id}${suffix}`, defaultBranch: 'main', number: 0 };
     return target;
   };
@@ -64,6 +65,8 @@ function fakeGitHub() {
     graphqlCalls: 0,
     calls: 0,
     deliveryListCalls: 0,
+    /** The repositories whose open PRs were listed, in order. */
+    pullListCalls: [] as string[],
     /** Statuses the next redelivery requests answer with, in order. Afterwards 202. */
     redeliverStatuses: [] as Array<number | { status: number; headers: Record<string, string> }>,
     /** Statuses for listed delivery pages, by page index. */
@@ -99,9 +102,15 @@ function fakeGitHub() {
     }
     const pulls = url.pathname.match(/^\/repos\/[^/]+\/([^/]+)\/pulls$/);
     if (pulls && request.method === 'GET') {
+      state.pullListCalls.push(pulls[1]);
       const status = state.pullsStatus.get(pulls[1]);
       if (status) return Response.json({ message: 'no' }, { status });
       return Response.json(state.pulls.get(pulls[1]) ?? []);
+    }
+    const repository = url.pathname.match(/^\/repositories\/(\d+)$/);
+    if (repository && request.method === 'GET') {
+      const id = Number(repository[1]);
+      return Response.json({ id, name: id === 4242 ? 'manki' : `repo-${id}`, owner: { login: OWNER }, default_branch: 'main' });
     }
     if (route === 'POST /graphql') {
       const { query, variables } = await request.json() as { query: string; variables: { name: string; number: number } };
@@ -131,10 +140,16 @@ beforeEach(() => {
 });
 
 const realCoordinators = RUNTIME_ENV.PR_COORDINATOR;
+const realAllowlist = RUNTIME_ENV.WEBHOOK_REPOS;
+
+function key(id: string) {
+  return { id, bodyHash: null };
+}
 
 afterEach(() => {
   vi.useRealTimers();
   RUNTIME_ENV.PR_COORDINATOR = realCoordinators;
+  RUNTIME_ENV.WEBHOOK_REPOS = realAllowlist;
 });
 
 /**
@@ -355,6 +370,22 @@ describe('Reconciler redelivery', () => {
     expect(rows).toBe(0);
   });
 
+  it('touches no repository outside WEBHOOK_REPOS, even one in the registry', async () => {
+    const { stub, repo } = setup();
+    const allowed = repo();
+    const dropped = repo();
+    for (const target of [allowed, dropped]) await stub.recordOptIn(target, true);
+    RUNTIME_ENV.WEBHOOK_REPOS = String(allowed.repositoryId);
+    const github = fakeGitHub();
+    github.pages = [[failure(dropped, 2, 0), failure(allowed, 1, 0)]];
+    github.pulls.set(allowed.repo, [pull(1, SHA_1, { repo: allowed.repo })]);
+    github.pulls.set(dropped.repo, [pull(1, SHA_1, { repo: dropped.repo })]);
+    await stub.reconcile();
+    expect(github.redelivered).toEqual([1]);
+    expect(logged(log, 'reconciler_caught_up').map((line) => line.repo)).toEqual([`${OWNER}/${allowed.repo}`]);
+    expect(github.pullListCalls).toEqual([allowed.repo]);
+  });
+
   it('stops redelivering when the pass runs out of budget, and reaches the rest first on the next pass', async () => {
     const { stub, repo } = setup();
     const target = repo();
@@ -394,7 +425,7 @@ describe('opt-in timestamp', () => {
     const route = routeDelivery('pull_request', pullRequestEvent('synchronize', { number: 900 }));
     if (route.type !== 'work') throw new Error('expected work');
     const start = Date.now();
-    await pr.receive(crypto.randomUUID(), route);
+    await pr.receive(key(crypto.randomUUID()), route);
     await runDurableObjectAlarm(pr);
     const registry = RUNTIME_ENV.RECONCILER.getByName(RECONCILER_NAME);
     const rows = () => runInDurableObject(registry, (_instance, state) =>
@@ -402,12 +433,13 @@ describe('opt-in timestamp', () => {
     expect(await rows()).toEqual([{ repository_id: 4242, opted_in_at: start }]);
 
     vi.mocked(globalThis.fetch).mockImplementation(async (input, init) => {
-      const request = new Request(input, init);
-      if (new URL(request.url).pathname === '/graphql') return Response.json(workflowsReply({ 'manki.yml': EVENT_WORKFLOW_YAML }).body);
-      return Response.json({ token: 'ghs_repo' }, { status: 201 });
+      const path = new URL(new Request(input, init).url).pathname;
+      if (path === '/graphql') return Response.json(workflowsReply({ 'manki.yml': EVENT_WORKFLOW_YAML }).body);
+      if (path === '/repositories/4242') return Response.json({ name: 'manki', owner: { login: OWNER }, default_branch: 'main' });
+      return Response.json({ token: 'ghs_repo', expires_at: '2030-01-01T01:00:00Z' }, { status: 201 });
     });
     advanceClock(10 * MINUTE);
-    await pr.receive(crypto.randomUUID(), route);
+    await pr.receive(key(crypto.randomUUID()), route);
     await runDurableObjectAlarm(pr);
     expect(await rows()).toEqual([]);
   });
@@ -461,7 +493,7 @@ describe('Reconciler catch-up', () => {
       repository: { id: target.repositoryId, name: target.repo, full_name: `${OWNER}/${target.repo}`, default_branch: 'main', owner: { login: OWNER } },
     });
     if (route.type !== 'work') throw new Error('expected work');
-    await pushed.receive(crypto.randomUUID(), route);
+    await pushed.receive(key(crypto.randomUUID()), route);
     github.pulls.set(target.repo, [pull(1, SHA_1, { repo: target.repo }), pull(2, SHA_2, { repo: target.repo })]);
     github.reviews.set(`${target.repo}#2`, [{ author: 'manki-review', oid: SHA_2 }]);
 
@@ -513,7 +545,8 @@ describe('Reconciler catch-up', () => {
       ...pullRequestEvent('synchronize', { number: 1, head: { sha: SHA_1, repo: { full_name: `${OWNER}/${target.repo}` } } }, { login: 'dependabot[bot]', type: 'Bot' }),
       repository: { id: target.repositoryId, name: target.repo, full_name: `${OWNER}/${target.repo}`, default_branch: 'main', owner: { login: OWNER } },
     };
-    expect((await postWebhook({ event: 'pull_request', payload })).status).toBe(202);
+    // `TEST_ENV` holds the allowlist from before this test added its repository.
+    expect((await postWebhook({ event: 'pull_request', payload, env: { ...TEST_ENV, WEBHOOK_REPOS: RUNTIME_ENV.WEBHOOK_REPOS } })).status).toBe(202);
     github.pulls.set(target.repo, [pull(1, SHA_1, { repo: target.repo })]);
     await stub.reconcile();
     expect(github.graphqlCalls).toBe(0);
@@ -581,13 +614,13 @@ describe('Reconciler catch-up', () => {
     const target = repo();
     await stub.recordOptIn(target, true);
     const github = fakeGitHub();
-    await coordinator(target.repositoryId, 1).markSeen(crypto.randomUUID(), { ...target, number: 1 }, SHA_1);
+    await coordinator(target.repositoryId, 1).markSeen(key(crypto.randomUUID()), { ...target, number: 1 }, SHA_1);
     const pushed = routeDelivery('pull_request', {
       ...pullRequestEvent('synchronize', { number: 2, head: { sha: SHA_2, repo: { full_name: `${OWNER}/${target.repo}` } } }),
       repository: { id: target.repositoryId, name: target.repo, full_name: `${OWNER}/${target.repo}`, default_branch: 'main', owner: { login: OWNER } },
     });
     if (pushed.type !== 'work') throw new Error('expected work');
-    await coordinator(target.repositoryId, 2).receive(crypto.randomUUID(), pushed);
+    await coordinator(target.repositoryId, 2).receive(key(crypto.randomUUID()), pushed);
     github.pulls.set(target.repo, [pull(1, SHA_1, { repo: target.repo }), pull(2, SHA_2, { repo: target.repo })]);
     const calls = watchCoordinators();
     await stub.reconcile();

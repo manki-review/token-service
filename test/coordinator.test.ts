@@ -326,8 +326,8 @@ describe('PrCoordinator catch-up state', () => {
 
   it('marks a bot head as handled without work, refuses the same delivery twice and sets its cleanup alarm', async () => {
     const pr = pullRequest();
-    expect(await pr.stub.markSeen('d-bot', target(pr.number), SHA_1)).toEqual({ accepted: true, effect: 'head marked as seen' });
-    expect(await pr.stub.markSeen('d-bot', target(pr.number), SHA_1)).toEqual({ accepted: false, reason: 'duplicate delivery' });
+    expect(await pr.stub.markSeen(key('d-bot'), target(pr.number), SHA_1)).toEqual({ accepted: true, effect: 'head marked as seen' });
+    expect(await pr.stub.markSeen(key('d-bot'), target(pr.number), SHA_1)).toEqual({ accepted: false, reason: 'duplicate delivery' });
     expect(await workRows(pr.stub)).toEqual([]);
     expect(await pr.stub.catchUpState(SHA_1)).toBe('handled');
     expect(await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm())).toBe(Date.now() + DELIVERY_RETENTION_MS);
@@ -747,7 +747,7 @@ describe('PrCoordinator dispatch', () => {
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'running', head_sha: SHA_1 }]);
     expect(await pr.send('pull_request', pr.push(SHA_1))).toEqual({ accepted: true, effect: 'head already reviewed or under review' });
 
-    await pr.stub.runCompleted('d-end', 9000, 'success');
+    await pr.stub.runCompleted(key('d-end'), 9000, 'success');
     expect(await pr.stub.catchUpState(SHA_1)).toBe('handled');
     expect(await pr.send('pull_request', pr.push(SHA_1))).toEqual({ accepted: true, effect: 'head already reviewed or under review' });
     expect(await pr.send('pull_request', pr.push(SHA_2))).toEqual({ accepted: true, effect: 'queued work 2' });
@@ -761,7 +761,7 @@ describe('PrCoordinator dispatch', () => {
     fakeGitHub(pr.number);
     await pr.send('pull_request', pr.push(SHA_1));
     await runDurableObjectAlarm(pr.stub);
-    await pr.stub.runCompleted('d-end', 9000, conclusion);
+    await pr.stub.runCompleted(key('d-end'), 9000, conclusion);
     expect(await pr.stub.catchUpState(SHA_1)).toBe('needed');
     expect(await pr.send('pull_request', pr.push(SHA_1))).toEqual({ accepted: true, effect: 'queued work 2' });
   });
