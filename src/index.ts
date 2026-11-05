@@ -1,4 +1,5 @@
 import { jwtVerify, createRemoteJWKSet } from 'jose';
+import { cappedPermissions, type Permissions } from './permissions';
 
 interface Env {
   APP_ID: string;
@@ -51,7 +52,12 @@ async function createAppJWT(appId: string, privateKeyPem: string): Promise<strin
   return `${headerB64}.${payloadB64}.${sigB64}`;
 }
 
-async function getInstallationId(jwt: string, owner: string, repo: string): Promise<number | null> {
+interface Installation {
+  id: number;
+  permissions: Permissions;
+}
+
+async function getInstallation(jwt: string, owner: string, repo: string): Promise<Installation | null> {
   const response = await fetch(
     `https://api.github.com/repos/${owner}/${repo}/installation`,
     {
@@ -68,8 +74,8 @@ async function getInstallationId(jwt: string, owner: string, repo: string): Prom
     return null;
   }
 
-  const data = await response.json() as { id: number };
-  return data.id;
+  const data = await response.json() as { id: number; permissions?: Permissions };
+  return { id: data.id, permissions: data.permissions ?? {} };
 }
 
 interface OIDCClaims {
@@ -143,24 +149,35 @@ export default {
     try {
       const appJwt = await createAppJWT(env.APP_ID, env.APP_PRIVATE_KEY);
 
-      const installationId = await getInstallationId(appJwt, body.owner, body.repo);
-      if (!installationId) {
+      const installation = await getInstallation(appJwt, body.owner, body.repo);
+      if (!installation) {
         return Response.json(
           { error: 'App not installed on this repository' },
           { status: 404 },
         );
       }
 
+      // An empty `permissions` object would not narrow the token, so refuse instead of minting a full one.
+      const permissions = cappedPermissions(installation.permissions);
+      if (Object.keys(permissions).length === 0) {
+        return Response.json(
+          { error: 'App installation grants none of the permissions Manki needs' },
+          { status: 403 },
+        );
+      }
+
       const tokenResponse = await fetch(
-        `https://api.github.com/app/installations/${installationId}/access_tokens`,
+        `https://api.github.com/app/installations/${installation.id}/access_tokens`,
         {
           method: 'POST',
           headers: {
             Authorization: `Bearer ${appJwt}`,
             Accept: 'application/vnd.github+json',
+            'Content-Type': 'application/json',
             'User-Agent': 'manki-token-service',
             'X-GitHub-Api-Version': '2022-11-28',
           },
+          body: JSON.stringify({ permissions }),
         },
       );
 
@@ -172,11 +189,12 @@ export default {
         );
       }
 
-      const tokenData = await tokenResponse.json() as { token: string; expires_at: string };
+      const tokenData = await tokenResponse.json() as { token: string; expires_at: string; permissions: Permissions };
 
       return Response.json({
         token: tokenData.token,
         expires_at: tokenData.expires_at,
+        permissions: tokenData.permissions,
       });
     } catch (error) {
       return Response.json(

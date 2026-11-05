@@ -2,12 +2,19 @@
   "name": "manki-token-service",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc && tsc -p test",
+    "test": "vitest run"
   },
   "devDependencies": {
-    "wrangler": "^4.0.0"
+    "@cloudflare/vitest-plugin": "^1.6.0",
+    "@cloudflare/workers-types": "^5.20261104.1",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0",
+    "wrangler": "^4.158.0"
   },
   "dependencies": {
     "jose": "^6.2.2"
