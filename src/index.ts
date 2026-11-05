@@ -1,11 +1,41 @@
 import { createAppJWT } from './app-jwt';
 import type { Env } from './env';
-import { createInstallationToken, getInstallation } from './github';
+import { createInstallationToken, getInstallation, type Installation } from './github';
+import { log } from './log';
 import { verifyGitHubOIDC } from './oidc';
-import { cappedPermissions, type Permissions } from './permissions';
+import { cappedPermissions, MANKI_PERMISSION_CAPS, MEMORY_PERMISSION_CAPS, type Permissions } from './permissions';
 import { handleWebhook } from './webhook';
 
 export { PrCoordinator } from './coordinator';
+
+// Only this name is minted, so a token for one installation account can never write another account's memory.
+const MEMORY_REPO = 'review-memory';
+
+interface MintedToken {
+  token: string;
+  expires_at: string;
+}
+
+/**
+ * Mints a token that writes only the installation account's `review-memory`. Returns `null` when the installation
+ * grants no `contents` or GitHub refuses the mint, such as when `review-memory` is not part of the installation.
+ */
+async function mintMemoryToken(jwt: string, installation: Installation): Promise<MintedToken | null> {
+  const permissions = cappedPermissions(installation.permissions, MEMORY_PERMISSION_CAPS);
+  if (Object.keys(permissions).length === 0) return null;
+  try {
+    const response = await createInstallationToken(jwt, installation.id, permissions, { repositories: [MEMORY_REPO] });
+    if (!response.ok) {
+      log('memory token mint refused', { installation_id: installation.id, status: response.status });
+      return null;
+    }
+    const data = await response.json() as MintedToken;
+    return { token: data.token, expires_at: data.expires_at };
+  } catch (error) {
+    log('memory token mint failed', { installation_id: installation.id, error: String(error) });
+    return null;
+  }
+}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -32,7 +62,7 @@ export default {
     }
     const oidcToken = authHeader.slice(7);
 
-    let parsed: { owner?: unknown; repo?: unknown } | null;
+    let parsed: { owner?: unknown; repo?: unknown; memory?: unknown } | null;
     try {
       parsed = await request.json();
     } catch {
@@ -42,13 +72,17 @@ export default {
     if (typeof parsed?.owner !== 'string' || typeof parsed?.repo !== 'string' || !parsed.owner || !parsed.repo) {
       return Response.json({ error: 'owner and repo are required' }, { status: 400 });
     }
-    const body = { owner: parsed.owner, repo: parsed.repo };
+    if (parsed.memory !== undefined && typeof parsed.memory !== 'boolean') {
+      return Response.json({ error: 'memory must be a boolean' }, { status: 400 });
+    }
+    const body = { owner: parsed.owner, repo: parsed.repo, memory: parsed.memory === true };
 
     const expectedRepo = `${body.owner}/${body.repo}`;
 
     // Verify the OIDC token is from a GitHub Actions workflow in the requested repo
+    let repositoryId: number;
     try {
-      await verifyGitHubOIDC(oidcToken, expectedRepo);
+      repositoryId = Number((await verifyGitHubOIDC(oidcToken, expectedRepo)).repository_id);
     } catch (error) {
       return Response.json(
         { error: `OIDC verification failed: ${error}` },
@@ -68,7 +102,7 @@ export default {
       }
 
       // An empty `permissions` object would not narrow the token, so refuse instead of minting a full one.
-      const permissions = cappedPermissions(installation.permissions);
+      const permissions = cappedPermissions(installation.permissions, MANKI_PERMISSION_CAPS);
       if (Object.keys(permissions).length === 0) {
         return Response.json(
           { error: 'App installation grants none of the permissions Manki needs' },
@@ -76,7 +110,7 @@ export default {
         );
       }
 
-      const tokenResponse = await createInstallationToken(appJwt, installation.id, permissions);
+      const tokenResponse = await createInstallationToken(appJwt, installation.id, permissions, { repository_ids: [repositoryId] });
 
       if (!tokenResponse.ok) {
         const error = await tokenResponse.text();
@@ -86,12 +120,14 @@ export default {
         );
       }
 
-      const tokenData = await tokenResponse.json() as { token: string; expires_at: string; permissions: Permissions };
+      const tokenData = await tokenResponse.json() as MintedToken & { permissions: Permissions };
+      const memory = body.memory ? await mintMemoryToken(appJwt, installation) : null;
 
       return Response.json({
         token: tokenData.token,
         expires_at: tokenData.expires_at,
         permissions: tokenData.permissions,
+        ...(memory && { memory_token: memory.token, memory_expires_at: memory.expires_at }),
       });
     } catch (error) {
       return Response.json(

@@ -13,6 +13,8 @@ export const APP_ID = '123456';
 export const INSTALLATION_ID = 987;
 export const OWNER = 'manki-review';
 export const REPO = 'manki';
+export const REPOSITORY_ID = 424242;
+export const OWNER_ID = 4242;
 
 const OIDC_KID = 'test-oidc-key';
 
@@ -65,17 +67,25 @@ export interface OidcTokenOptions {
   audience?: string;
   key?: CryptoKey;
   expiresIn?: string | number;
+  /** The `iat` claim. A missing value means now. */
+  issuedAt?: number;
   /** Registered claims to leave out of the token. */
   omit?: Array<'exp' | 'iat'>;
 }
 
 /** Returns a GitHub Actions OIDC token for `OWNER/REPO`, signed with the key `stubGitHub` serves as the JWKS. */
 export async function oidcToken(options: OidcTokenOptions = {}): Promise<string> {
-  const jwt = new SignJWT({ repository: `${OWNER}/${REPO}`, repository_owner: OWNER, ...options.claims })
+  const jwt = new SignJWT({
+    repository: `${OWNER}/${REPO}`,
+    repository_owner: OWNER,
+    repository_id: String(REPOSITORY_ID),
+    repository_owner_id: String(OWNER_ID),
+    ...options.claims,
+  })
     .setProtectedHeader({ alg: 'RS256', kid: OIDC_KID })
     .setIssuer(options.issuer ?? OIDC_ISSUER)
     .setAudience(options.audience ?? OIDC_AUDIENCE);
-  if (!options.omit?.includes('iat')) jwt.setIssuedAt();
+  if (!options.omit?.includes('iat')) jwt.setIssuedAt(options.issuedAt);
   if (!options.omit?.includes('exp')) jwt.setExpirationTime(options.expiresIn ?? '5m');
   return jwt.sign(options.key ?? oidcKeys.privateKey);
 }
