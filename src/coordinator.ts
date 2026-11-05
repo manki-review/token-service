@@ -74,7 +74,8 @@ export interface WorkRow extends Record<string, string | number | null> {
 /** A delivery's id and the SHA-256 of its raw body. A delivery is a replay when either was seen before. */
 export interface Delivery {
   id: string;
-  bodyHash: string;
+  /** Null for a body that can repeat in a genuine delivery, which only its id identifies. */
+  bodyHash: string | null;
 }
 
 export type ReceiveResult = { accepted: false; reason: string } | { accepted: true; effect: string };
@@ -178,11 +179,13 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /** Whether the delivery's id or body was seen before. The id header is not signed, so a captured body can come back under a new id. */
   private isReplay(delivery: Delivery): boolean {
-    return this.sql.exec('SELECT 1 FROM deliveries WHERE id IN (?, ?)', delivery.id, `sha256:${delivery.bodyHash}`).toArray().length > 0;
+    const keys = delivery.bodyHash === null ? [delivery.id] : [delivery.id, `sha256:${delivery.bodyHash}`];
+    return this.sql.exec(`SELECT 1 FROM deliveries WHERE id IN (${keys.map(() => '?').join(', ')})`, ...keys).toArray().length > 0;
   }
 
   private remember(delivery: Delivery, now: number): void {
-    this.sql.exec('INSERT INTO deliveries (id, received_at) VALUES (?, ?), (?, ?)', delivery.id, now, `sha256:${delivery.bodyHash}`, now);
+    this.sql.exec('INSERT INTO deliveries (id, received_at) VALUES (?, ?)', delivery.id, now);
+    if (delivery.bodyHash !== null) this.sql.exec('INSERT INTO deliveries (id, received_at) VALUES (?, ?)', `sha256:${delivery.bodyHash}`, now);
   }
 
   /** Records a routed delivery and queues its work. A delivery whose id or body was seen before is refused. */

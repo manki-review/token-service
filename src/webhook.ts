@@ -103,7 +103,9 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
   log('webhook', { delivery, event, action: payload.action ?? null, ...summarize(route) });
   if (route.type !== 'ignore') {
     const coordinator = env.PR_COORDINATOR.getByName(`${route.target.repositoryId}:${route.target.number}`);
-    const key = { id: delivery, bodyHash: await sha256Hex(body) };
+    // A thread event names no time, so resolving, reopening and resolving again send the same body. A replay of one
+    // only adds a review state check, which merges with the queued one, so its id alone is checked.
+    const key = { id: delivery, bodyHash: event === 'pull_request_review_thread' ? null : await sha256Hex(body) };
     try {
       if (route.type === 'run_completed') await coordinator.runCompleted(key, route.runId, route.conclusion);
       else await coordinator.receive(key, route);
