@@ -61,6 +61,28 @@ describe('/token permissions', () => {
     });
   });
 
+  it('caps an `admin` level at the cap', async () => {
+    const requests = stubGitHub({
+      installation: { body: { id: INSTALLATION_ID, permissions: { contents: 'admin', metadata: 'read', pull_requests: 'admin' } } },
+    });
+
+    expect((await postToken()).status).toBe(200);
+    expect(await mintRequestBody(requests)).toEqual({
+      permissions: { contents: 'write', metadata: 'read', pull_requests: 'write' },
+    });
+  });
+
+  it('refuses to mint when the installation response has no permissions', async () => {
+    const requests = stubGitHub({ installation: { body: { id: INSTALLATION_ID } } });
+
+    const response = await postToken();
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ error: 'App installation grants none of the permissions Manki needs' });
+    expect(apiRequests(requests).map((request) => new URL(request.url).pathname)).toEqual([
+      '/repos/manki-review/manki/installation',
+    ]);
+  });
+
   it('refuses to mint when the installation grants nothing Manki uses', async () => {
     const requests = stubGitHub({
       installation: { body: { id: INSTALLATION_ID, permissions: { administration: 'write' } } },
