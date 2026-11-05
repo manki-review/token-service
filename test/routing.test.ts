@@ -127,6 +127,9 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['a dispatch run that only differs in its event', 'workflow_run', workflowRunEvent({ event: 'push' }), 'ignore'],
   ['a dispatch of another workflow', 'workflow_run', workflowRunEvent({ path: '.github/workflows/deploy.yml' }), 'ignore'],
   ['a dispatch run without a PR in its name', 'workflow_run', workflowRunEvent({ display_title: 'Manki dispatch' }), 'ignore'],
+  ['a dispatch run a person started', 'workflow_run', { ...workflowRunEvent(), sender: { login: 'alice', type: 'User' } }, 'ignore'],
+  ['a dispatch run another App started', 'workflow_run', { ...workflowRunEvent(), sender: BOT_SENDER }, 'ignore'],
+  ['a dispatch run without a sender', 'workflow_run', { ...workflowRunEvent(), sender: undefined }, 'ignore'],
 
   // Other events and broken payloads
   ['a ping', 'ping', { zen: 'Keep it logically awesome.' } as WebhookPayload, 'ignore'],

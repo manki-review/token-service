@@ -13,6 +13,8 @@ export default defineConfig({
         APP_ID: '123456',
         APP_PRIVATE_KEY: privateKey.export({ type: 'pkcs1', format: 'pem' }).toString(),
         WEBHOOK_SECRET: 'test-webhook-secret',
+        // `REPOSITORY_ID` of `test/payloads.ts`, in place of the real ids in `wrangler.toml`.
+        WEBHOOK_REPOS: '4242',
       },
     },
   })],
