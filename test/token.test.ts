@@ -1,5 +1,6 @@
 import { decodeProtectedHeader, generateKeyPair, jwtVerify } from 'jose';
 import { describe, expect, it } from 'vitest';
+import { toPkcs8Pem } from '../src/app-jwt';
 import worker from '../src/index';
 import {
   apiRequests,
@@ -56,6 +57,13 @@ describe('/token', () => {
       expect(payload.iat).toBeLessThanOrEqual(before - 59);
       expect(payload.exp! - payload.iat!).toBe(660);
     }
+  });
+
+  it('wraps a PKCS#1 App key into the matching PKCS#8 key', () => {
+    // workerd also accepts a raw PKCS#1 key as PKCS#8, so a signed JWT alone does not prove the conversion.
+    const body = (pem: string) => pem.replace(/-----[A-Z ]+-----|\s/g, '');
+    expect(body(toPkcs8Pem(appPrivateKeyPkcs1))).toBe(body(appPrivateKeyPkcs8));
+    expect(body(toPkcs8Pem(appPrivateKeyPkcs8))).toBe(body(appPrivateKeyPkcs8));
   });
 
   it('reuses the cached OIDC key set on later requests', async () => {

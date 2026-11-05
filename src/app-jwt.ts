@@ -32,7 +32,7 @@ function isPkcs8(der: Uint8Array): boolean {
  * The format is read from the DER, not the PEM label. The importer this replaces ignored the label, so the deployed
  * secret may carry a label that does not match its format.
  */
-function toPkcs8Pem(privateKeyPem: string): string {
+export function toPkcs8Pem(privateKeyPem: string): string {
   const base64 = privateKeyPem.replace(/-----[A-Z ]+-----/g, '').replace(/\s/g, '');
   const der = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
   const pkcs8 = isPkcs8(der)
