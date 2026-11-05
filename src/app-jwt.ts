@@ -41,13 +41,29 @@ export function toPkcs8Pem(privateKeyPem: string): string {
   return `-----BEGIN PRIVATE KEY-----\n${btoa(String.fromCharCode(...pkcs8))}\n-----END PRIVATE KEY-----`;
 }
 
+/** How long a signed App JWT is reused. It is valid for 10 minutes, so a reused one has a minute left at least. */
+export const APP_JWT_REUSE_MS = 9 * 60_000;
+
+let cachedJwt: { appId: string; privateKeyPem: string; jwt: string; signedAt: number } | null = null;
+
+/** Returns an App JWT, signing a new one only when the last one for this App and key is 9 minutes old. */
 export async function createAppJWT(appId: string, privateKeyPem: string): Promise<string> {
+  const now = Date.now();
+  const cached = cachedJwt;
+  if (
+    cached && cached.appId === appId && cached.privateKeyPem === privateKeyPem
+    && now >= cached.signedAt && now - cached.signedAt < APP_JWT_REUSE_MS
+  ) {
+    return cached.jwt;
+  }
   const key = await importPKCS8(toPkcs8Pem(privateKeyPem), 'RS256');
-  const now = Math.floor(Date.now() / 1000);
-  return new SignJWT()
+  const seconds = Math.floor(now / 1000);
+  const jwt = await new SignJWT()
     .setProtectedHeader({ alg: 'RS256', typ: 'JWT' })
-    .setIssuedAt(now - 60)
-    .setExpirationTime(now + 600)
+    .setIssuedAt(seconds - 60)
+    .setExpirationTime(seconds + 600)
     .setIssuer(appId)
     .sign(key);
+  cachedJwt = { appId, privateKeyPem, jwt, signedAt: now };
+  return jwt;
 }

@@ -105,6 +105,8 @@ export interface StubReply {
 export interface GitHubStub {
   installation?: StubReply;
   accessToken?: StubReply;
+  /** The reply to `GET /repositories/<id>`. */
+  repository?: StubReply;
   /**
    * Replies keyed by `<METHOD> <path>`, such as `POST /graphql`. They take precedence over the defaults. A function
    * runs in the caller's context, so it can read a request body sent from inside a Durable Object.
@@ -128,6 +130,9 @@ export function stubGitHub(stub: GitHubStub = {}): Request[] {
     if (handler) return reply(handler, {});
     if (request.url === JWKS_URL) {
       return Response.json({ keys: [oidcJwk] });
+    }
+    if (/^\/repositories\/[0-9]+$/.test(url.pathname)) {
+      return reply(stub.repository, { name: REPO, owner: { login: OWNER }, default_branch: 'main' });
     }
     if (url.pathname === `/repos/${OWNER}/${REPO}/installation`) {
       return reply(stub.installation, { id: INSTALLATION_ID, permissions: DEFAULT_INSTALLATION_PERMISSIONS });

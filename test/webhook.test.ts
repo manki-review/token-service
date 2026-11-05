@@ -171,6 +171,14 @@ describe('/webhook', () => {
     expect(log).not.toHaveBeenCalled();
   });
 
+  it('accepts a delivery signed with WEBHOOK_SECRET_PREVIOUS while it is set', async () => {
+    const payload = { zen: 'Mind your words, they are important.' };
+    const signature = await signWebhook(JSON.stringify(payload), 'old-secret');
+    expect((await postWebhook({ payload, signature, env: { ...TEST_ENV, WEBHOOK_SECRET_PREVIOUS: 'old-secret' } })).status).toBe(202);
+    expect((await postWebhook({ payload, signature })).status).toBe(401);
+    expect((await postWebhook({ payload, signature, env: { ...TEST_ENV, WEBHOOK_SECRET_PREVIOUS: 'another-secret' } })).status).toBe(401);
+  });
+
   it('refuses a body changed after signing', async () => {
     const signature = await signWebhook(JSON.stringify(pullRequestEvent('synchronize')));
     const response = await postWebhook({ event: 'pull_request', payload: pullRequestEvent('opened'), signature });

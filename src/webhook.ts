@@ -73,7 +73,11 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
   if (Number(request.headers.get('Content-Length') ?? 0) > MAX_BODY_BYTES) return tooLarge();
   const body = await readBody(request);
   if (body === null) return tooLarge();
-  if (!(await verifyWebhookSignature(env.WEBHOOK_SECRET, body, request.headers.get('X-Hub-Signature-256')))) {
+  const signature = request.headers.get('X-Hub-Signature-256');
+  // The previous secret stays valid while a rotation is under way, so no delivery fails in between.
+  const signed = await verifyWebhookSignature(env.WEBHOOK_SECRET, body, signature)
+    || await verifyWebhookSignature(env.WEBHOOK_SECRET_PREVIOUS ?? '', body, signature);
+  if (!signed) {
     return Response.json({ error: 'Invalid signature' }, { status: 401 });
   }
 

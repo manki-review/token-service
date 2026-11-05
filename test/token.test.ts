@@ -1,6 +1,6 @@
 import { decodeProtectedHeader, generateKeyPair, jwtVerify } from 'jose';
-import { describe, expect, it } from 'vitest';
-import { toPkcs8Pem } from '../src/app-jwt';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { APP_JWT_REUSE_MS, createAppJWT, toPkcs8Pem } from '../src/app-jwt';
 import worker from '../src/index';
 import {
   apiRequests,
@@ -8,6 +8,7 @@ import {
   appKeys,
   appPrivateKeyPkcs1,
   appPrivateKeyPkcs8,
+  freezeClock,
   INSTALLATION_ID,
   JWKS_URL,
   OIDC_AUDIENCE,
@@ -47,6 +48,10 @@ function stubMemoryMint(memory: StubReply = {}): Request[] {
 }
 
 describe('/token', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it('returns an installation token for a verified workflow', async () => {
     const requests = stubGitHub();
     const response = await postToken();
@@ -73,6 +78,8 @@ describe('/token', () => {
     ['PKCS#8', appPrivateKeyPkcs8],
     ['PKCS#8 under an RSA label', appPrivateKeyPkcs8.replace(/(BEGIN|END) PRIVATE KEY/g, '$1 RSA PRIVATE KEY')],
   ])('signs the App JWT with a %s key', async (_format, privateKey) => {
+    // Past the reuse window of any JWT an earlier test signed, so this one is signed now.
+    freezeClock(Date.now() + APP_JWT_REUSE_MS);
     const requests = stubGitHub();
     const before = Math.floor(Date.now() / 1000);
     const response = await postToken({ env: { ...TEST_ENV, APP_PRIVATE_KEY: privateKey } });
@@ -88,6 +95,22 @@ describe('/token', () => {
       expect(payload.iat).toBeLessThanOrEqual(before - 59);
       expect(payload.exp! - payload.iat!).toBe(660);
     }
+  });
+
+  it('reuses the App JWT for 9 minutes for the same App and key', async () => {
+    const advance = freezeClock(Date.now() + 2 * APP_JWT_REUSE_MS);
+    const first = await createAppJWT(APP_ID, appPrivateKeyPkcs1);
+    advance(APP_JWT_REUSE_MS - 1);
+    expect(await createAppJWT(APP_ID, appPrivateKeyPkcs1)).toBe(first);
+    expect(await createAppJWT('654321', appPrivateKeyPkcs1)).not.toBe(first);
+    const other = await createAppJWT(APP_ID, appPrivateKeyPkcs8);
+    expect(other).not.toBe(first);
+    expect(await createAppJWT(APP_ID, appPrivateKeyPkcs8)).toBe(other);
+    advance(APP_JWT_REUSE_MS);
+    const renewed = await createAppJWT(APP_ID, appPrivateKeyPkcs8);
+    expect(renewed).not.toBe(other);
+    const { payload } = await jwtVerify(renewed, appKeys.publicKey, { issuer: APP_ID });
+    expect(payload.iat).toBe(Math.floor(Date.now() / 1000) - 60);
   });
 
   it('wraps a PKCS#1 App key into the matching PKCS#8 key', () => {

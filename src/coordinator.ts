@@ -1,10 +1,10 @@
 import { DurableObject } from 'cloudflare:workers';
 import { dispatchInputs, runTitle } from './dispatch';
 import type { Env } from './env';
-import { githubApi, type MintResult, mintRepositoryToken } from './github';
+import { githubApi, isRateLimited, type MintResult, mintRepositoryToken } from './github';
 import { log } from './log';
 import { BOT_LOGIN } from './manki';
-import { type OptIn, readOptIn } from './opt-in';
+import { type OptIn, readOptIn, type Repository } from './opt-in';
 import type { Permissions } from './permissions';
 import { DISPATCH_WORKFLOW, type Lane, type Route, type Target, type Work } from './routing';
 
@@ -31,7 +31,10 @@ export const POLL_MS = 2 * MINUTE;
 export const QUEUED_RUN_TIMEOUT_MS = 30 * MINUTE;
 /** A run going this long outlived the dispatch workflow's `timeout-minutes: 30`, so it is cancelled. */
 export const RUNNING_RUN_TIMEOUT_MS = 40 * MINUTE;
-/** A running item ends as `timed_out` this long after its dispatch, whatever its polls returned. */
+/**
+ * A run not seen ending this long after its dispatch is cancelled. Its lane stays busy until the cancel succeeds or
+ * the run is seen completed, so two runs never overlap.
+ */
 export const RUN_DEADLINE_MS = 75 * MINUTE;
 /** A dispatch answered without a run id fails once no matching run turned up in this time. */
 export const RUN_LOOKUP_TIMEOUT_MS = 10 * MINUTE;
@@ -69,6 +72,14 @@ export interface WorkRow extends Record<string, string | number | null> {
   errors: number;
   /** 1 when a repository user caused the work, 0 for a comment by anyone else. */
   trusted: number;
+  /** How often the item was queued again after its run never started. */
+  requeues: number;
+}
+
+/** The opt-in result as cached, with the repository as GitHub names it when it was read. */
+interface CachedOptIn extends OptIn {
+  expires: number;
+  repository: Repository | null;
 }
 
 /** A delivery's id and the SHA-256 of its raw body. A delivery is a replay when either was seen before. */
@@ -108,6 +119,7 @@ export const MIGRATIONS = [
    ALTER TABLE work ADD COLUMN errors INTEGER NOT NULL DEFAULT 0;
    CREATE INDEX work_by_run ON work (run_id);`,
   `ALTER TABLE work ADD COLUMN trusted INTEGER NOT NULL DEFAULT 1;`,
+  `ALTER TABLE work ADD COLUMN requeues INTEGER NOT NULL DEFAULT 0;`,
 ];
 
 const ACTIVE = `status IN ('dispatching', 'running')`;
@@ -115,11 +127,6 @@ const ACTIVE = `status IN ('dispatching', 'running')`;
 /** The wait before the next try after `errors` failures in a row: 2, 4, 8, then at most 16 minutes. */
 export function backoff(errors: number): number {
   return POLL_MS * 2 ** Math.min(errors, 3);
-}
-
-/** Whether a 403 is GitHub's rate limit, which passes, rather than a refusal. */
-function isRateLimited(response: Response): boolean {
-  return response.status === 403 && (response.headers.has('retry-after') || response.headers.get('x-ratelimit-remaining') === '0');
 }
 
 /**
@@ -375,12 +382,26 @@ export class PrCoordinator extends DurableObject<Env> {
     return mint;
   }
 
-  /** Returns a token for this repository alone. Returns null when GitHub refuses, which it does for an ungranted permission. */
+  /**
+   * Returns a token for this repository alone. Returns null when GitHub refuses, which it does for an ungranted
+   * permission. Throws on any other failure, so the caller retries after its backoff.
+   */
   private async token(permissions: Permissions): Promise<string | null> {
     const mint = await this.mint(permissions);
     if (mint.ok) return mint.token;
-    log('coordinator_token_refused', { ...this.logFields(), permissions, status: mint.status, message: mint.message });
+    log('coordinator_token_failed', { ...this.logFields(), permissions, status: mint.status, refused: mint.refused, message: mint.message });
+    if (!mint.refused) throw new Error(`token mint failed with ${mint.status}`);
     return null;
+  }
+
+  /**
+   * Returns the target with the owner, name and default branch GitHub gives for its repository id. Returns null when
+   * GitHub refused to show the repository.
+   */
+  private async verifiedTarget(): Promise<Target | null> {
+    await this.optIn();
+    const repository = this.getMeta<CachedOptIn>('opt_in')?.repository;
+    return repository ? { ...this.target(), ...repository } : null;
   }
 
   private async start(item: WorkRow): Promise<void> {
@@ -448,7 +469,8 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /** Starts a run for `item`. Every GitHub call is followed by a fresh read of the row before anything is written. */
   private async dispatch(item: WorkRow): Promise<void> {
-    const target = this.target();
+    const target = await this.verifiedTarget();
+    if (!target) throw new Error('the repository could not be read');
     if (item.kind === 'review' && !(await this.refreshReview(item, target))) return;
 
     const current = this.row(item.id);
@@ -466,7 +488,12 @@ export class PrCoordinator extends DurableObject<Env> {
     if (!this.isDispatching(item.id)) return;
     if (token === null) {
       log('coordinator_lacks_actions_write', { ...this.logFields(), work_id: item.id });
-      this.setMeta('opt_in', { optedIn: false, reason: 'installation lacks actions: write', expires: Date.now() + OPT_IN_TTL_MS });
+      this.setMeta('opt_in', {
+        optedIn: false,
+        reason: 'installation lacks actions: write',
+        expires: Date.now() + OPT_IN_TTL_MS,
+        repository: { owner: target.owner, repo: target.repo, defaultBranch: target.defaultBranch },
+      } satisfies CachedOptIn);
       this.finish(item.id, 'skipped', 'installation lacks actions: write');
       return;
     }
@@ -490,13 +517,14 @@ export class PrCoordinator extends DurableObject<Env> {
     // A run that started is tracked even when a close dropped the item meanwhile, so the lane waits for it.
     const started = response?.status === 200 || response?.status === 204;
     if (!latest || (latest.status !== 'dispatching' && !started)) return;
+    const failure = response && !started ? await response.text() : '';
 
     if (response?.status === 200) {
       const { workflow_run_id } = await response.json() as { workflow_run_id?: number };
       this.markRunning(latest, workflow_run_id ?? null, 'dispatched');
     } else if (response?.status === 204) {
       this.markRunning(latest, null, 'dispatched without run details');
-    } else if (response === null || response.status >= 500 || response.status === 429 || isRateLimited(response)) {
+    } else if (response === null || response.status >= 500 || response.status === 429 || isRateLimited(response, failure)) {
       if (attempts > DISPATCH_BACKOFF_MS.length) {
         this.finish(item.id, 'failed', `dispatch failed ${attempts} times, last with ${response?.status ?? 'a network error'}`);
       } else {
@@ -506,7 +534,7 @@ export class PrCoordinator extends DurableObject<Env> {
     } else {
       // 403, 404 and 422 mean the permission, the file or its `workflow_dispatch` trigger is missing.
       this.sql.exec(`DELETE FROM meta WHERE key = 'opt_in'`);
-      this.finish(item.id, 'failed', `dispatch refused with ${response.status}: ${(await response.text()).slice(0, 200)}`);
+      this.finish(item.id, 'failed', `dispatch refused with ${response.status}: ${failure.slice(0, 200)}`);
     }
   }
 
@@ -574,11 +602,13 @@ export class PrCoordinator extends DurableObject<Env> {
       'UPDATE work SET check_at = ?, errors = errors + 1 WHERE id = ?',
       now + backoff(item.errors), item.id,
     );
-    if (now - dispatchedAt > RUN_DEADLINE_MS) {
-      this.finish(item.id, 'timed_out', 'no end of the run seen in time');
+    const target = await this.verifiedTarget();
+    if (!target) {
+      // The run cannot be read or cancelled without the repository's names, so the item waits for them to come back.
+      // Past the deadline it ends, since no cancel is possible and a started run is past the workflow's `timeout-minutes`.
+      if (now - dispatchedAt > RUN_DEADLINE_MS) this.finish(item.id, 'timed_out', 'the repository can no longer be read');
       return;
     }
-    const target = this.target();
 
     if (item.run_id === null) {
       if (now - dispatchedAt > RUN_LOOKUP_TIMEOUT_MS) {
@@ -593,23 +623,29 @@ export class PrCoordinator extends DurableObject<Env> {
     }
 
     const token = await this.token({ actions: 'read' });
-    if (token === null) return;
-    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/actions/runs/${item.run_id}`);
+    const response = token === null ? null : await githubApi(token, `/repos/${target.owner}/${target.repo}/actions/runs/${item.run_id}`);
     if (this.row(item.id)?.status !== 'running') return;
-    if (response.status === 404) {
+    if (response?.status === 404) {
       this.finish(item.id, 'done', 'run deleted');
       return;
     }
-    if (!response.ok) return;
-    this.polled(item.id);
-    const run = await response.json() as { status: string; conclusion: string | null; run_started_at?: string };
-    if (run.status === 'completed') {
+    const run = response?.ok
+      ? await response.json() as { status: string; conclusion: string | null; run_started_at?: string }
+      : null;
+    if (run) this.polled(item.id);
+    if (run?.status === 'completed') {
       this.finish(item.id, 'done', 'run completed (poll)', run.conclusion);
       return;
     }
+    // Past the deadline the run is cancelled even when it could not be read, since only a cancel frees the lane.
+    if (now - dispatchedAt > RUN_DEADLINE_MS) {
+      await this.cancel(item, target, 'no end of the run seen in time');
+      return;
+    }
+    if (!run) return;
     const startedAt = run.run_started_at ? Date.parse(run.run_started_at) : dispatchedAt;
     if (NOT_STARTED.has(run.status) && now - dispatchedAt > QUEUED_RUN_TIMEOUT_MS) {
-      await this.cancel(item, target, 'run never started');
+      await this.cancel(item, target, 'run never started', item.requeues === 0);
     } else if (!NOT_STARTED.has(run.status) && now - startedAt > RUNNING_RUN_TIMEOUT_MS) {
       await this.cancel(item, target, 'run went past its timeout');
     }
@@ -620,17 +656,31 @@ export class PrCoordinator extends DurableObject<Env> {
     this.sql.exec('UPDATE work SET errors = 0, check_at = ? WHERE id = ?', Date.now() + POLL_MS, id);
   }
 
-  /** Cancels a run that overran. A failed cancel keeps the item running, so the next poll tries again. */
-  private async cancel(item: WorkRow, target: Target, reason: string): Promise<void> {
+  /**
+   * Cancels a run that overran and ends its item, or queues the item again when `requeue` is set. A failed cancel
+   * keeps the item running, so the next poll tries again.
+   */
+  private async cancel(item: WorkRow, target: Target, reason: string, requeue = false): Promise<void> {
     const token = await this.token({ actions: 'write' });
-    const response = token === null
-      ? null
-      : await githubApi(token, `/repos/${target.owner}/${target.repo}/actions/runs/${item.run_id}/cancel`, { method: 'POST' });
+    if (token === null) {
+      // Without `actions: write` no other run can be dispatched either, so ending the item cannot let two overlap.
+      if (this.row(item.id)?.status === 'running') this.finish(item.id, 'timed_out', `${reason}, cannot cancel without actions: write`);
+      return;
+    }
+    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/actions/runs/${item.run_id}/cancel`, { method: 'POST' });
     if (this.row(item.id)?.status !== 'running') return;
-    if (response?.ok) {
-      this.finish(item.id, 'timed_out', `${reason}, cancel requested`);
+    if (!response.ok) {
+      log('coordinator_cancel_failed', { ...this.logFields(), work_id: item.id, run_id: item.run_id, reason, status: response.status });
+    } else if (requeue) {
+      // The fresh attempt count keeps the next dispatch from adopting the cancelled run as its own.
+      this.sql.exec(
+        `UPDATE work SET status = 'queued', run_id = NULL, check_at = NULL, lease_until = NULL, attempts = 0,
+         first_attempt_at = NULL, errors = 0, requeues = requeues + 1, note = ? WHERE id = ?`,
+        `${reason}, cancel requested, queued again`, item.id,
+      );
+      log('coordinator_requeued', { ...this.logFields(), work_id: item.id, run_id: item.run_id, reason });
     } else {
-      log('coordinator_cancel_failed', { ...this.logFields(), work_id: item.id, run_id: item.run_id, reason, status: response?.status ?? null });
+      this.finish(item.id, 'timed_out', `${reason}, cancel requested`);
     }
   }
 
@@ -657,23 +707,43 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /** Returns whether the repository opted in to webhook mode, read at most every `OPT_IN_TTL_MS`. */
   private async optIn(): Promise<OptIn> {
-    const cached = this.getMeta<OptIn & { expires: number }>('opt_in');
-    if (cached && cached.expires > Date.now()) return { optedIn: cached.optedIn, reason: cached.reason };
+    const cached = this.getMeta<CachedOptIn>('opt_in');
+    // An entry cached without the repository predates reading it, so it is read again.
+    if (cached && cached.expires > Date.now() && cached.repository !== undefined) return { optedIn: cached.optedIn, reason: cached.reason };
     this.optInRead ??= this.readOptIn().finally(() => {
       this.optInRead = null;
     });
     return this.optInRead;
   }
 
+  /**
+   * Reads the repository by its id and its workflows from the default branch GitHub names. The payload's names are
+   * not used, so a forged delivery cannot pick the branch a run starts from. A failure GitHub may recover from throws
+   * and is not cached.
+   */
   private async readOptIn(): Promise<OptIn> {
     const target = this.getMeta<Target>('target');
     if (!target) return { optedIn: false, reason: 'no target recorded' };
     const mint = await this.mint({ contents: 'read', metadata: 'read' });
-    const optIn = mint.ok
-      ? await readOptIn(mint.token, target)
-      : { optedIn: false, reason: `token mint refused with ${mint.status}` };
+    if (!mint.ok && !mint.refused) throw new Error(`token mint failed with ${mint.status}`);
+    let repository: Repository | null = null;
+    let optIn: OptIn;
+    if (!mint.ok) {
+      optIn = { optedIn: false, reason: `token mint refused with ${mint.status}` };
+    } else {
+      const response = await githubApi(mint.token, `/repositories/${target.repositoryId}`);
+      if (response.status === 404) {
+        optIn = { optedIn: false, reason: 'repository not found' };
+      } else if (!response.ok) {
+        throw new Error(`reading the repository failed with ${response.status}`);
+      } else {
+        const repo = await response.json() as { name: string; owner: { login: string }; default_branch: string };
+        repository = { owner: repo.owner.login, repo: repo.name, defaultBranch: repo.default_branch };
+        optIn = await readOptIn(mint.token, repository);
+      }
+    }
     log('coordinator_opt_in', { ...this.logFields(), opted_in: optIn.optedIn, reason: optIn.reason });
-    this.setMeta('opt_in', { ...optIn, expires: Date.now() + OPT_IN_TTL_MS });
+    this.setMeta('opt_in', { ...optIn, expires: Date.now() + OPT_IN_TTL_MS, repository } satisfies CachedOptIn);
     return optIn;
   }
 

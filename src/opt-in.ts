@@ -8,6 +8,9 @@ export interface OptIn {
   reason: string;
 }
 
+/** A repository as GitHub names it, read by its id. */
+export type Repository = Pick<Target, 'owner' | 'repo' | 'defaultBranch'>;
+
 export interface WorkflowFile {
   name: string;
   text: string | null;
@@ -143,7 +146,7 @@ interface WorkflowsResponse {
 }
 
 /** Reads `.github/workflows` on the default branch in one GraphQL request and classifies it. */
-export async function readOptIn(token: string, target: Target): Promise<OptIn> {
+export async function readOptIn(token: string, target: Repository): Promise<OptIn> {
   const data = await githubGraphql<WorkflowsResponse>(token, WORKFLOWS_QUERY, {
     owner: target.owner,
     name: target.repo,
