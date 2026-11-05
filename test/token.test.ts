@@ -107,6 +107,9 @@ describe('/token', () => {
     ['a token for another audience', { audience: 'example.com' }],
     ['an expired token', { expiresIn: Math.floor(Date.now() / 1000) - 60 }],
     ['a token for another repository', { claims: { repository: `${OWNER}/other` } }],
+    ['a token without an expiry', { omit: ['exp'] as Array<'exp' | 'iat'> }],
+    ['a token without an issue time', { omit: ['iat'] as Array<'exp' | 'iat'> }],
+    ['a token without a repository claim', { claims: { repository: undefined } }],
   ])('refuses %s', async (_case, options) => {
     const requests = stubGitHub();
     const response = await postToken({ token: await oidcToken(options) });

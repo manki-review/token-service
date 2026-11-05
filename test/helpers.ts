@@ -41,17 +41,19 @@ export interface OidcTokenOptions {
   audience?: string;
   key?: CryptoKey;
   expiresIn?: string | number;
+  /** Registered claims to leave out of the token. */
+  omit?: Array<'exp' | 'iat'>;
 }
 
 /** Returns a GitHub Actions OIDC token for `OWNER/REPO`, signed with the key `stubGitHub` serves as the JWKS. */
 export async function oidcToken(options: OidcTokenOptions = {}): Promise<string> {
-  return new SignJWT({ repository: `${OWNER}/${REPO}`, repository_owner: OWNER, ...options.claims })
+  const jwt = new SignJWT({ repository: `${OWNER}/${REPO}`, repository_owner: OWNER, ...options.claims })
     .setProtectedHeader({ alg: 'RS256', kid: OIDC_KID })
     .setIssuer(options.issuer ?? OIDC_ISSUER)
-    .setAudience(options.audience ?? OIDC_AUDIENCE)
-    .setIssuedAt()
-    .setExpirationTime(options.expiresIn ?? '5m')
-    .sign(options.key ?? oidcKeys.privateKey);
+    .setAudience(options.audience ?? OIDC_AUDIENCE);
+  if (!options.omit?.includes('iat')) jwt.setIssuedAt();
+  if (!options.omit?.includes('exp')) jwt.setExpirationTime(options.expiresIn ?? '5m');
+  return jwt.sign(options.key ?? oidcKeys.privateKey);
 }
 
 export const DEFAULT_INSTALLATION_PERMISSIONS = {
