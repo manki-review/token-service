@@ -11,6 +11,7 @@ import {
   REPOSITORY_ID,
   reviewCommentEvent,
   reviewEvent,
+  reviewThreadEvent,
   workflowsReply,
 } from './payloads';
 
@@ -32,6 +33,7 @@ function pullRequest() {
     push: (sha: string, action = 'synchronize') => pullRequestEvent(action, { number, head: { sha, repo: { full_name: 'manki-review/manki' } } }),
     comment: (body: string, action = 'created') => issueCommentEvent(body, { number, action }),
     review: () => reviewEvent('submitted', {}, { number }),
+    resolve: (action = 'resolved') => reviewThreadEvent(action, { number }),
     reply: (body: string) => reviewCommentEvent(body, { in_reply_to_id: 1 }, 'created', { number }),
     close: (merged: boolean) => pullRequestEvent('closed', { number, merged }),
     async send(event: string, payload: WebhookPayload, delivery: string = crypto.randomUUID()) {
@@ -120,6 +122,21 @@ describe('PrCoordinator.receive', () => {
     expect(await pr.send('pull_request_review', { ...pr.review(), review: { ...pr.review().review, id: 3003 } }, 'd-newest'))
       .toEqual({ accepted: true, effect: 'merged into work 1' });
     expect(await workRows(pr.stub)).toMatchObject([{ kind: 'review_state', object_id: 3003, sender: 'alice', delivery: 'd-newest' }]);
+  });
+
+  it('queues a thread change as a review state check that merges with the others', async () => {
+    const pr = pullRequest();
+    expect(await pr.send('pull_request_review_thread', pr.resolve(), 'd-thread')).toEqual({ accepted: true, effect: 'queued work 1' });
+    expect(await workRows(pr.stub)).toMatchObject([
+      { lane: 'state', kind: 'review_state', event: 'pull_request_review_thread.resolved', object_id: null, delivery: 'd-thread' },
+    ]);
+    // A review takes over the queued check, since its id is what the dispatch can name.
+    expect(await pr.send('pull_request_review', pr.review(), 'd-review')).toEqual({ accepted: true, effect: 'merged into work 1' });
+    // A later thread change leaves the review trigger in place.
+    expect(await pr.send('pull_request_review_thread', pr.resolve('unresolved'))).toEqual({ accepted: true, effect: 'merged into work 1' });
+    expect(await workRows(pr.stub)).toMatchObject([
+      { kind: 'review_state', event: 'pull_request_review.submitted', object_id: 2002, delivery: 'd-review', status: 'queued' },
+    ]);
   });
 
   it('queues each review request on its own once the push review became one', async () => {

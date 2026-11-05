@@ -14,7 +14,7 @@ Workflows authenticate via [GitHub's OIDC provider](https://docs.github.com/en/a
 
 ## Webhook
 
-`POST /webhook` receives the GitHub App's webhook deliveries for Manki's webhook mode. It checks the `X-Hub-Signature-256` HMAC against `WEBHOOK_SECRET`, checks that `X-GitHub-Hook-Installation-Target-ID` is `APP_ID`, and works out where the delivery would go: ignored, the PR's state lane (reviews, thread replies, `check`, `dismiss`) or its chat lane (explain, questions, help, remember, forget). Work and closes go to the PR's `PrCoordinator` Durable Object before the `202` leaves.
+`POST /webhook` receives the GitHub App's webhook deliveries for Manki's webhook mode. It checks the `X-Hub-Signature-256` HMAC against `WEBHOOK_SECRET`, checks that `X-GitHub-Hook-Installation-Target-ID` is `APP_ID`, and works out where the delivery would go: ignored, the PR's state lane (reviews, thread replies, `check`, `dismiss`, review state checks from reviews and from resolved or reopened threads) or its chat lane (explain, questions, help, remember, forget). Work and closes go to the PR's `PrCoordinator` Durable Object before the `202` leaves.
 
 `PrCoordinator` (one per PR or issue, named `<repository id>:<number>`, SQLite storage) refuses a delivery id it has seen in the last 7 days, queues work per lane, collapses queued pushes into one review of the newest head, and drops queued work when the PR closes. Its alarm takes the oldest item of each free lane, checks that the repository opted in (`.github/workflows/manki-dispatch.yml` on the default branch and no event-driven Manki workflow next to it, cached for 5 minutes), and for now only logs what it would dispatch. It deletes its storage a week after the last delivery.
 

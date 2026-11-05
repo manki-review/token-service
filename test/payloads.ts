@@ -41,6 +41,10 @@ export function reviewEvent(action: string, review: Record<string, unknown> = {}
   };
 }
 
+export function reviewThreadEvent(action: string, pr: Record<string, unknown> = {}, sender = HUMAN): WebhookPayload {
+  return { ...base(action), sender, pull_request: pullRequest({ state: 'open', ...pr }), thread: { node_id: 'PRRT_1' } } as WebhookPayload;
+}
+
 export function reviewCommentEvent(body: string, comment: Record<string, unknown> = {}, action = 'created', pr: Record<string, unknown> = {}): WebhookPayload {
   return {
     ...base(action),
