@@ -92,6 +92,7 @@ let log: ReturnType<typeof vi.spyOn>;
 beforeEach(() => {
   advanceClock = freezeClock();
   log = vi.spyOn(console, 'log').mockImplementation(() => {});
+  setDispatchEnabled(false);
 });
 
 afterEach(() => {
