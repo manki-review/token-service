@@ -109,6 +109,11 @@ export function skipRulesOf(config: BaseConfig): SkipRules | null {
   return { skip_labels: [], skip_authors: [], skip_branches: [], ...Object.fromEntries(given.map((key) => [key, config[key]])) };
 }
 
+/** Whether `config` asks for automatic reviews of drafts with `drafts: review`. Any other value skips them, as in Manki. */
+export function reviewsDrafts(config: BaseConfig): boolean {
+  return config?.drafts === 'review';
+}
+
 export interface SkipFacts {
   labels: string[];
   author?: string;

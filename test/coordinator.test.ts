@@ -1144,7 +1144,9 @@ describe('PrCoordinator dispatch', () => {
 
   it.each([
     ['closed', { prState: 'closed' }, 'pull request closed'],
-    ['back in draft', { draft: true }, 'pull request is a draft'],
+    ['a draft', { draft: true }, 'pull request is a draft'],
+    ['a draft whose base config skips drafts', { draft: true, config: 'drafts: skip' }, 'pull request is a draft'],
+    ['a draft whose base config sets an unknown drafts value', { draft: true, config: 'drafts: always' }, 'pull request is a draft'],
   ])('drops a review when the PR is %s', async (_case, change, note) => {
     const pr = pullRequest();
     const github = Object.assign(fakeGitHub(pr.number), change);
@@ -1152,6 +1154,26 @@ describe('PrCoordinator dispatch', () => {
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches).toEqual([]);
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'dropped', note }]);
+  });
+
+  it('reviews a draft automatically when the base config sets `drafts: review`, and still answers comments on a draft', async () => {
+    const pr = pullRequest();
+    const github = Object.assign(fakeGitHub(pr.number), { draft: true, baseRef: 'develop' });
+    await pr.send('pull_request', pr.push(SHA_1, 'opened'));
+    await pr.send('pull_request_review_comment', pr.reply('Fixed'));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches).toEqual([]);
+    expect((await workRows(pr.stub))[0]).toMatchObject({ status: 'dropped', note: 'pull request is a draft' });
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request_review_comment']);
+    await pr.stub.runCompleted(key('d-reply'), 9000, 'success');
+
+    github.config = 'drafts: review';
+    await pr.send('pull_request', pr.push(SHA_2));
+    github.head = SHA_2;
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches.at(-1)?.inputs).toMatchObject({ event: 'pull_request', head_sha: SHA_2 });
+    expect(github.configReads).toEqual(['develop', 'develop']);
   });
 
   it.each([
@@ -1377,6 +1399,17 @@ describe('PrCoordinator dispatch', () => {
       expect(github.dispatches).toHaveLength(1);
       expect(github.dispatches[0].inputs).toMatchObject({ event: 'issue_comment', action: 'edited', comment_id: String(SETTINGS) });
       expect(await state()).toMatchObject({ active: [{ kind: 'review', run_id: 9000, modes: ['full', 'deeper'] }] });
+    });
+
+    it('reviews a draft once on a Review this draft tick, while its pushes start nothing', async () => {
+      const { pr, github, state, edit } = setup();
+      github.draft = true;
+      await pr.send('pull_request', pr.push(SHA_1));
+      await runDurableObjectAlarm(pr.stub);
+      expect(github.dispatches).toEqual([]);
+      await edit([], ['draft']);
+      expect(github.dispatches).toHaveLength(1);
+      expect(await state()).toMatchObject({ active: [{ kind: 'review', event: 'issue_comment.edited', modes: ['draft'] }] });
     });
 
     it('cancels the running review on a Cancel tick, which the cron then leaves alone', async () => {

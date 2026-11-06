@@ -271,7 +271,7 @@ function routePullRequest(target: Target, payload: WebhookPayload): Route {
   if (action !== 'opened' && action !== 'synchronize' && action !== 'ready_for_review') {
     return ignore(`pull_request action ${action}`);
   }
-  if (payload.pull_request?.draft) return ignore('pull request is a draft');
+  // A draft's push still queues, since `drafts: review` on the base branch reviews it. The coordinator decides.
   return { type: 'work', target, work: work('state', 'review', payload, 'pull_request') };
 }
 

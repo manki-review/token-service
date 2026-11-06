@@ -4,7 +4,8 @@ import type { Env } from './env';
 import { githubApi, isRateLimited, type MintResult, mintRepositoryToken } from './github';
 import { log } from './log';
 import {
-  type BaseConfig, BOT_LOGIN, type BoxChange, HELP_REPLY, matchSkipRule, parseConfig, REVIEW_MODES, type ReviewMode, setBoxes, skipRulesOf,
+  type BaseConfig, BOT_LOGIN, type BoxChange, HELP_REPLY, matchSkipRule, parseConfig, REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes,
+  skipRulesOf,
 } from './manki';
 import { LEGACY_DISPATCH_WORKFLOW, type OptIn, readOptIn, type Repository } from './opt-in';
 import type { Permissions } from './permissions';
@@ -1054,13 +1055,15 @@ export class PrCoordinator extends DurableObject<Env> {
       return false;
     }
     if (item.event.startsWith('pull_request.')) {
-      if (pr.draft) {
+      // A retry after a dispatch attempt may find that attempt's run, so only the first attempt can skip.
+      const config = pr.draft || item.attempts === 0 ? await this.baseConfig(pr, target) : null;
+      if (!this.isDispatching(item.id)) return false;
+      // A draft is reviewed on request, such as by its settings box, unless the base config reviews drafts.
+      if (pr.draft && !reviewsDrafts(config)) {
         this.finish(item.id, 'dropped', 'pull request is a draft');
         return false;
       }
-      // A retry after a dispatch attempt may find that attempt's run, so only the first attempt can skip.
-      const rule = item.attempts === 0 ? this.skipRule(await this.baseConfig(pr, target), pr, item.head_sha, item.sender, target) : null;
-      if (!this.isDispatching(item.id)) return false;
+      const rule = item.attempts === 0 ? this.skipRule(config, pr, item.head_sha, item.sender, target) : null;
       if (rule !== null) {
         await this.reportSkipped(pr.head.sha, rule, target);
         if (!this.isDispatching(item.id)) return false;
