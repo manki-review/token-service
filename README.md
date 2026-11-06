@@ -82,6 +82,21 @@ wrangler secret put WEBHOOK_SECRET
 
 To rotate the webhook secret, put the current one into `WEBHOOK_SECRET_PREVIOUS`, then the new one into `WEBHOOK_SECRET` and the App's settings, and delete `WEBHOOK_SECRET_PREVIOUS` once deliveries verify under the new one.
 
+## Deployment
+
+`.github/workflows/deploy.yml` deploys the Worker with [`cloudflare/wrangler-action`](https://github.com/cloudflare/wrangler-action) on every push to `main` and on a manual run (`workflow_dispatch`). It runs the same tests as CI first. The deploy job runs in the `production` environment, so it waits for the owner's approval, and only that job can read the Cloudflare API token.
+
+GitHub never holds the App key or the webhook secret. The Worker secrets above stay set by hand with `wrangler secret put`, and a deploy keeps them.
+
+The owner sets this up once:
+
+1. In the Cloudflare dashboard, create an API token (My Profile, API Tokens, Create Token, Create Custom Token) with only these permissions:
+   - Account, Workers Scripts, Edit, with Account Resources set to the account that runs the Worker.
+   - Zone, Workers Routes, Edit, with Zone Resources set to the specific zone `dustinface.me`.
+2. In the repository settings on GitHub, open Environments and create `production`. Under Deployment protection rules, tick Required reviewers and add yourself. Leave Prevent self-review off, as you approve your own merges. Under Deployment branches and tags, allow only `main`.
+3. In `production`, add the token as the environment secret `CLOUDFLARE_API_TOKEN`, and the account ID (on the account's overview page in the dashboard) as the environment variable `CLOUDFLARE_ACCOUNT_ID`. Wrangler needs the account ID to deploy from CI.
+4. Remove `CLOUDFLARE_API_TOKEN` from `~/.zshenv`, and delete that token in the dashboard once nothing else uses it. For a manual deploy from a laptop, use `wrangler login` instead.
+
 ## Development
 
 ```sh
@@ -89,5 +104,5 @@ npm install
 npm run dev        # local dev server
 npm run typecheck  # type-check the Worker and the tests
 npm test           # run the tests
-npm run deploy     # deploy to Cloudflare
+npm run deploy     # deploy by hand, outside the workflow
 ```
