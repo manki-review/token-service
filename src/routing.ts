@@ -13,8 +13,11 @@ import {
 /** A comment event older than this when it arrives, such as a late redelivery, is dropped. */
 export const STALE_COMMENT_MS = 6 * 60 * 60 * 1000;
 
-/** The file name of the dispatch-only workflow a repository adds to opt in to webhook mode. */
-export const DISPATCH_WORKFLOW = 'manki-dispatch.yml';
+/**
+ * A workflow file's path as a run names it, maybe with the ref, as in `.github/workflows/manki.yml@refs/heads/main`.
+ * Any file name counts, since the repository's opt-in decides which file the Worker dispatches.
+ */
+const WORKFLOW_PATH = /^\.github\/workflows\/[^/@]+\.ya?ml(@.+)?$/;
 
 /**
  * The state lane carries everything that reads or changes threads, verdicts or approval. The chat lane carries
@@ -322,9 +325,7 @@ function routeWorkflowRun(payload: WebhookPayload): Route {
   // Every run in every installed repository sends one, so anything the App did not start is dropped first.
   if (payload.sender?.login !== BOT_LOGIN) return ignore('run was not started by Manki');
   if (payload.action !== 'completed') return ignore(`workflow_run action ${payload.action}`);
-  const path = `.github/workflows/${DISPATCH_WORKFLOW}`;
-  // The path can carry the ref, as in `.github/workflows/manki-dispatch.yml@refs/heads/main`.
-  if (run?.id === undefined || run.event !== 'workflow_dispatch' || (run.path !== path && !run.path?.startsWith(`${path}@`))) {
+  if (run?.id === undefined || run.event !== 'workflow_dispatch' || !WORKFLOW_PATH.test(run.path ?? '')) {
     return ignore('not a Manki dispatch run');
   }
   const target = targetOf(payload, numberFromRunTitle(run.display_title));

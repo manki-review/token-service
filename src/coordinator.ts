@@ -7,7 +7,7 @@ import { BOT_LOGIN } from './manki';
 import { type OptIn, readOptIn, type Repository } from './opt-in';
 import type { Permissions } from './permissions';
 import { RECONCILER_NAME } from './reconciler';
-import { DISPATCH_WORKFLOW, type Lane, type Route, type Target, type Work } from './routing';
+import { type Lane, type Route, type Target, type Work } from './routing';
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -78,10 +78,10 @@ export interface WorkRow extends Record<string, string | number | null> {
 }
 
 /** The opt-in result as cached, with the repository as GitHub names it when it was read. */
-interface CachedOptIn extends OptIn {
+type CachedOptIn = OptIn & {
   expires: number;
   repository: Repository | null;
-}
+};
 
 /** A delivery's id and the SHA-256 of its raw body. A delivery is a replay when either was seen before. */
 export interface Delivery {
@@ -566,7 +566,7 @@ export class PrCoordinator extends DurableObject<Env> {
         return;
       }
       if (this.capped(item)) return;
-      await this.dispatch(item);
+      await this.dispatch(item, optIn.workflow);
     } catch (error) {
       // The lease runs out after the backoff, and the next pass takes the item again.
       this.sql.exec(
@@ -613,8 +613,11 @@ export class PrCoordinator extends DurableObject<Env> {
     };
   }
 
-  /** Starts a run for `item`. Every GitHub call is followed by a fresh read of the row before anything is written. */
-  private async dispatch(item: WorkRow): Promise<void> {
+  /**
+   * Starts a run of `workflow` for `item`. Every GitHub call is followed by a fresh read of the row before anything is
+   * written.
+   */
+  private async dispatch(item: WorkRow, workflow: string): Promise<void> {
     const target = await this.verifiedTarget();
     if (!target) throw new Error('the repository could not be read');
     if (item.kind === 'review' && !(await this.refreshReview(item, target))) return;
@@ -652,7 +655,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const attempts = current.attempts + 1;
     let response: Response | null = null;
     try {
-      response = await githubApi(token, `/repos/${target.owner}/${target.repo}/actions/workflows/${DISPATCH_WORKFLOW}/dispatches`, {
+      response = await githubApi(token, `/repos/${target.owner}/${target.repo}/actions/workflows/${encodeURIComponent(workflow)}/dispatches`, {
         method: 'POST',
         body: { ref: target.defaultBranch, inputs: dispatchInputs(current, target.number), return_run_details: true },
       });
@@ -725,7 +728,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const since = new Date((item.first_attempt_at ?? Date.now()) - MINUTE).toISOString();
     const response = await githubApi(
       token,
-      `/repos/${target.owner}/${target.repo}/actions/workflows/${DISPATCH_WORKFLOW}/runs?event=workflow_dispatch&created=${encodeURIComponent(`>=${since}`)}&per_page=50`,
+      `/repos/${target.owner}/${target.repo}/actions/runs?event=workflow_dispatch&created=${encodeURIComponent(`>=${since}`)}&per_page=50`,
     );
     if (!response.ok) throw new Error(`listing dispatch runs failed with ${response.status}`);
     const { workflow_runs: runs } = await response.json() as {
@@ -854,8 +857,8 @@ export class PrCoordinator extends DurableObject<Env> {
   /** Returns whether the repository opted in to webhook mode, read at most every `OPT_IN_TTL_MS`. */
   private async optIn(): Promise<OptIn> {
     const cached = this.getMeta<CachedOptIn>('opt_in');
-    // An entry cached without the repository predates reading it, so it is read again.
-    if (cached && cached.expires > Date.now() && cached.repository !== undefined) return { optedIn: cached.optedIn, reason: cached.reason };
+    // An entry cached without the repository, or opted in without the workflow, predates reading them, so it is read again.
+    if (cached && cached.expires > Date.now() && cached.repository !== undefined && (!cached.optedIn || cached.workflow !== undefined)) return cached;
     this.optInRead ??= this.readOptIn().finally(() => {
       this.optInRead = null;
     });

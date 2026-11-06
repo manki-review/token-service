@@ -597,8 +597,10 @@ function fakeGitHub(number: number) {
     /** The eyes reactions added, as `<issues or pulls>/<comment id>`, and the status each kind gets. */
     reactions: [] as string[],
     reactionStatus: { issues: 201, pulls: 201 } as Record<string, number>,
+    /** The workflow files on the default branch, and the file each dispatch named. */
+    workflows: { 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML } as Record<string, string>,
+    dispatchedWorkflows: [] as string[],
   };
-  const workflowsBody = workflowsReply({ 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML }).body;
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
     const request = new Request(input, init);
     const url = new URL(request.url);
@@ -625,12 +627,14 @@ function fakeGitHub(number: number) {
     if (route === 'POST /graphql') {
       state.graphqlCalls++;
       state.graphqlVariables.push(((await request.json()) as { variables: Record<string, string> }).variables);
-      return Response.json(workflowsBody);
+      return Response.json(workflowsReply(state.workflows).body);
     }
     if (route === `GET ${repo}/pulls/${number}`) {
       return Response.json({ state: state.prState, draft: state.draft, head: { sha: state.head } });
     }
-    if (route === `POST ${repo}/actions/workflows/manki-dispatch.yml/dispatches`) {
+    const dispatched = route.match(new RegExp(`^POST ${repo}/actions/workflows/([^/]+)/dispatches$`));
+    if (dispatched) {
+      state.dispatchedWorkflows.push(dispatched[1]);
       state.dispatches.push(await request.json() as (typeof state.dispatches)[number]);
       const next = state.dispatchStatuses.shift() ?? 200;
       const { status, headers, body: text } = replyParts(next);
@@ -640,7 +644,7 @@ function fakeGitHub(number: number) {
       state.runs.set(id, { status: 'queued' });
       return Response.json({ workflow_run_id: id, run_url: `https://api.github.com${repo}/actions/runs/${id}`, html_url: 'https://github.com' });
     }
-    if (route === `GET ${repo}/actions/workflows/manki-dispatch.yml/runs`) {
+    if (route === `GET ${repo}/actions/runs`) {
       if (state.listRunsStatus !== 200) return Response.json({ message: 'no' }, { status: state.listRunsStatus });
       return Response.json({ total_count: state.listedRuns.length, workflow_runs: state.listedRuns });
     }
@@ -1372,6 +1376,20 @@ describe('PrCoordinator dispatch', () => {
     expect(await workRows(other.stub)).toMatchObject([{ status: 'skipped', note: `not opted in: token mint refused with ${typeof reply === 'number' ? reply : reply.status}` }]);
   });
 
+  it.each([
+    ['manki.yml', { 'manki.yml': DISPATCH_WORKFLOW_YAML }],
+    ['manki-dispatch.yml', { 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML }],
+    ['manki.yml next to manki-dispatch.yml', { 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML, 'manki.yml': DISPATCH_WORKFLOW_YAML }],
+  ])('dispatches the workflow the opt-in found, for %s', async (_case, workflows) => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    github.workflows = workflows;
+    await pr.send('pull_request', pr.push(SHA_1));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatchedWorkflows).toEqual([Object.hasOwn(workflows, 'manki.yml') ? 'manki.yml' : 'manki-dispatch.yml']);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'running' }]);
+  });
+
   it('takes the owner, name and default branch from the repository id, never from the payload', async () => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
@@ -1425,18 +1443,22 @@ describe('PrCoordinator dispatch', () => {
     expect(await workRows(other.stub)).toMatchObject([{ status: 'running' }]);
   });
 
-  it('reads the repository again for an opt-in cached without it', async () => {
+  it.each([
+    ['the repository', { optedIn: true, reason: 'cached before the repository was read' }],
+    ['the workflow', { optedIn: true, reason: 'cached before the workflow was kept', repository: { owner: OWNER, ownerId: OWNER_ID, repo: REPO, defaultBranch: 'main' } }],
+  ])('reads the opt-in again when it was cached without %s', async (_case, cached) => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
     await pr.send('issue_comment', pr.comment('@manki explain'));
     await runInDurableObject(pr.stub, (_instance, state) => {
       state.storage.sql.exec(
         'INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)',
-        'opt_in', JSON.stringify({ optedIn: true, reason: 'cached before the repository was read', expires: Date.now() + OPT_IN_TTL_MS }),
+        'opt_in', JSON.stringify({ ...cached, expires: Date.now() + OPT_IN_TTL_MS }),
       );
     });
     await runDurableObjectAlarm(pr.stub);
     expect(github.repositoryReads).toBe(1);
+    expect(github.dispatchedWorkflows).toEqual(['manki-dispatch.yml']);
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'running' }]);
   });
 
@@ -1474,6 +1496,6 @@ describe('PrCoordinator dispatch', () => {
     stubGitHub({ api: { 'POST /graphql': workflowsReply({ 'manki.yml': EVENT_WORKFLOW_YAML }) } });
     await pr.send('pull_request', pr.push(SHA_1));
     await runDurableObjectAlarm(pr.stub);
-    expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped', note: 'not opted in: no manki-dispatch.yml' }]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped', note: 'not opted in: no Manki workflow runs on workflow_dispatch' }]);
   });
 });

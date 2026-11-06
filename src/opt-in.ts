@@ -1,12 +1,10 @@
 import { parse } from 'yaml';
 import { DISPATCH_INPUT_NAMES } from './dispatch';
 import { githubGraphql } from './github';
-import { DISPATCH_WORKFLOW, type Target } from './routing';
+import type { Target } from './routing';
 
-export interface OptIn {
-  optedIn: boolean;
-  reason: string;
-}
+/** Whether a repository opted in to webhook mode, and the file name of the workflow the Worker dispatches when it did. */
+export type OptIn = { optedIn: true; workflow: string; reason: string } | { optedIn: false; reason: string };
 
 /** A repository as GitHub names it, read by its id. */
 export type Repository = Pick<Target, 'owner' | 'ownerId' | 'repo' | 'defaultBranch'>;
@@ -92,45 +90,62 @@ function mankiWorkflows(files: WorkflowFile[]): Set<string> {
   return manki;
 }
 
+/** The dispatch workflow's file name before v7. For one minor release it counts even when it does not name Manki. */
+const LEGACY_DISPATCH_WORKFLOW = 'manki-dispatch.yml';
+/** The dispatch workflow's file name from v7 on. It is picked first when several files qualify. */
+const DISPATCH_WORKFLOW = 'manki.yml';
+
+type WorkflowText = WorkflowFile & { text: string };
+
+/** Returns why `file` cannot be the dispatch workflow, and whether it runs on `workflow_dispatch` at all. */
+function dispatchProblem(file: WorkflowText): { reason: string; dispatched: boolean } | null {
+  const parsed = parseOn(file.text);
+  const names = parsed && triggers(parsed.on);
+  if (!parsed || !names?.has('workflow_dispatch')) return { reason: `${file.name} does not run on workflow_dispatch`, dispatched: false };
+  // Any other trigger would start Manki on events the Worker also dispatches.
+  if (names.size > 1) return { reason: `${file.name} runs on more than workflow_dispatch`, dispatched: true };
+  const missing = missingInputs(parsed.on);
+  return missing.length > 0 ? { reason: `${file.name} does not declare the inputs ${missing.join(', ')}`, dispatched: true } : null;
+}
+
 /**
- * Decides whether a repository opted in to webhook mode from the workflow files on its default branch. It opts in
- * when `manki-dispatch.yml` runs on `workflow_dispatch` and no other file is an event-driven Manki workflow.
+ * Decides whether a repository opted in to webhook mode from the workflow files on its default branch, and which file
+ * the Worker dispatches. A file qualifies when it runs Manki, runs only on `workflow_dispatch` and declares the dispatch
+ * inputs. `manki-dispatch.yml` qualifies without naming Manki. With several, one that names Manki goes first, then
+ * `manki.yml`, then the first by name. No other file may be an event-driven Manki workflow.
  */
 export function classifyWorkflows(files: WorkflowFile[]): OptIn {
-  const dispatch = files.find((file) => file.name === DISPATCH_WORKFLOW);
-  if (!dispatch?.text) return { optedIn: false, reason: `no ${DISPATCH_WORKFLOW}` };
-  const tooBig = skipReason(dispatch);
-  if (tooBig) return { optedIn: false, reason: `${DISPATCH_WORKFLOW} ${tooBig}` };
-  const parsed = parseOn(dispatch.text);
-  const dispatchTriggers = parsed && triggers(parsed.on);
-  if (!parsed || !dispatchTriggers?.has('workflow_dispatch')) {
-    return { optedIn: false, reason: `${DISPATCH_WORKFLOW} does not run on workflow_dispatch` };
-  }
-  // Any other trigger would start Manki on events the Worker also dispatches.
-  if (dispatchTriggers.size > 1) {
-    return { optedIn: false, reason: `${DISPATCH_WORKFLOW} runs on more than workflow_dispatch` };
-  }
-  const missing = missingInputs(parsed.on);
-  if (missing.length > 0) {
-    return { optedIn: false, reason: `${DISPATCH_WORKFLOW} does not declare the inputs ${missing.join(', ')}` };
-  }
-
-  // A file that is not parsed cannot be ruled out, whether or not it looks like Manki, so it counts as event-driven.
+  // A file that is not parsed cannot be ruled out, whether or not it looks like Manki.
   for (const file of files) {
-    const skipped = file !== dispatch && isWorkflowFile(file.name) ? skipReason(file) : null;
+    const skipped = isWorkflowFile(file.name) ? skipReason(file) : null;
     if (skipped) return { optedIn: false, reason: `${file.name} ${skipped}, so it counts as an event-driven Manki workflow` };
   }
 
   const manki = mankiWorkflows(files);
+  const rank = (file: WorkflowFile) => [manki.has(file.name) ? 0 : 1, file.name === DISPATCH_WORKFLOW ? 0 : 1] as const;
+  const candidates = files
+    .filter((file): file is WorkflowText => isWorkflowFile(file.name) && file.text !== null
+      && (manki.has(file.name) || file.name === LEGACY_DISPATCH_WORKFLOW))
+    .map((file) => ({ file, problem: dispatchProblem(file) }))
+    .sort((a, b) => {
+      const [x, y] = [rank(a.file), rank(b.file)];
+      return x[0] - y[0] || x[1] - y[1] || a.file.name.localeCompare(b.file.name);
+    });
+  const dispatch = candidates.find((candidate) => candidate.problem === null)?.file;
+  if (!dispatch) {
+    const near = candidates.find((candidate) => candidate.problem?.dispatched)?.problem;
+    return { optedIn: false, reason: near?.reason ?? 'no Manki workflow runs on workflow_dispatch' };
+  }
+
   for (const file of files) {
     if (file === dispatch || !isWorkflowFile(file.name) || !file.text || !manki.has(file.name)) continue;
     const on = parseOn(file.text);
     // A file that does not parse cannot be ruled out, so it counts as event-driven.
     if (on === null || [...triggers(on.on)].some((name) => EVENT_TRIGGERS.has(name))) {
-      return { optedIn: false, reason: `event-driven Manki workflow ${file.name} is next to ${DISPATCH_WORKFLOW}` };
+      return { optedIn: false, reason: `event-driven Manki workflow ${file.name} is next to ${dispatch.name}` };
     }
   }
-  return { optedIn: true, reason: `${DISPATCH_WORKFLOW} and no event-driven Manki workflow` };
+  return { optedIn: true, workflow: dispatch.name, reason: `${dispatch.name} and no event-driven Manki workflow` };
 }
 
 const WORKFLOWS_QUERY = `query($owner: String!, $name: String!, $expression: String!) {
