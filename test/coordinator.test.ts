@@ -35,7 +35,9 @@ import {
 import {
   DISPATCH_WORKFLOW_YAML,
   EVENT_WORKFLOW_YAML,
+  FORCE_REVIEW_COMMENT,
   issueCommentEvent,
+  MANKI_AUTHOR,
   pullRequestEvent,
   REPOSITORY_ID,
   reviewCommentEvent,
@@ -192,16 +194,22 @@ describe('PrCoordinator.receive', () => {
     ]);
   });
 
-  it('queues each review request on its own once the push review became one', async () => {
+  it('merges a review command into the queued one, and queues a tick or an edited request on its own', async () => {
     const pr = pullRequest();
+    const comment = (id: number, body: string, action = 'created', user = { login: 'bob', type: 'User' }) =>
+      ({ ...pr.comment(body, action), comment: { id, body, user, author_association: 'MEMBER' } });
     await pr.send('pull_request', pr.push(SHA_1));
-    await pr.send('issue_comment', pr.comment('@manki review'));
-    expect(await pr.send('issue_comment', { ...pr.comment('@manki review again'), comment: { id: 1002, body: '@manki review again', user: { login: 'bob', type: 'User' }, author_association: 'MEMBER' } }))
-      .toEqual({ accepted: true, effect: 'queued work 2' });
+    await pr.send('issue_comment', pr.comment('@manki review'), 'd-request');
+    expect(await pr.send('issue_comment', comment(1002, '@manki review again'))).toEqual({ accepted: true, effect: 'merged into work 1' });
+    expect(await pr.send('issue_comment', comment(1003, FORCE_REVIEW_COMMENT, 'edited', MANKI_AUTHOR))).toEqual({ accepted: true, effect: 'queued work 2' });
+    expect(await pr.send('issue_comment', comment(1004, '@manki review now', 'edited'))).toEqual({ accepted: true, effect: 'queued work 3' });
+    // A command after the tick still joins the queued command.
+    expect(await pr.send('issue_comment', comment(1005, '@manki review'))).toEqual({ accepted: true, effect: 'merged into work 1' });
     await pr.send('pull_request', pr.push(SHA_2));
     expect(await workRows(pr.stub)).toMatchObject([
-      { id: 1, event: 'issue_comment.created', object_id: 1001, head_sha: SHA_1 },
-      { id: 2, event: 'issue_comment.created', object_id: 1002, head_sha: SHA_2 },
+      { id: 1, event: 'issue_comment.created', object_id: 1001, head_sha: SHA_1, delivery: 'd-request' },
+      { id: 2, event: 'issue_comment.edited', object_id: 1003 },
+      { id: 3, event: 'issue_comment.edited', object_id: 1004, head_sha: SHA_2 },
     ]);
   });
 
@@ -215,12 +223,18 @@ describe('PrCoordinator.receive', () => {
       { id: 2, event: 'issue_comment.created', head_sha: null, trusted: 0 },
     ]);
 
+    // Nor does it join a queued review command, or take one in.
+    expect(await pr.send('issue_comment', pr.comment('@manki review'))).toEqual({ accepted: true, effect: 'merged into work 1' });
+    expect(await pr.send('issue_comment', pr.outsiderComment('@manki review'))).toEqual({ accepted: true, effect: 'queued work 3' });
+
     const other = pullRequest();
     await other.send('issue_comment', other.outsiderComment('@manki review'));
-    expect(await other.send('pull_request', other.push(SHA_1))).toEqual({ accepted: true, effect: 'queued work 2' });
+    expect(await other.send('issue_comment', other.outsiderComment('@manki review'))).toEqual({ accepted: true, effect: 'queued work 2' });
+    expect(await other.send('pull_request', other.push(SHA_1))).toEqual({ accepted: true, effect: 'queued work 3' });
     expect(await workRows(other.stub)).toMatchObject([
       { id: 1, event: 'issue_comment.created', head_sha: null, trusted: 0 },
-      { id: 2, event: 'pull_request.synchronize', head_sha: SHA_1, trusted: 1 },
+      { id: 2, event: 'issue_comment.created', head_sha: null, trusted: 0 },
+      { id: 3, event: 'pull_request.synchronize', head_sha: SHA_1, trusted: 1 },
     ]);
   });
 
@@ -785,6 +799,20 @@ describe('PrCoordinator dispatch', () => {
     await pr.send('pull_request', pr.push(SHA_1));
     await runDurableObjectAlarm(pr.stub);
     expect(await pr.send('pull_request', pr.push(SHA_2))).toEqual({ accepted: true, effect: 'queued work 2' });
+  });
+
+  it('dispatches one review for two review commands in a row, and queues a command made while it runs', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    await pr.send('issue_comment', pr.comment('@manki review'), 'd-first');
+    await pr.send('issue_comment', { ...pr.comment('@manki review'), comment: { id: 1002, body: '@manki review', user: { login: 'bob', type: 'User' }, author_association: 'MEMBER' } });
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches.map((dispatch) => dispatch.inputs)).toMatchObject([{ event: 'issue_comment', comment_id: '1001', delivery_id: 'd-first' }]);
+
+    // The head can move before the next run starts, so a command during the run gets its own.
+    expect(await pr.send('issue_comment', { ...pr.comment('@manki review'), comment: { id: 1003, body: '@manki review', user: { login: 'bob', type: 'User' }, author_association: 'MEMBER' } }))
+      .toEqual({ accepted: true, effect: 'queued work 2' });
+    expect((await workRows(pr.stub)).map((row) => [row.object_id, row.status])).toEqual([[1001, 'running'], [1003, 'queued']]);
   });
 
   it('reviews the head the PR has when the review starts', async () => {
