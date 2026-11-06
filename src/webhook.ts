@@ -101,12 +101,16 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
   let route: Route = routed.type !== 'ignore' && !allowedRepos(env).has(routed.target.repositoryId)
     ? { type: 'ignore', reason: `repository ${routed.target.repositoryId} is not in WEBHOOK_REPOS` }
     : routed;
-  // One installation may store only so many deliveries an hour, so a flood from it cannot use up the quota either.
-  // A close and a run's end are exempt, since dropping one would leave work queued or a lane busy.
-  if (route.type === 'work' || route.type === 'seen') {
+  // One installation may store only so many comments and reviews an hour, so a flood from it cannot use up the quota
+  // either. A push to a branch of the repository takes write access, and a close or a run's end must never be lost, so
+  // `pull_request` and `workflow_run` deliveries are exempt. The router already drops fork pushes.
+  const limiter = route.type === 'work' && event !== 'pull_request'
+    ? env.INSTALLATION_LIMITER.getByName(String(route.target.installationId))
+    : null;
+  if (limiter && route.type !== 'ignore') {
     const limit = eventsPerHour(env);
     try {
-      if (!await env.INSTALLATION_LIMITER.getByName(String(route.target.installationId)).take(limit)) {
+      if (!await limiter.take(limit)) {
         route = { type: 'ignore', reason: `installation ${route.target.installationId} is over ${limit} events this hour` };
       }
     } catch (error) {
@@ -120,12 +124,21 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
     // A thread event names no time, so resolving, reopening and resolving again send the same body. A replay of one
     // only adds a review state check, which merges with the queued one, so its id alone is checked.
     const key = { id: delivery, bodyHash: event === 'pull_request_review_thread' ? null : await sha256Hex(body) };
+    // Only stored work counts, so a replay the coordinator refused or a failed call gives its count back.
+    const release = async () => {
+      try {
+        await limiter?.release();
+      } catch (error) {
+        log('webhook_limiter_error', { delivery, error: String(error) });
+      }
+    };
     try {
       if (route.type === 'run_completed') await coordinator.runCompleted(key, route.runId, route.conclusion);
       else if (route.type === 'seen') await coordinator.markSeen(key, route.target, route.headSha);
-      else await coordinator.receive(key, route);
+      else if (!(await coordinator.receive(key, route)).accepted) await release();
     } catch (error) {
       log('webhook_coordinator_error', { delivery, error: String(error) });
+      await release();
       return Response.json({ error: 'Could not queue the delivery' }, { status: 500 });
     }
   }

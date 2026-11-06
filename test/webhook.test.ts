@@ -145,26 +145,37 @@ describe('/webhook', () => {
     expect(await workRows(coordinator(REPOSITORY_ID, 33))).toHaveLength(1);
   });
 
-  it('ignores work over the installation cap until the next hour, without touching its coordinator', async () => {
+  it('ignores comments over the installation cap until the next hour, without touching their coordinators', async () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const installation = 5151;
     const env = { ...TEST_ENV, INSTALLATION_EVENTS_PER_HOUR: '2' };
-    const send = (number: number, installationId = installation) => postWebhook({
+    const send = (number: number, installationId = installation, body = '@manki explain', delivery?: string) => postWebhook({
       event: 'issue_comment',
-      payload: { ...issueCommentEvent('@manki explain', { number }), installation: { id: installationId } },
+      payload: { ...issueCommentEvent(body, { number }), installation: { id: installationId } },
       env,
+      delivery,
     });
-    for (const number of [61, 62, 63]) expect((await send(number)).status).toBe(202);
-    expect(logged(log, 'webhook').map((line) => line.reason ?? line.route)).toEqual(['chat', 'chat', `installation ${installation} is over 2 events this hour`]);
+    // Only stored work counts: neither a delivery the router ignores nor a replay the coordinator refuses.
+    const replayed = crypto.randomUUID();
+    for (const delivery of [replayed, replayed]) expect((await send(61, installation, '@manki explain', delivery)).status).toBe(202);
+    expect((await send(61, installation, 'LGTM')).status).toBe(202);
+    for (const number of [62, 63]) expect((await send(number)).status).toBe(202);
+    expect(logged(log, 'webhook').map((line) => line.reason ?? line.route)).toEqual([
+      'chat', 'chat', 'comment does not mention Manki', 'chat', `installation ${installation} is over 2 events this hour`,
+    ]);
+    expect(logged(log, 'coordinator_receive')).toMatchObject([{ accepted: true }, { accepted: false, reason: 'duplicate delivery' }, { accepted: true }]);
     expect(await workRows(coordinator(REPOSITORY_ID, 62))).toHaveLength(1);
     expect(await workRows(coordinator(REPOSITORY_ID, 63))).toEqual([]);
-    // A close and a run's end still get through.
+    // A push to a branch of the repository, a close and a run's end still get through.
+    const push = { ...pullRequestEvent('synchronize', { number: 63 }), installation: { id: installation } };
+    expect((await postWebhook({ event: 'pull_request', payload: push, env })).status).toBe(202);
+    expect(await workRows(coordinator(REPOSITORY_ID, 63))).toMatchObject([{ kind: 'review', status: 'queued' }]);
     const close = { ...pullRequestEvent('closed', { number: 62 }), installation: { id: installation } };
     expect((await postWebhook({ event: 'pull_request', payload: close, env })).status).toBe(202);
     expect(await workRows(coordinator(REPOSITORY_ID, 62))).toMatchObject([{ status: 'dropped', note: 'pull request closed' }]);
     const runEnd = { ...workflowRunEvent(), installation: { id: installation } };
     expect((await postWebhook({ event: 'workflow_run', payload: runEnd, env })).status).toBe(202);
-    expect(logged(log, 'webhook').slice(-2).map((line) => line.route)).toEqual(['close', 'run_completed']);
+    expect(logged(log, 'webhook').slice(-3).map((line) => line.route)).toEqual(['state', 'close', 'run_completed']);
     // Another installation has its own count.
     expect((await send(64, installation + 1)).status).toBe(202);
     expect(await workRows(coordinator(REPOSITORY_ID, 64))).toHaveLength(1);

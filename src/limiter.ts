@@ -18,7 +18,7 @@ interface Counter {
 }
 
 /**
- * Counts the deliveries of one installation that reach a coordinator, per clock hour. It is named by the installation
+ * Counts the deliveries of one installation that a coordinator stored, per clock hour. It is named by the installation
  * id. Only a delivery under the cap writes storage, so a flood above it costs reads alone.
  */
 export class InstallationLimiter extends DurableObject<Env> {
@@ -27,14 +27,29 @@ export class InstallationLimiter extends DurableObject<Env> {
 
   /** Counts one delivery and returns true, or returns false when `limit` deliveries already counted this hour. */
   take(limit: number): boolean {
+    const { hour, count } = this.current();
+    if (count >= limit) return false;
+    this.save({ hour, count: count + 1 });
+    return true;
+  }
+
+  /** Takes back one delivery `take` counted, for a delivery the coordinator did not store. */
+  release(): void {
+    const { hour, count } = this.current();
+    if (count > 0) this.save({ hour, count: count - 1 });
+  }
+
+  private current(): Counter {
     const hour = Math.floor(Date.now() / HOUR);
     if (this.counter?.hour !== hour) {
       const stored = this.ctx.storage.kv.get<Counter>('counter');
       this.counter = stored?.hour === hour ? stored : { hour, count: 0 };
     }
-    if (this.counter.count >= limit) return false;
-    this.counter = { hour, count: this.counter.count + 1 };
-    this.ctx.storage.kv.put('counter', this.counter);
-    return true;
+    return this.counter;
+  }
+
+  private save(counter: Counter): void {
+    this.counter = counter;
+    this.ctx.storage.kv.put('counter', counter);
   }
 }
