@@ -150,13 +150,18 @@ function isTrusted(payload: WebhookPayload): boolean {
 /** The `author_association` values Manki's `isTrustedAssociation` takes as write access. */
 const WRITER_ASSOCIATIONS = ['OWNER', 'MEMBER', 'COLLABORATOR'];
 
+/** Whether the comment's or review's author has write access, as its `author_association` shows it. */
+export function isWriterAuthored(payload: WebhookPayload): boolean {
+  return WRITER_ASSOCIATIONS.includes((payload.comment ?? payload.review)?.author_association ?? '');
+}
+
 /**
  * Whether the comment is a Manki command whose author wrote it with write access, as the payload shows it. Only such a
  * comment gets the eyes reaction when it is queued, so a stranger cannot make the App react.
  */
 function isWriterCommand(payload: WebhookPayload): boolean {
   const { comment, sender } = payload;
-  return hasBotMention(comment?.body ?? '') && WRITER_ASSOCIATIONS.includes(comment?.author_association ?? '')
+  return hasBotMention(comment?.body ?? '') && isWriterAuthored(payload)
     && comment?.user?.login !== undefined && comment.user.login === sender?.login;
 }
 

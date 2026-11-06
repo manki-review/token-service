@@ -145,13 +145,13 @@ describe('/webhook', () => {
     expect(await workRows(coordinator(REPOSITORY_ID, 33))).toHaveLength(1);
   });
 
-  it('ignores comments over the installation cap until the next hour, without touching their coordinators', async () => {
+  it('ignores outsiders\' comments over the installation cap until the next hour, without touching their coordinators', async () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const installation = 5151;
     const env = { ...TEST_ENV, INSTALLATION_EVENTS_PER_HOUR: '2' };
-    const send = (number: number, installationId = installation, body = '@manki explain', delivery?: string) => postWebhook({
+    const send = (number: number, installationId = installation, body = '@manki explain', delivery?: string, association = 'NONE') => postWebhook({
       event: 'issue_comment',
-      payload: { ...issueCommentEvent(body, { number }), installation: { id: installationId } },
+      payload: { ...issueCommentEvent(body, { number, association }), installation: { id: installationId } },
       env,
       delivery,
     });
@@ -166,7 +166,11 @@ describe('/webhook', () => {
     expect(logged(log, 'coordinator_receive')).toMatchObject([{ accepted: true }, { accepted: false, reason: 'duplicate delivery' }, { accepted: true }]);
     expect(await workRows(coordinator(REPOSITORY_ID, 62))).toHaveLength(1);
     expect(await workRows(coordinator(REPOSITORY_ID, 63))).toEqual([]);
-    // A push to a branch of the repository, a close and a run's end still get through.
+    // A writer's comment, a push to a branch of the repository, a close and a run's end still get through.
+    for (const association of ['OWNER', 'MEMBER', 'COLLABORATOR']) {
+      expect((await send(66, installation, `@manki explain ${association}`, undefined, association)).status).toBe(202);
+    }
+    expect(await workRows(coordinator(REPOSITORY_ID, 66))).toHaveLength(3);
     const push = { ...pullRequestEvent('synchronize', { number: 63 }), installation: { id: installation } };
     expect((await postWebhook({ event: 'pull_request', payload: push, env })).status).toBe(202);
     expect(await workRows(coordinator(REPOSITORY_ID, 63))).toMatchObject([{ kind: 'review', status: 'queued' }]);
@@ -175,7 +179,7 @@ describe('/webhook', () => {
     expect(await workRows(coordinator(REPOSITORY_ID, 62))).toMatchObject([{ status: 'dropped', note: 'pull request closed' }]);
     const runEnd = { ...workflowRunEvent(), installation: { id: installation } };
     expect((await postWebhook({ event: 'workflow_run', payload: runEnd, env })).status).toBe(202);
-    expect(logged(log, 'webhook').slice(-3).map((line) => line.route)).toEqual(['state', 'close', 'run_completed']);
+    expect(logged(log, 'webhook').slice(-6).map((line) => line.route)).toEqual(['chat', 'chat', 'chat', 'state', 'close', 'run_completed']);
     // Another installation has its own count.
     expect((await send(64, installation + 1)).status).toBe(202);
     expect(await workRows(coordinator(REPOSITORY_ID, 64))).toHaveLength(1);
