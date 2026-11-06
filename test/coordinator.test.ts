@@ -1425,12 +1425,14 @@ describe('PrCoordinator dispatch', () => {
       expect(github.dispatches).toEqual([]);
     });
 
-    it('ignores a settings edit older than the last one applied, such as a late redelivery', async () => {
-      const { pr, state, edit } = setup();
+    it('ignores a Pause change older than the last one applied, such as a late redelivery, and still applies its other boxes', async () => {
+      const { pr, github, state, edit } = setup();
       await edit(['pause'], [], 'alice', '2030-01-01T00:00:02Z');
-      await edit([], ['pause'], 'alice', '2030-01-01T00:00:01Z');
+      await edit([], ['pause', 'full'], 'alice', '2030-01-01T00:00:01Z');
       expect(await state()).toMatchObject({ settings: { paused: false } });
-      expect((await workRows(pr.stub)).map((row) => row.note)).toEqual(['nothing changed', 'older than the last settings edit']);
+      expect(github.dispatches).toHaveLength(1);
+      expect((await workRows(pr.stub)).filter((row) => row.kind === 'settings').map((row) => row.note))
+        .toEqual(['nothing changed', 'pause older than the last pause change, full review work 3']);
     });
   });
 

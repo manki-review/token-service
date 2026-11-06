@@ -927,20 +927,22 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /**
    * Applies a writer's box changes. Pause is set and cleared. A tick of a review box asks for one review with that mode,
-   * and Cancel cancels the running review. Unticking any other box changes nothing, since it clears itself. An edit older
-   * than the last one applied, such as a late redelivery, changes nothing.
+   * and Cancel cancels the running review. Unticking any other box changes nothing, since it clears itself. Pause is the
+   * only state an edit sets, so only its change is ignored when the edit is older than the last Pause change applied,
+   * such as a late redelivery.
    */
   private async applySettings(item: WorkRow): Promise<void> {
     const { at, changes } = editOf(item);
-    if (at < (this.getMeta<number>('settings_at') ?? 0)) {
-      this.finish(item.id, 'skipped', 'older than the last settings edit');
-      return;
-    }
     // Cancel goes first, since a failed cancel throws and the whole edit is tried again.
     const ordered = [...changes].sort((a, b) => Number(b.box === 'cancel') - Number(a.box === 'cancel'));
     const effects: string[] = [];
     for (const { box, ticked } of ordered) {
       if (box === 'pause') {
+        if (at < (this.getMeta<number>('pause_at') ?? 0)) {
+          effects.push('pause older than the last pause change');
+          continue;
+        }
+        this.setMeta('pause_at', at);
         const state = this.reported();
         if (state.settings.paused === ticked) continue;
         this.setMeta('pr_state', { ...state, settings: { paused: ticked } });
@@ -951,9 +953,7 @@ export class PrCoordinator extends DurableObject<Env> {
         effects.push(await this.cancelReview(item));
       }
     }
-    if (!this.isDispatching(item.id)) return;
-    this.setMeta('settings_at', at);
-    this.finish(item.id, 'done', effects.join(', ') || 'nothing changed');
+    if (this.isDispatching(item.id)) this.finish(item.id, 'done', effects.join(', ') || 'nothing changed');
   }
 
   /**
