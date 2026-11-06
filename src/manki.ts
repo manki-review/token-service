@@ -82,23 +82,31 @@ export interface SkipRules {
 
 const SKIP_KEYS = ['skip_labels', 'skip_authors', 'skip_branches'] as const;
 
-/**
- * Returns the skip rules `text` sets, as Manki's `loadSkipRules` reads them. Null when it sets none, does not parse, or
- * sets one that is not a list of non-empty strings.
- */
-export function parseSkipRules(text: string): SkipRules | null {
+/** A `.manki.yml` as parsed, or null when it does not parse to a mapping. */
+export type BaseConfig = Record<string, unknown> | null;
+
+/** Parses a `.manki.yml`. A file that does not parse, or not to a mapping, gives null, which sets nothing. */
+export function parseConfig(text: string): BaseConfig {
   let root: unknown;
   try {
     root = parse(text);
   } catch {
     return null;
   }
-  if (!root || typeof root !== 'object' || Array.isArray(root)) return null;
-  const given = SKIP_KEYS.filter((key) => Object.hasOwn(root, key));
+  return root && typeof root === 'object' && !Array.isArray(root) ? root as Record<string, unknown> : null;
+}
+
+/**
+ * Returns the skip rules `config` sets, as Manki's `loadSkipRules` reads them. Null when it sets none or sets one that
+ * is not a list of non-empty strings.
+ */
+export function skipRulesOf(config: BaseConfig): SkipRules | null {
+  if (config === null) return null;
+  const given = SKIP_KEYS.filter((key) => Object.hasOwn(config, key));
   if (given.length === 0) return null;
   const valid = (value: unknown) => Array.isArray(value) && value.every((entry) => typeof entry === 'string' && entry.trim() !== '');
-  if (!given.every((key) => valid((root as Record<string, unknown>)[key]))) return null;
-  return { skip_labels: [], skip_authors: [], skip_branches: [], ...Object.fromEntries(given.map((key) => [key, (root as Record<string, unknown>)[key]])) };
+  if (!given.every((key) => valid(config[key]))) return null;
+  return { skip_labels: [], skip_authors: [], skip_branches: [], ...Object.fromEntries(given.map((key) => [key, config[key]])) };
 }
 
 export interface SkipFacts {
