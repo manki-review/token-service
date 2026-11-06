@@ -264,6 +264,7 @@ export class PrCoordinator extends DurableObject<Env> {
   private migrate(): void {
     this.sql.exec('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
     const applied = Number(this.getMeta<number>('schema_version') ?? 0);
+    if (applied === 0) this.setMeta('created_at', Date.now());
     for (let version = applied; version < MIGRATIONS.length; version++) {
       this.ctx.storage.transactionSync(() => {
         this.sql.exec(MIGRATIONS[version]);
@@ -299,6 +300,12 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /** Records a routed delivery and queues its work. A delivery whose id or body was seen before is refused. */
   async receive(delivery: Delivery, route: Extract<Route, { type: 'work' | 'close' }>): Promise<ReceiveResult> {
+    // A close from before the PR's last reopen or before its state existed is a late redelivery, so it changes nothing.
+    if (route.type === 'close' && route.at > 0 && this.hasState()
+      && route.at < Math.max(this.getMeta<number>('created_at') ?? 0, this.getMeta<number>('reopened_at') ?? 0)) {
+      log('coordinator_receive', { ...this.logFields(), delivery: delivery.id, accepted: false, reason: 'close older than the open PR' });
+      return { accepted: false, reason: 'close older than the open PR' };
+    }
     // A close that neither drops work nor records a merge writes nothing, so closing and reopening in a loop costs no rows.
     if (route.type === 'close' && !route.merged && !this.hasPendingWork()) {
       const recorded = this.hasState() ? this.recordClose(delivery, Date.now()) : 'unchanged';
@@ -609,10 +616,14 @@ export class PrCoordinator extends DurableObject<Env> {
     }
   }
 
-  /** Clears the PR's recorded close, so its state is kept as for an open PR. Writes nothing when none is recorded. */
-  async reopen(): Promise<void> {
+  /**
+   * Clears the PR's recorded close, so its state is kept as for an open PR, and records the reopen time `at`, so a close
+   * redelivered later changes nothing. Writes nothing for a PR without state.
+   */
+  async reopen(at: number): Promise<void> {
     if (!this.hasState()) return;
     this.ensureSchema();
+    if (at > (this.getMeta<number>('reopened_at') ?? 0)) this.setMeta('reopened_at', at);
     if (this.sql.exec(`DELETE FROM meta WHERE key = 'closed_at' RETURNING key`).toArray().length === 0) return;
     log('coordinator_reopened', this.logFields());
     await this.scheduleNext();
