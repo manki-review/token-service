@@ -3,7 +3,10 @@ import { dispatchInputs, runTitle } from './dispatch';
 import type { Env } from './env';
 import { githubApi, isRateLimited, type MintResult, mintRepositoryToken } from './github';
 import { log } from './log';
-import { BOT_LOGIN, type BoxChange, HELP_REPLY, matchSkipRule, parseSkipRules, REVIEW_MODES, type ReviewMode, setBoxes } from './manki';
+import {
+  type BaseConfig, BOT_LOGIN, type BoxChange, HELP_REPLY, matchSkipRule, parseConfig, REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes,
+  skipRulesOf,
+} from './manki';
 import { LEGACY_DISPATCH_WORKFLOW, type OptIn, readOptIn, type Repository } from './opt-in';
 import type { Permissions } from './permissions';
 import { RECONCILER_NAME } from './reconciler';
@@ -1052,13 +1055,16 @@ export class PrCoordinator extends DurableObject<Env> {
       return false;
     }
     if (item.event.startsWith('pull_request.')) {
-      if (pr.draft) {
+      // A retry after a dispatch attempt may find that attempt's run, so only the first attempt can drop or skip.
+      const first = item.attempts === 0;
+      const config = first ? await this.baseConfig(pr, target) : null;
+      if (!this.isDispatching(item.id)) return false;
+      // A draft is reviewed on request, such as by its settings box, unless the base config reviews drafts.
+      if (first && pr.draft && !reviewsDrafts(config)) {
         this.finish(item.id, 'dropped', 'pull request is a draft');
         return false;
       }
-      // A retry after a dispatch attempt may find that attempt's run, so only the first attempt can skip.
-      const rule = item.attempts === 0 ? await this.skipRule(pr, item.head_sha, item.sender, target) : null;
-      if (!this.isDispatching(item.id)) return false;
+      const rule = first ? this.skipRule(config, pr, item.head_sha, item.sender, target) : null;
       if (rule !== null) {
         await this.reportSkipped(pr.head.sha, rule, target);
         if (!this.isDispatching(item.id)) return false;
@@ -1077,10 +1083,10 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Returns the skip rule of the base branch's `.manki.yml` the PR matches, or null when none does. A missing,
-   * oversized or invalid file skips nothing, as it does in Manki.
+   * Reads `.manki.yml` from the PR's base branch, so a PR cannot change what applies to itself. A missing, oversized or
+   * unparsable file gives null, which sets nothing, as in Manki.
    */
-  private async skipRule(pr: PullRequestRead, queuedHead: string | null, sender: string, target: Target): Promise<string | null> {
+  private async baseConfig(pr: PullRequestRead, target: Target): Promise<BaseConfig> {
     const token = await this.token({ contents: 'read', metadata: 'read' });
     if (token === null) return null;
     const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/contents/.manki.yml?ref=${encodeURIComponent(pr.base.ref)}`);
@@ -1088,8 +1094,12 @@ export class PrCoordinator extends DurableObject<Env> {
     if (!response.ok) throw new Error(`reading .manki.yml failed with ${response.status}`);
     const file = await response.json() as { type?: string; size?: number; encoding?: string; content?: string };
     if (file.type !== 'file' || file.encoding !== 'base64' || file.content === undefined || (file.size ?? 0) > MAX_CONFIG_BYTES) return null;
-    const text = new TextDecoder().decode(Uint8Array.from(atob(file.content.replace(/\s/g, '')), (c) => c.charCodeAt(0)));
-    const rules = parseSkipRules(text);
+    return parseConfig(new TextDecoder().decode(Uint8Array.from(atob(file.content.replace(/\s/g, '')), (c) => c.charCodeAt(0))));
+  }
+
+  /** Returns the skip rule of `config` the PR matches, or null when none does. */
+  private skipRule(config: BaseConfig, pr: PullRequestRead, queuedHead: string | null, sender: string, target: Target): string | null {
+    const rules = skipRulesOf(config);
     if (rules === null) return null;
     return matchSkipRule(rules, {
       labels: pr.labels?.map((label) => label.name) ?? [],
