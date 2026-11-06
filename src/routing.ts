@@ -90,9 +90,10 @@ export interface Work {
 export type Route =
   | { type: 'ignore'; reason: string }
   | { type: 'work'; target: Target; work: Work }
-  | { type: 'close'; target: Target; merged: Work | null }
+  /** `at` is when GitHub says the PR closed, or reopened, in milliseconds. 0 when the payload names no time. */
+  | { type: 'close'; target: Target; merged: Work | null; at: number }
   | { type: 'seen'; target: Target; headSha: string }
-  | { type: 'reopen'; target: Target }
+  | { type: 'reopen'; target: Target; at: number }
   | { type: 'run_completed'; target: Target; runId: number; conclusion: string | null };
 
 interface User {
@@ -106,6 +107,8 @@ interface PullRequest {
   draft?: boolean;
   merged?: boolean;
   state?: string;
+  closed_at?: string | null;
+  updated_at?: string;
   head?: { sha?: string; repo?: { full_name?: string } | null };
 }
 
@@ -234,7 +237,8 @@ export function routeDelivery(event: string, payload: WebhookPayload, now = Date
   // A close always clears the queue, even when the job `if` would skip the run that records the fix rate.
   if (event === 'pull_request' && payload.action === 'closed') {
     const recordsFixRate = payload.pull_request?.merged === true && !isBot(payload.sender) && !isForkHead(payload);
-    return { type: 'close', target, merged: recordsFixRate ? work('state', 'merged', payload, event) : null };
+    const at = Date.parse(payload.pull_request?.closed_at ?? '') || 0;
+    return { type: 'close', target, merged: recordsFixRate ? work('state', 'merged', payload, event) : null, at };
   }
 
   // Manki skips a bot's push. The coordinator still records the head, so the cron does not review it later.
@@ -267,7 +271,7 @@ export function routeDelivery(event: string, payload: WebhookPayload, now = Date
 function routePullRequest(target: Target, payload: WebhookPayload): Route {
   const { action } = payload;
   // A reopen queues no review, but the coordinator keeps the PR's state as for an open PR again.
-  if (action === 'reopened') return { type: 'reopen', target };
+  if (action === 'reopened') return { type: 'reopen', target, at: Date.parse(payload.pull_request?.updated_at ?? '') || 0 };
   if (action !== 'opened' && action !== 'synchronize' && action !== 'ready_for_review') {
     return ignore(`pull_request action ${action}`);
   }

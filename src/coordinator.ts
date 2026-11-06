@@ -299,6 +299,12 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /** Records a routed delivery and queues its work. A delivery whose id or body was seen before is refused. */
   async receive(delivery: Delivery, route: Extract<Route, { type: 'work' | 'close' }>): Promise<ReceiveResult> {
+    // A close from before the PR's last reopen is a late redelivery, so it changes nothing. Both times are GitHub's. A
+    // merge is never stale, since a merged PR cannot reopen.
+    if (route.type === 'close' && !route.merged && route.at > 0 && this.hasState() && route.at < (this.getMeta<number>('reopened_at') ?? 0)) {
+      log('coordinator_receive', { ...this.logFields(), delivery: delivery.id, accepted: false, reason: 'close older than the open PR' });
+      return { accepted: false, reason: 'close older than the open PR' };
+    }
     // A close that neither drops work nor records a merge writes nothing, so closing and reopening in a loop costs no rows.
     if (route.type === 'close' && !route.merged && !this.hasPendingWork()) {
       const recorded = this.hasState() ? this.recordClose(delivery, Date.now()) : 'unchanged';
@@ -609,12 +615,21 @@ export class PrCoordinator extends DurableObject<Env> {
     }
   }
 
-  /** Clears the PR's recorded close, so its state is kept as for an open PR. Writes nothing when none is recorded. */
-  async reopen(): Promise<void> {
-    if (!this.hasState()) return;
+  /**
+   * Records a reopen at `at`, GitHub's time, and clears the PR's recorded close, so its state is kept as for an open PR
+   * and a close redelivered later changes nothing. A PR without state gets some too, since its close stored nothing.
+   */
+  async reopen(delivery: Delivery, target: Target, at: number): Promise<void> {
     this.ensureSchema();
-    if (this.sql.exec(`DELETE FROM meta WHERE key = 'closed_at' RETURNING key`).toArray().length === 0) return;
-    log('coordinator_reopened', this.logFields());
+    const cleared = this.ctx.storage.transactionSync(() => {
+      if (this.isReplay(delivery)) return null;
+      this.remember(delivery, Date.now());
+      this.setMeta('target', target);
+      if (at > (this.getMeta<number>('reopened_at') ?? 0)) this.setMeta('reopened_at', at);
+      return this.sql.exec(`DELETE FROM meta WHERE key = 'closed_at' RETURNING key`).toArray().length > 0;
+    });
+    if (cleared === null) return;
+    if (cleared) log('coordinator_reopened', this.logFields());
     await this.scheduleNext();
   }
 

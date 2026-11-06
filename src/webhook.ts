@@ -130,7 +130,7 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
     try {
       if (route.type === 'run_completed') await coordinator.runCompleted(key, route.runId, route.conclusion);
       else if (route.type === 'seen') await coordinator.markSeen(key, route.target, route.headSha);
-      else if (route.type === 'reopen') await coordinator.reopen();
+      else if (route.type === 'reopen') await coordinator.reopen(key, route.target, route.at);
       else stored = (await coordinator.receive(key, route)).accepted;
     } catch (error) {
       log('webhook_coordinator_error', { delivery, error: String(error) });
