@@ -292,7 +292,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const now = Date.now();
     const delivery = `catch-up-${head.slice(0, 12)}`;
     // The head is a same-repository push, which the webhook path trusts too.
-    const work: Work = { lane: 'state', kind: 'review', event: 'pull_request.synchronize', headSha: head, objectId: null, sender: '', trusted: true, acknowledge: false };
+    const work: Work = { lane: 'state', kind: 'review', event: 'pull_request.synchronize', headSha: head, objectId: null, sender: '', trusted: true, acknowledge: false, writer: true };
     const effect = this.ctx.storage.transactionSync(() => {
       this.sql.exec('INSERT OR REPLACE INTO deliveries (id, received_at) VALUES (?, ?)', delivery, now);
       this.setMeta('target', target);

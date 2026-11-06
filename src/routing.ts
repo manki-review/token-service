@@ -60,6 +60,11 @@ export interface Work {
   trusted: boolean;
   /** Whether the work comes from a comment that gets the eyes reaction as soon as it is queued. */
   acknowledge: boolean;
+  /**
+   * Whether someone with write access caused the work: a push to a branch of the repository, a thread resolved on a
+   * same-repository PR, a Force review tick, or a comment or review by an `OWNER`, `MEMBER` or `COLLABORATOR`.
+   */
+  writer: boolean;
 }
 
 export type Route =
@@ -151,7 +156,7 @@ function isTrusted(payload: WebhookPayload): boolean {
 const WRITER_ASSOCIATIONS = ['OWNER', 'MEMBER', 'COLLABORATOR'];
 
 /** Whether the comment's or review's author has write access, as its `author_association` shows it. */
-export function isWriterAuthored(payload: WebhookPayload): boolean {
+function isWriterAuthored(payload: WebhookPayload): boolean {
   return WRITER_ASSOCIATIONS.includes((payload.comment ?? payload.review)?.author_association ?? '');
 }
 
@@ -175,6 +180,9 @@ function work(lane: Lane, kind: WorkKind, payload: WebhookPayload, event: string
     sender: payload.sender?.login ?? '',
     trusted: isTrusted(payload),
     acknowledge: isWriterCommand(payload),
+    // Fork heads are dropped before this, so a push and a thread resolution, which only a writer or the PR's author
+    // can make, both take write access.
+    writer: event === 'pull_request' || event === 'pull_request_review_thread' || isWriterAuthored(payload),
   };
 }
 
@@ -279,7 +287,7 @@ function routeIssueComment(target: Target, payload: WebhookPayload): Route {
       return { type: 'work', target, work: work('state', 'comment', payload, 'issue_comment', objectId) };
     }
     // The association is that of Manki's comment. Editing someone else's comment takes write access, so the tick is trusted.
-    return { type: 'work', target, work: { ...work('state', 'review', payload, 'issue_comment', objectId), trusted: true, acknowledge: true } };
+    return { type: 'work', target, work: { ...work('state', 'review', payload, 'issue_comment', objectId), trusted: true, acknowledge: true, writer: true } };
   }
 
   // An edit that keeps an earlier mention is forwarded too. Manki skips one it already answered.

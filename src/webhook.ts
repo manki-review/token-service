@@ -1,7 +1,7 @@
 import { allowedRepos, type Env } from './env';
 import { eventsPerHour } from './limiter';
 import { log } from './log';
-import { isWriterAuthored, routeDelivery, type Route, type WebhookPayload } from './routing';
+import { routeDelivery, type Route, type WebhookPayload } from './routing';
 import { sha256Hex, verifyWebhookSignature } from './signature';
 
 const MAX_BODY_BYTES = 25 * 1024 * 1024;
@@ -101,11 +101,9 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
   let route: Route = routed.type !== 'ignore' && !allowedRepos(env).has(routed.target.repositoryId)
     ? { type: 'ignore', reason: `repository ${routed.target.repositoryId} is not in WEBHOOK_REPOS` }
     : routed;
-  // One installation may store only so many comments and reviews an hour, so a flood from it cannot use up the quota
-  // either. A push to a branch of the repository takes write access, and a close or a run's end must never be lost, so
-  // `pull_request` and `workflow_run` deliveries are exempt. The router already drops fork pushes. A comment or review
-  // by someone with write access is exempt too, so outsiders can only use up their own share.
-  const limiter = route.type === 'work' && event !== 'pull_request' && !isWriterAuthored(payload)
+  // One installation may store only so many deliveries from people without write access an hour, so a flood from it
+  // cannot use up the quota either, and outsiders only use up their own share. A close or a run's end is never capped.
+  const limiter = route.type === 'work' && !route.work.writer
     ? env.INSTALLATION_LIMITER.getByName(String(route.target.installationId))
     : null;
   if (limiter && route.type !== 'ignore') {
