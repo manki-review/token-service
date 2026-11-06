@@ -12,7 +12,7 @@ export interface DispatchItem {
   delivery: string;
 }
 
-/** Returns the inputs for a run of `manki-dispatch.yml` that replays `item` on PR or issue `number`. */
+/** Returns the inputs for a run of the dispatch workflow that replays `item` on PR or issue `number`. */
 export function dispatchInputs(item: DispatchItem, number: number): Record<string, string> {
   const [event, action] = item.event.split('.');
   const inputs: Record<string, string> = { event, action, pr: String(number), delivery_id: item.delivery };
