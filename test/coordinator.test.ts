@@ -585,6 +585,9 @@ function fakeGitHub(number: number) {
     graphqlVariables: [] as Array<Record<string, string>>,
     repositoryStatus: 200,
     repositoryReads: 0,
+    /** The eyes reactions added, as `<issues or pulls>/<comment id>`, and the status they get. */
+    reactions: [] as string[],
+    reactionStatus: 201,
   };
   const workflowsBody = workflowsReply({ 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML }).body;
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
@@ -631,6 +634,11 @@ function fakeGitHub(number: number) {
     if (route === `GET ${repo}/actions/workflows/manki-dispatch.yml/runs`) {
       if (state.listRunsStatus !== 200) return Response.json({ message: 'no' }, { status: state.listRunsStatus });
       return Response.json({ total_count: state.listedRuns.length, workflow_runs: state.listedRuns });
+    }
+    const reaction = url.pathname.match(new RegExp(`^${repo}/(issues|pulls)/comments/(\\d+)/reactions$`));
+    if (reaction && request.method === 'POST' && ((await request.json()) as { content: string }).content === 'eyes') {
+      state.reactions.push(`${reaction[1]}/${reaction[2]}`);
+      return Response.json({ content: 'eyes' }, { status: state.reactionStatus });
     }
     const run = url.pathname.match(new RegExp(`^${repo}/actions/runs/(\\d+)(/cancel)?$`));
     if (run && request.method === 'POST' && run[2]) {
@@ -682,6 +690,61 @@ describe('PrCoordinator dispatch', () => {
       { permissions: { pull_requests: 'read' }, repository_ids: [REPOSITORY_ID] },
       { permissions: { actions: 'write' }, repository_ids: [REPOSITORY_ID] },
     ]);
+  });
+
+  it('reacts to a queued command at once, with a token for that kind of comment alone', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    await pr.send('pull_request', pr.push(SHA_1));
+    await runDurableObjectAlarm(pr.stub);
+    github.mints = [];
+
+    await pr.send('issue_comment', pr.comment('@manki review'));
+    await pr.send('pull_request_review_comment', reviewCommentEvent('@manki is this safe?', {}, 'created', { number: pr.number }));
+    await runDurableObjectAlarm(pr.stub);
+
+    expect(github.reactions).toEqual(['issues/1001', 'pulls/1001']);
+    expect(github.mints).toEqual([
+      { permissions: { issues: 'write' }, repository_ids: [REPOSITORY_ID] },
+      { permissions: { pull_requests: 'write' }, repository_ids: [REPOSITORY_ID] },
+    ]);
+    expect(github.dispatches).toHaveLength(1);
+    expect((await workRows(pr.stub)).map((row) => row.status)).toEqual(['running', 'queued', 'queued']);
+
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.reactions).toHaveLength(2);
+  });
+
+  it('reacts to no outsider, to no reply without a mention, and to nothing without dispatch', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    await pr.send('issue_comment', pr.outsiderComment('@manki review'));
+    await pr.send('pull_request_review_comment', pr.reply('Fixed'));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.reactions).toEqual([]);
+
+    setDispatchEnabled(false);
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    await runDurableObjectAlarm(pr.stub);
+    github.repositoryStatus = 404;
+    advanceClock(OPT_IN_TTL_MS + 1);
+    setDispatchEnabled(true);
+    await pr.send('issue_comment', pr.comment('@manki help'));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.reactions).toEqual([]);
+  });
+
+  it.each<[string, (github: ReturnType<typeof fakeGitHub>) => void, string]>([
+    ['a refused reaction', (github) => { github.reactionStatus = 403; }, 'coordinator_reaction_failed'],
+    ['a failed token mint', (github) => { github.mintFailures = [{ permission: 'issues', reply: 500 }]; }, 'coordinator_reaction_error'],
+  ])('dispatches the command after %s', async (_case, fail, message) => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    fail(github);
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    await runDurableObjectAlarm(pr.stub);
+    expect(logged(log, message)).toHaveLength(1);
+    expect(github.dispatches).toHaveLength(1);
   });
 
   it('holds the lane until the workflow_run webhook ends the run, then starts the next item', async () => {
