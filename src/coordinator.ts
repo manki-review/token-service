@@ -3,7 +3,7 @@ import { dispatchInputs, runTitle } from './dispatch';
 import type { Env } from './env';
 import { githubApi, isRateLimited, type MintResult, mintRepositoryToken } from './github';
 import { log } from './log';
-import { BOT_LOGIN } from './manki';
+import { BOT_LOGIN, matchSkipRule, parseSkipRules } from './manki';
 import { LEGACY_DISPATCH_WORKFLOW, type OptIn, readOptIn, type Repository } from './opt-in';
 import type { Permissions } from './permissions';
 import { RECONCILER_NAME } from './reconciler';
@@ -51,6 +51,8 @@ export const UNTRUSTED_DISPATCHES_PER_HOUR = 5;
 /** A token is minted again once it expires within this time. */
 const TOKEN_EXPIRY_MARGIN_MS = 5 * MINUTE;
 const NOT_STARTED = new Set(['queued', 'requested', 'waiting', 'pending']);
+/** A larger `.manki.yml` is not parsed for skip rules, as it costs too much CPU in an alarm. */
+const MAX_CONFIG_BYTES = 64 * 1024;
 
 export type WorkStatus = 'queued' | 'dispatching' | 'running' | 'done' | 'failed' | 'timed_out' | 'dropped' | 'skipped';
 
@@ -82,6 +84,16 @@ export interface WorkRow extends Record<string, string | number | null> {
   requeues: number;
   /** The workflow file the last dispatch attempt named. Null before the first attempt. */
   workflow: string | null;
+}
+
+/** The fields of `GET /repos/{owner}/{repo}/pulls/{number}` a review start reads. */
+interface PullRequestRead {
+  state: string;
+  draft?: boolean;
+  labels?: Array<{ name: string }>;
+  user?: { login?: string } | null;
+  head: { sha: string; ref: string; repo?: { id?: number } | null };
+  base: { ref: string };
 }
 
 /** The opt-in result as cached, with the repository as GitHub names it when it was read. */
@@ -306,14 +318,14 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Whether a review of `head` ran to success (`handled`) or is queued or running (`pending`). Null when neither, also
-   * when its run failed, was cancelled or was deleted, so such a head is reviewed again.
+   * Whether a review of `head` ran to success or matched a skip rule (`handled`), or is queued or running (`pending`).
+   * Null when neither, also when its run failed, was cancelled or was deleted, so such a head is reviewed again.
    */
   private reviewState(head: string | null): 'handled' | 'pending' | null {
     const rows = this.sql.exec<{ status: WorkStatus; conclusion: string | null }>(
       `SELECT status, conclusion FROM work WHERE kind = 'review' AND head_sha = ?`, head,
     ).toArray();
-    if (rows.some((row) => row.status === 'done' && row.conclusion === 'success')) return 'handled';
+    if (rows.some((row) => (row.status === 'done' && row.conclusion === 'success') || (row.status === 'skipped' && row.conclusion === 'skipped'))) return 'handled';
     if (rows.some((row) => row.status === 'queued' || row.status === 'dispatching' || row.status === 'running')) return 'pending';
     return null;
   }
@@ -375,8 +387,9 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Where `head` stands for the cron. It is `handled` once a review run of it succeeded or a bot pushed it, `pending`
-   * while a review is queued or running, and `needed` otherwise, also when that review was skipped, dropped or failed.
+   * Where `head` stands for the cron. It is `handled` once a review run of it succeeded, it matched a skip rule or a bot
+   * pushed it, `pending` while a review is queued or running, and `needed` otherwise, also when that review was dropped,
+   * failed or skipped for another reason, such as dispatch being off.
    * Writes nothing, so asking about a PR without state creates none.
    */
   async catchUpState(head: string): Promise<'needed' | 'pending' | 'handled'> {
@@ -842,7 +855,7 @@ export class PrCoordinator extends DurableObject<Env> {
     if (token === null) throw new Error('could not mint a token to read the pull request');
     const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/pulls/${target.number}`);
     if (!response.ok) throw new Error(`reading the pull request failed with ${response.status}`);
-    const pr = await response.json() as { state: string; draft?: boolean; head: { sha: string } };
+    const pr = await response.json() as PullRequestRead;
     if (!this.isDispatching(item.id)) return false;
     if (pr.state !== 'open') {
       this.finish(item.id, 'dropped', 'pull request closed');
@@ -853,9 +866,66 @@ export class PrCoordinator extends DurableObject<Env> {
         this.finish(item.id, 'dropped', 'pull request is a draft');
         return false;
       }
-      this.sql.exec('UPDATE work SET head_sha = ? WHERE id = ?', pr.head.sha, item.id);
+      // A retry after a dispatch attempt may find that attempt's run, so only the first attempt can skip.
+      const rule = item.attempts === 0 ? await this.skipRule(pr, item.head_sha, item.sender, target) : null;
+      if (!this.isDispatching(item.id)) return false;
+      if (rule !== null) {
+        await this.reportSkipped(pr.head.sha, rule, target);
+        if (!this.isDispatching(item.id)) return false;
+      }
+      // Who pushed a newer head is unknown, so its sender goes with the queued head, also for a retry after a failure.
+      this.sql.exec(
+        `UPDATE work SET sender = CASE WHEN head_sha IS ? THEN sender ELSE '' END, head_sha = ? WHERE id = ?`,
+        pr.head.sha, pr.head.sha, item.id,
+      );
+      if (rule !== null) {
+        this.finish(item.id, 'skipped', `matches the skip rule for ${rule}`, 'skipped');
+        return false;
+      }
     }
     return true;
+  }
+
+  /**
+   * Returns the skip rule of the base branch's `.manki.yml` the PR matches, or null when none does. A missing,
+   * oversized or invalid file skips nothing, as it does in Manki.
+   */
+  private async skipRule(pr: PullRequestRead, queuedHead: string | null, sender: string, target: Target): Promise<string | null> {
+    const token = await this.token({ contents: 'read', metadata: 'read' });
+    if (token === null) return null;
+    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/contents/.manki.yml?ref=${encodeURIComponent(pr.base.ref)}`);
+    if (response.status === 404) return null;
+    if (!response.ok) throw new Error(`reading .manki.yml failed with ${response.status}`);
+    const file = await response.json() as { type?: string; size?: number; encoding?: string; content?: string };
+    if (file.type !== 'file' || file.encoding !== 'base64' || file.content === undefined || (file.size ?? 0) > MAX_CONFIG_BYTES) return null;
+    const text = new TextDecoder().decode(Uint8Array.from(atob(file.content.replace(/\s/g, '')), (c) => c.charCodeAt(0)));
+    const rules = parseSkipRules(text);
+    if (rules === null) return null;
+    return matchSkipRule(rules, {
+      labels: pr.labels?.map((label) => label.name) ?? [],
+      author: pr.user?.login,
+      // Who pushed a head other than the queued one is unknown, as for a catch-up, so no author rule matches it.
+      sender: pr.head.sha === queuedHead ? sender : '',
+      branch: pr.head.ref,
+      fromFork: pr.head.repo?.id !== target.repositoryId,
+    });
+  }
+
+  /** Completes a `Manki` check on `head` as skipped, as Manki does for a PR it skips. */
+  private async reportSkipped(head: string, rule: string, target: Target): Promise<void> {
+    const token = await this.token({ checks: 'write' });
+    if (token === null) return;
+    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/check-runs`, {
+      method: 'POST',
+      body: {
+        name: 'Manki',
+        head_sha: head,
+        status: 'completed',
+        conclusion: 'skipped',
+        output: { title: 'Review skipped', summary: `This PR matches the skip rule for ${rule} in \`.manki.yml\` on the base branch.` },
+      },
+    });
+    if (!response.ok) throw new Error(`creating the skipped check failed with ${response.status}`);
   }
 
   private markRunning(item: WorkRow, runId: number | null, note: string): void {

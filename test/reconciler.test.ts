@@ -114,8 +114,9 @@ function fakeGitHub() {
     const single = url.pathname.match(/^\/repos\/[^/]+\/([^/]+)\/pulls\/(\d+)$/);
     if (single && request.method === 'GET') {
       const found = (state.pulls.get(single[1]) ?? []).find((candidate) => candidate.number === Number(single[2]));
-      return Response.json({ state: 'open', draft: false, head: { sha: found?.head.sha } });
+      return Response.json({ state: 'open', draft: false, head: { sha: found?.head.sha, ref: 'feature' }, base: { ref: 'main' } });
     }
+    if (/^\/repos\/[^/]+\/[^/]+\/contents\/\.manki\.yml$/.test(url.pathname)) return Response.json({ message: 'Not Found' }, { status: 404 });
     if (url.pathname.endsWith('/actions/workflows/manki-dispatch.yml/dispatches') && request.method === 'POST') {
       state.dispatches++;
       return Response.json({ workflow_run_id: 7000 + state.dispatches });
