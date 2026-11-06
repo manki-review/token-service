@@ -585,9 +585,9 @@ function fakeGitHub(number: number) {
     graphqlVariables: [] as Array<Record<string, string>>,
     repositoryStatus: 200,
     repositoryReads: 0,
-    /** The eyes reactions added, as `<issues or pulls>/<comment id>`, and the status they get. */
+    /** The eyes reactions added, as `<issues or pulls>/<comment id>`, and the status each kind gets. */
     reactions: [] as string[],
-    reactionStatus: 201,
+    reactionStatus: { issues: 201, pulls: 201 } as Record<string, number>,
   };
   const workflowsBody = workflowsReply({ 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML }).body;
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
@@ -638,7 +638,7 @@ function fakeGitHub(number: number) {
     const reaction = url.pathname.match(new RegExp(`^${repo}/(issues|pulls)/comments/(\\d+)/reactions$`));
     if (reaction && request.method === 'POST' && ((await request.json()) as { content: string }).content === 'eyes') {
       state.reactions.push(`${reaction[1]}/${reaction[2]}`);
-      return Response.json({ content: 'eyes' }, { status: state.reactionStatus });
+      return Response.json({ content: 'eyes' }, { status: state.reactionStatus[reaction[1]] });
     }
     const run = url.pathname.match(new RegExp(`^${repo}/actions/runs/(\\d+)(/cancel)?$`));
     if (run && request.method === 'POST' && run[2]) {
@@ -700,6 +700,7 @@ describe('PrCoordinator dispatch', () => {
     github.mints = [];
 
     await pr.send('issue_comment', pr.comment('@manki review'));
+    await pr.send('issue_comment', pr.comment('@manki review this', 'edited'));
     await pr.send('pull_request_review_comment', reviewCommentEvent('@manki is this safe?', {}, 'created', { number: pr.number }));
     await runDurableObjectAlarm(pr.stub);
 
@@ -735,16 +736,18 @@ describe('PrCoordinator dispatch', () => {
   });
 
   it.each<[string, (github: ReturnType<typeof fakeGitHub>) => void, string]>([
-    ['a refused reaction', (github) => { github.reactionStatus = 403; }, 'coordinator_reaction_failed'],
+    ['a refused reaction', (github) => { github.reactionStatus.issues = 403; }, 'coordinator_reaction_failed'],
     ['a failed token mint', (github) => { github.mintFailures = [{ permission: 'issues', reply: 500 }]; }, 'coordinator_reaction_error'],
-  ])('dispatches the command after %s', async (_case, fail, message) => {
+  ])('dispatches the command and still reacts to the others after %s', async (_case, fail, message) => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
     fail(github);
     await pr.send('issue_comment', pr.comment('@manki explain'));
+    await pr.send('pull_request_review_comment', reviewCommentEvent('@manki is this safe?', {}, 'created', { number: pr.number }));
     await runDurableObjectAlarm(pr.stub);
-    expect(logged(log, message)).toHaveLength(1);
-    expect(github.dispatches).toHaveLength(1);
+    expect(logged(log, message)).toMatchObject([{ comment_id: 1001 }]);
+    expect(github.reactions).toContain('pulls/1001');
+    expect(github.dispatches).toHaveLength(2);
   });
 
   it('holds the lane until the workflow_run webhook ends the run, then starts the next item', async () => {

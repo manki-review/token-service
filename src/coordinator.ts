@@ -90,9 +90,9 @@ export interface Delivery {
   bodyHash: string | null;
 }
 
-/** A comment `receive` queued a command from, waiting for its eyes reaction. */
+/** A comment `receive` queued a command from, waiting for its eyes reaction. `pulls` names a review comment. */
 interface PendingReaction {
-  event: string;
+  comments: 'issues' | 'pulls';
   commentId: number;
 }
 
@@ -227,8 +227,14 @@ export class PrCoordinator extends DurableObject<Env> {
         if (state !== null) return { accepted: true, effect: 'head already reviewed or under review' };
       }
       if (route.work.acknowledge && route.work.objectId !== null) {
-        const reaction: PendingReaction = { event: route.work.event, commentId: route.work.objectId };
-        this.setMeta('reactions', [...this.getMeta<PendingReaction[]>('reactions') ?? [], reaction]);
+        const reaction: PendingReaction = {
+          comments: route.work.event.startsWith('pull_request_review_comment.') ? 'pulls' : 'issues',
+          commentId: route.work.objectId,
+        };
+        const pending = this.getMeta<PendingReaction[]>('reactions') ?? [];
+        if (!pending.some((entry) => entry.comments === reaction.comments && entry.commentId === reaction.commentId)) {
+          this.setMeta('reactions', [...pending, reaction]);
+        }
       }
       return { accepted: true, effect: this.enqueue(route.work, delivery.id, now) };
     });
@@ -408,20 +414,25 @@ export class PrCoordinator extends DurableObject<Env> {
     const pending = this.getMeta<PendingReaction[]>('reactions');
     if (!pending) return;
     this.sql.exec(`DELETE FROM meta WHERE key = 'reactions'`);
+    let target: Target | null;
     try {
       if (this.env.DISPATCH_ENABLED !== 'true' || !(await this.optIn()).optedIn) return;
-      const target = await this.verifiedTarget();
-      if (!target) return;
-      for (const { event, commentId } of pending) {
-        const onReviewComment = event.startsWith('pull_request_review_comment.');
-        const token = await this.token(onReviewComment ? { pull_requests: 'write' } : { issues: 'write' });
-        if (token === null) continue;
-        const path = `/repos/${target.owner}/${target.repo}/${onReviewComment ? 'pulls' : 'issues'}/comments/${commentId}/reactions`;
-        const response = await githubApi(token, path, { method: 'POST', body: { content: 'eyes' } });
-        if (!response.ok) log('coordinator_reaction_failed', { ...this.logFields(), comment_id: commentId, status: response.status });
-      }
+      target = await this.verifiedTarget();
     } catch (error) {
       log('coordinator_reaction_error', { ...this.logFields(), error: String(error) });
+      return;
+    }
+    if (!target) return;
+    for (const { comments, commentId } of pending) {
+      try {
+        const token = await this.token(comments === 'pulls' ? { pull_requests: 'write' } : { issues: 'write' });
+        if (token === null) continue;
+        const path = `/repos/${target.owner}/${target.repo}/${comments}/comments/${commentId}/reactions`;
+        const response = await githubApi(token, path, { method: 'POST', body: { content: 'eyes' } });
+        if (!response.ok) log('coordinator_reaction_failed', { ...this.logFields(), comment_id: commentId, status: response.status });
+      } catch (error) {
+        log('coordinator_reaction_error', { ...this.logFields(), comment_id: commentId, error: String(error) });
+      }
     }
   }
 
