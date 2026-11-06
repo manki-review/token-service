@@ -425,7 +425,8 @@ export class PrCoordinator extends DurableObject<Env> {
     if (!target) return;
     for (const { comments, commentId } of pending) {
       try {
-        const token = await this.token(comments === 'pulls' ? { pull_requests: 'write' } : { issues: 'write' });
+        // A comment on a pull request needs `pull_requests: write` to take a reaction, one on a plain issue `issues: write`.
+        const token = await this.token(comments === 'pulls' ? { pull_requests: 'write' } : { issues: 'write', pull_requests: 'write' });
         if (token === null) continue;
         const path = `/repos/${target.owner}/${target.repo}/${comments}/comments/${commentId}/reactions`;
         const response = await githubApi(token, path, { method: 'POST', body: { content: 'eyes' } });
