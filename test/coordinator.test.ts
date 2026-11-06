@@ -590,37 +590,34 @@ describe('PrCoordinator.alarm', () => {
     await quiet.send('pull_request', quiet.close(false), 'd-close');
     await runDurableObjectAlarm(quiet.stub);
     advanceClock(DAY);
-    const reopen = pullRequestEvent('reopened', { number: quiet.number, updated_at: new Date().toISOString() });
-    expect((await postWebhook({ event: 'pull_request', payload: reopen })).status).toBe(202);
+    const reopenedAt = Date.now();
+    const reopen = (pr: ReturnType<typeof pullRequest>) =>
+      postWebhook({ event: 'pull_request', payload: pullRequestEvent('reopened', { number: pr.number, updated_at: new Date().toISOString() }) });
+    expect((await reopen(quiet)).status).toBe(202);
     expect(await workRows(quiet.stub)).toMatchObject([{ status: 'dropped' }]);
     expect(logged(log, 'coordinator_reopened')).toHaveLength(1);
-    expect(await alarm(quiet.stub)).toBe(Date.now() - DAY + IDLE_RETENTION_MS);
+    expect(await alarm(quiet.stub)).toBe(reopenedAt + IDLE_RETENTION_MS);
     expect(await quiet.send('pull_request', quiet.close(false), 'd-close')).toEqual({ accepted: false, reason: 'duplicate delivery' });
-    expect(await alarm(quiet.stub)).toBe(Date.now() - DAY + IDLE_RETENTION_MS);
 
-    // Once the close's delivery is forgotten, its time still shows it came before the reopen.
-    const closedBefore = (pr: ReturnType<typeof pullRequest>, at: number) =>
-      pullRequestEvent('closed', { number: pr.number, closed_at: new Date(at).toISOString() });
+    // Once the close's delivery id is forgotten, its time still shows it came before the reopen. A merge never does.
+    const closeAt = (pr: ReturnType<typeof pullRequest>, at: number, merged = false) =>
+      pullRequestEvent('closed', { number: pr.number, merged, closed_at: new Date(at).toISOString() });
     advanceClock(DELIVERY_RETENTION_MS);
-    const reopenedAt = Date.now() - DELIVERY_RETENTION_MS;
-    expect(await quiet.send('pull_request', closedBefore(quiet, reopenedAt - DAY), 'd-close')).toEqual({ accepted: false, reason: 'close older than the open PR' });
-    expect(await alarm(quiet.stub)).toBe(reopenedAt - DAY + IDLE_RETENTION_MS);
-    // A merge is never stale, since a merged PR cannot reopen.
-    const merge = pullRequestEvent('closed', { number: quiet.number, merged: true, closed_at: new Date(reopenedAt - DAY).toISOString() });
-    expect(await quiet.send('pull_request', merge)).toMatchObject({ accepted: true, effect: expect.stringContaining('queued') });
+    expect(await quiet.send('pull_request', closeAt(quiet, reopenedAt - DAY), 'd-close')).toEqual({ accepted: false, reason: 'close older than the open PR' });
+    expect(await alarm(quiet.stub)).toBe(reopenedAt + IDLE_RETENTION_MS);
+    expect(await quiet.send('pull_request', closeAt(quiet, reopenedAt - DAY, true))).toMatchObject({ accepted: true, effect: expect.stringContaining('queued') });
 
-    // A close that stored nothing, of a PR whose state came later, is no newer than that state either.
+    // A close that stored nothing is refused after the reopen too, which records its time on a PR without state.
     const late = pullRequest();
-    const lateClose = Date.now() - 10 * MINUTE;
-    expect(await late.send('pull_request', closedBefore(late, lateClose))).toEqual({ accepted: true, effect: 'closed, nothing queued' });
+    const lateClose = Date.now() - MINUTE;
+    expect(await late.send('pull_request', closeAt(late, lateClose))).toEqual({ accepted: true, effect: 'closed, nothing queued' });
     expect(await tableNames(late.stub)).toEqual([]);
+    expect((await reopen(late)).status).toBe(202);
     await late.send('pull_request', late.push(SHA_1));
-    expect(await late.send('pull_request', closedBefore(late, lateClose))).toEqual({ accepted: false, reason: 'close older than the open PR' });
-    await runDurableObjectAlarm(late.stub);
-    expect(await alarm(late.stub)).toBe(Date.now() + IDLE_RETENTION_MS);
-    // A close GitHub dates shortly before the state's creation, as when its push arrived first, still counts.
-    expect(await late.send('pull_request', closedBefore(late, Date.now() - MINUTE))).toMatchObject({ accepted: true });
-    expect(await alarm(late.stub)).toBe(Date.now() + DELIVERY_RETENTION_MS);
+    expect(await late.send('pull_request', closeAt(late, lateClose))).toEqual({ accepted: false, reason: 'close older than the open PR' });
+    // A later close still counts.
+    advanceClock(MINUTE);
+    expect(await late.send('pull_request', closeAt(late, Date.now()))).toMatchObject({ accepted: true });
   });
 });
 

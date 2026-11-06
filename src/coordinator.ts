@@ -30,8 +30,6 @@ export const OPT_IN_TTL_MS = 5 * MINUTE;
 export const FINISHED_RETENTION_MS = 7 * DAY;
 /** How long an alarm may hold an item in `dispatching` before another pass takes it back. */
 const LEASE_MS = 5 * MINUTE;
-/** How much older than the state's creation a close must be to count as a late redelivery. */
-const STALE_CLOSE_MARGIN_MS = 5 * MINUTE;
 const LANES: readonly Lane[] = ['state', 'chat', 'help', 'settings'];
 
 /** The wait before each retry of a dispatch that failed with a 5xx or a network error. */
@@ -266,7 +264,6 @@ export class PrCoordinator extends DurableObject<Env> {
   private migrate(): void {
     this.sql.exec('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
     const applied = Number(this.getMeta<number>('schema_version') ?? 0);
-    if (applied === 0) this.setMeta('created_at', Date.now());
     for (let version = applied; version < MIGRATIONS.length; version++) {
       this.ctx.storage.transactionSync(() => {
         this.sql.exec(MIGRATIONS[version]);
@@ -302,11 +299,9 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /** Records a routed delivery and queues its work. A delivery whose id or body was seen before is refused. */
   async receive(delivery: Delivery, route: Extract<Route, { type: 'work' | 'close' }>): Promise<ReceiveResult> {
-    // A close from before the PR's last reopen or before its state existed is a late redelivery, so it changes nothing.
-    // The creation time is the Worker's own and the delivery that created the state may lag, so it gets a margin. A
+    // A close from before the PR's last reopen is a late redelivery, so it changes nothing. Both times are GitHub's. A
     // merge is never stale, since a merged PR cannot reopen.
-    if (route.type === 'close' && !route.merged && route.at > 0 && this.hasState()
-      && route.at < Math.max((this.getMeta<number>('created_at') ?? 0) - STALE_CLOSE_MARGIN_MS, this.getMeta<number>('reopened_at') ?? 0)) {
+    if (route.type === 'close' && !route.merged && route.at > 0 && this.hasState() && route.at < (this.getMeta<number>('reopened_at') ?? 0)) {
       log('coordinator_receive', { ...this.logFields(), delivery: delivery.id, accepted: false, reason: 'close older than the open PR' });
       return { accepted: false, reason: 'close older than the open PR' };
     }
@@ -621,15 +616,20 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Clears the PR's recorded close, so its state is kept as for an open PR, and records the reopen time `at`, so a close
-   * redelivered later changes nothing. Writes nothing for a PR without state.
+   * Records a reopen at `at`, GitHub's time, and clears the PR's recorded close, so its state is kept as for an open PR
+   * and a close redelivered later changes nothing. A PR without state gets some too, since its close stored nothing.
    */
-  async reopen(at: number): Promise<void> {
-    if (!this.hasState()) return;
+  async reopen(delivery: Delivery, target: Target, at: number): Promise<void> {
     this.ensureSchema();
-    if (at > (this.getMeta<number>('reopened_at') ?? 0)) this.setMeta('reopened_at', at);
-    if (this.sql.exec(`DELETE FROM meta WHERE key = 'closed_at' RETURNING key`).toArray().length === 0) return;
-    log('coordinator_reopened', this.logFields());
+    const cleared = this.ctx.storage.transactionSync(() => {
+      if (this.isReplay(delivery)) return null;
+      this.remember(delivery, Date.now());
+      this.setMeta('target', target);
+      if (at > (this.getMeta<number>('reopened_at') ?? 0)) this.setMeta('reopened_at', at);
+      return this.sql.exec(`DELETE FROM meta WHERE key = 'closed_at' RETURNING key`).toArray().length > 0;
+    });
+    if (cleared === null) return;
+    if (cleared) log('coordinator_reopened', this.logFields());
     await this.scheduleNext();
   }
 
