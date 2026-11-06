@@ -162,6 +162,13 @@ export class PrCoordinator extends DurableObject<Env> {
     return this.sql.exec(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'`).toArray().length > 0;
   }
 
+  /** Whether work is queued or being dispatched. Asking a PR without state creates none. */
+  private hasPendingWork(): boolean {
+    if (!this.hasState()) return false;
+    this.ensureSchema();
+    return this.sql.exec(`SELECT 1 FROM work WHERE status IN ('queued', 'dispatching') LIMIT 1`).toArray().length > 0;
+  }
+
   private ensureSchema(): void {
     if (this.schemaReady) return;
     this.migrate();
@@ -206,6 +213,13 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /** Records a routed delivery and queues its work. A delivery whose id or body was seen before is refused. */
   async receive(delivery: Delivery, route: Extract<Route, { type: 'work' | 'close' }>): Promise<ReceiveResult> {
+    // A close that neither drops work nor records a merge writes nothing, so closing and reopening in a loop costs no rows.
+    if (route.type === 'close' && !route.merged && !this.hasPendingWork()) {
+      const result: ReceiveResult = { accepted: true, effect: 'closed, nothing queued' };
+      const { owner, repo, number } = route.target;
+      log('coordinator_receive', { repo: `${owner}/${repo}`, pr: number, delivery: delivery.id, ...result });
+      return result;
+    }
     this.ensureSchema();
     const now = Date.now();
     const result = this.ctx.storage.transactionSync((): ReceiveResult => {
