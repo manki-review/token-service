@@ -622,6 +622,16 @@ function fakeGitHub(number: number) {
     head: SHA_1,
     prState: 'open',
     draft: false,
+    labels: [] as string[],
+    author: 'octocat',
+    headRef: 'feature',
+    headRepositoryId: REPOSITORY_ID,
+    baseRef: 'main',
+    /** The base branch's `.manki.yml`, or null when it has none. */
+    config: null as string | null,
+    /** The refs `.manki.yml` was read at, and the check runs created. */
+    configReads: [] as string[],
+    checkRuns: [] as Array<Record<string, unknown>>,
     /** Replies the next dispatches get, in order. Afterwards 200 with a new run id. */
     dispatchStatuses: [] as Reply[],
     /** Statuses the next cancels answer with, in order. Afterwards 202. */
@@ -679,7 +689,24 @@ function fakeGitHub(number: number) {
       return Response.json(workflowsReply(state.workflows).body);
     }
     if (route === `GET ${repo}/pulls/${number}`) {
-      return Response.json({ state: state.prState, draft: state.draft, head: { sha: state.head } });
+      return Response.json({
+        state: state.prState,
+        draft: state.draft,
+        labels: state.labels.map((name) => ({ name })),
+        user: { login: state.author },
+        head: { sha: state.head, ref: state.headRef, repo: { id: state.headRepositoryId } },
+        base: { ref: state.baseRef },
+      });
+    }
+    if (route === `GET ${repo}/contents/.manki.yml`) {
+      state.configReads.push(url.searchParams.get('ref') ?? '');
+      if (state.config === null) return Response.json({ message: 'Not Found' }, { status: 404 });
+      const content = btoa(String.fromCharCode(...new TextEncoder().encode(state.config)));
+      return Response.json({ type: 'file', encoding: 'base64', size: state.config.length, content });
+    }
+    if (route === `POST ${repo}/check-runs`) {
+      state.checkRuns.push(await request.json() as Record<string, unknown>);
+      return Response.json({ id: 1 }, { status: 201 });
     }
     const dispatched = route.match(new RegExp(`^POST ${repo}/actions/workflows/([^/]+)/dispatches$`));
     if (dispatched) {
@@ -1083,6 +1110,54 @@ describe('PrCoordinator dispatch', () => {
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches).toEqual([]);
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'dropped', note }]);
+  });
+
+  it.each([
+    ['a label, in any case', { config: 'skip_labels: [dependencies]', labels: ['Dependencies'] }, 'label "Dependencies"'],
+    ['an author who also pushed', { config: 'skip_authors: [renovate-bot]', author: 'Renovate-Bot', sender: 'renovate-bot' }, 'author Renovate-Bot'],
+    ['a branch glob', { config: 'skip_branches: ["release/**"]', headRef: 'release/1.2/fix' }, 'branch release/1.2/fix'],
+  ])('skips a push review matching %s on the base branch with a skipped check and no run', async (_case, change, rule) => {
+    const pr = pullRequest();
+    const { sender, ...pull } = { sender: 'octocat', ...change };
+    const github = Object.assign(fakeGitHub(pr.number), pull, { baseRef: 'develop' });
+    const push = pr.push(SHA_1);
+    await pr.send('pull_request', { ...push, sender: { ...push.sender, login: sender } });
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches).toEqual([]);
+    expect(github.configReads).toEqual(['develop']);
+    expect(github.checkRuns).toEqual([{
+      name: 'Manki', head_sha: SHA_1, status: 'completed', conclusion: 'skipped',
+      output: { title: 'Review skipped', summary: `This PR matches the skip rule for ${rule} in \`.manki.yml\` on the base branch.` },
+    }]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped', conclusion: 'skipped', note: `matches the skip rule for ${rule}` }]);
+    // The cron and a late redelivery of the push leave a skipped head alone.
+    expect(await pr.stub.catchUpState(SHA_1)).toBe('handled');
+    expect(await pr.send('pull_request', pr.push(SHA_1))).toEqual({ accepted: true, effect: 'head already reviewed or under review' });
+  });
+
+  it.each([
+    ['a listed author when someone else pushed', { config: 'skip_authors: [renovate-bot]', author: 'renovate-bot' }],
+    ['a label on a fork head', { config: 'skip_labels: [dependencies]', labels: ['dependencies'], headRepositoryId: 1 }],
+    ['a branch on a fork head', { config: 'skip_branches: ["release/*"]', headRef: 'release/1', headRepositoryId: 1 }],
+    ['rules that are not lists of non-empty strings', { config: 'skip_labels: dependencies\nskip_branches: ["feature"]' }],
+    ['a config that does not parse', { config: 'skip_branches: [feature' }],
+    ['no config', {}],
+  ])('reviews a push matching %s', async (_case, change) => {
+    const pr = pullRequest();
+    const github = Object.assign(fakeGitHub(pr.number), change);
+    await pr.send('pull_request', pr.push(SHA_1));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches).toHaveLength(1);
+    expect(github.checkRuns).toEqual([]);
+  });
+
+  it('applies no skip rule to a review request, which only a push review reads', async () => {
+    const pr = pullRequest();
+    const github = Object.assign(fakeGitHub(pr.number), { config: 'skip_labels: [dependencies]', labels: ['dependencies'] });
+    await pr.send('issue_comment', pr.comment('@manki review'));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches).toHaveLength(1);
+    expect(github.configReads).toEqual([]);
   });
 
   it('polls a run every two minutes as a safety net and ends it once completed', async () => {
