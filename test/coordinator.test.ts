@@ -24,6 +24,7 @@ import {
   freezeClock,
   type GitHubStub,
   INSTALLATION_ID,
+  logged,
   OWNER,
   postWebhook,
   REPO,
@@ -82,10 +83,6 @@ function pullRequest() {
       return stub.receive(key(delivery), route);
     },
   };
-}
-
-function logged(spy: { mock: { calls: unknown[][] } }, msg: string): Record<string, unknown>[] {
-  return spy.mock.calls.map((call) => JSON.parse(String(call[0]))).filter((line) => line.msg === msg);
 }
 
 let advanceClock: (ms: number) => number;

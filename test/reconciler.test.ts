@@ -10,7 +10,7 @@ import worker from '../src/index';
 import { RUN_DEADLINE_MS } from '../src/coordinator';
 import { CATCH_UP_WINDOW_MS, MAX_DELIVERY_PAGES, MAX_REDELIVERIES, RECONCILER_NAME, REDELIVERY_WINDOW_MS, SUBREQUEST_BUDGET } from '../src/reconciler';
 import { routeDelivery, type Target } from '../src/routing';
-import { coordinator, freezeClock, INSTALLATION_ID, OWNER, postWebhook, RUNTIME_ENV, setDispatchEnabled, tableNames, TEST_ENV, workRows } from './helpers';
+import { coordinator, freezeClock, INSTALLATION_ID, logged, OWNER, postWebhook, RUNTIME_ENV, setDispatchEnabled, tableNames, TEST_ENV, workRows } from './helpers';
 import { DISPATCH_WORKFLOW_YAML, EVENT_WORKFLOW_YAML, pullRequestEvent, workflowsReply } from './payloads';
 
 const MINUTE = 60_000;
@@ -766,7 +766,3 @@ describe('cron trigger', () => {
     expect(github.calls).toBeGreaterThanOrEqual(1);
   });
 });
-
-function logged(spy: { mock: { calls: unknown[][] } }, msg: string): Record<string, unknown>[] {
-  return spy.mock.calls.map((call) => JSON.parse(String(call[0]))).filter((line) => line.msg === msg);
-}
