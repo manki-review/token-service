@@ -865,7 +865,6 @@ describe('PrCoordinator dispatch', () => {
       last_reviewed: null,
       last_approval: null,
       pause: null,
-      settings: { paused: false, full_review: false, deeper_review: false, review_draft: false, force_review: false },
     });
 
     // Only the active run may report, and a replayed report writes nothing.

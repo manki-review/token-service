@@ -105,29 +105,18 @@ interface PendingReaction {
 
 export type ReceiveResult = { accepted: false; reason: string } | { accepted: true; effect: string };
 
-/** The boxes of Manki's progress comment a writer ticks. `paused` stays until unticked, the others clear after their run. */
-export interface PrSettings {
-  paused: boolean;
-  full_review: boolean;
-  deeper_review: boolean;
-  review_draft: boolean;
-  force_review: boolean;
-}
-
 /** What the PR's runs reported, as stored. Times are in milliseconds. */
 interface ReportedState {
   last_reviewed: { commit: string; run_id: number; at: number } | null;
   last_approval: { commit: string; held: boolean; run_id: number; at: number } | null;
   /** The automatic pause the Action decided from the round history, such as the round cap. */
   pause: { reason: string; at: number } | null;
-  settings: PrSettings;
 }
 
 const EMPTY_STATE: ReportedState = {
   last_reviewed: null,
   last_approval: null,
   pause: null,
-  settings: { paused: false, full_review: false, deeper_review: false, review_draft: false, force_review: false },
 };
 
 /** What a run of the PR reports. A field left out keeps its value, and `pause: null` lifts the pause. */
@@ -144,7 +133,6 @@ export interface PrState {
   last_reviewed: { commit: string; run_id: number; at: string } | null;
   last_approval: { commit: string; held: boolean; run_id: number; at: string } | null;
   pause: { reason: string; at: string } | null;
-  settings: PrSettings;
 }
 
 export type ReportResult = { accepted: false; reason: string } | { accepted: true; changed: string[] };
@@ -332,8 +320,7 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /** Returns the PR's running state. Writes nothing, so asking about a PR without state creates none. */
   async state(): Promise<PrState> {
-    const reported = this.reported();
-    const { last_reviewed: reviewed, last_approval: approval, pause } = reported;
+    const { last_reviewed: reviewed, last_approval: approval, pause } = this.reported();
     const work = this.hasState() ? this.sql.exec<WorkRow>(`SELECT * FROM work WHERE status = 'queued' OR ${ACTIVE} ORDER BY id`).toArray() : [];
     return {
       active: work.filter((row) => row.status !== 'queued').map((row) => ({
@@ -346,7 +333,6 @@ export class PrCoordinator extends DurableObject<Env> {
       last_reviewed: reviewed && { ...reviewed, at: iso(reviewed.at) },
       last_approval: approval && { ...approval, at: iso(approval.at) },
       pause: pause && { ...pause, at: iso(pause.at) },
-      settings: reported.settings,
     };
   }
 
@@ -385,7 +371,7 @@ export class PrCoordinator extends DurableObject<Env> {
       this.ensureSchema();
       stored = this.getMeta<Partial<ReportedState>>('pr_state');
     }
-    return { ...EMPTY_STATE, ...stored, settings: { ...EMPTY_STATE.settings, ...stored?.settings } };
+    return { ...EMPTY_STATE, ...stored };
   }
 
   /**
