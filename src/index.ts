@@ -8,6 +8,7 @@ import { RECONCILER_NAME } from './reconciler';
 import { handleWebhook } from './webhook';
 
 export { PrCoordinator } from './coordinator';
+export { InstallationLimiter } from './limiter';
 export { Reconciler } from './reconciler';
 
 // Only this name is minted, so a token for one installation account can never write another account's memory.

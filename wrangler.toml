@@ -16,6 +16,10 @@ class_name = "PrCoordinator"
 name = "RECONCILER"
 class_name = "Reconciler"
 
+[[durable_objects.bindings]]
+name = "INSTALLATION_LIMITER"
+class_name = "InstallationLimiter"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["PrCoordinator"]
@@ -23,6 +27,10 @@ new_sqlite_classes = ["PrCoordinator"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["Reconciler"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["InstallationLimiter"]
 
 [triggers]
 crons = ["*/5 * * * *"]

@@ -1,6 +1,8 @@
+import { runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { verifyWebhookSignature } from '../src/signature';
 import worker from '../src/index';
+import { DEFAULT_EVENTS_PER_HOUR, eventsPerHour, InstallationLimiter } from '../src/limiter';
 import { coordinator, DELIVERY_ID, freezeClock, logged, OIDC_AUDIENCE, postWebhook, signWebhook, stubGitHub, TEST_ENV, workRows } from './helpers';
 import { HEAD_SHA, issueCommentEvent, PR_NUMBER, pullRequestEvent, REPOSITORY_ID, reviewThreadEvent, workflowRunEvent } from './payloads';
 
@@ -38,8 +40,10 @@ describe('verifyWebhookSignature', () => {
 });
 
 describe('/webhook', () => {
+  let advanceClock: (ms: number) => number;
+
   beforeEach(() => {
-    freezeClock();
+    advanceClock = freezeClock();
   });
 
   afterEach(() => {
@@ -139,6 +143,42 @@ describe('/webhook', () => {
     const env = { ...TEST_ENV, WEBHOOK_REPOS: ` 1, ${REPOSITORY_ID} ,3` };
     expect((await postWebhook({ event: 'issue_comment', payload: issueCommentEvent('@manki explain', { number: 33 }), env })).status).toBe(202);
     expect(await workRows(coordinator(REPOSITORY_ID, 33))).toHaveLength(1);
+  });
+
+  it('ignores deliveries over the installation cap until the next hour, without touching their coordinators', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const installation = 5151;
+    const env = { ...TEST_ENV, INSTALLATION_EVENTS_PER_HOUR: '2' };
+    const send = (number: number, installationId = installation) => postWebhook({
+      event: 'issue_comment',
+      payload: { ...issueCommentEvent('@manki explain', { number }), installation: { id: installationId } },
+      env,
+    });
+    for (const number of [61, 62, 63]) expect((await send(number)).status).toBe(202);
+    expect(logged(log, 'webhook').map((line) => line.reason ?? line.route)).toEqual(['chat', 'chat', `installation ${installation} is over 2 events this hour`]);
+    expect(await workRows(coordinator(REPOSITORY_ID, 62))).toHaveLength(1);
+    expect(await workRows(coordinator(REPOSITORY_ID, 63))).toEqual([]);
+    // Another installation has its own count.
+    expect((await send(64, installation + 1)).status).toBe(202);
+    expect(await workRows(coordinator(REPOSITORY_ID, 64))).toHaveLength(1);
+    // The count is stored, so an instance that starts after an eviction keeps refusing.
+    const limiter = TEST_ENV.INSTALLATION_LIMITER.getByName(String(installation));
+    expect(await runInDurableObject(limiter, (_instance, state) => new InstallationLimiter(state, TEST_ENV).take(2))).toBe(false);
+
+    advanceClock(60 * 60_000);
+    expect((await send(65)).status).toBe(202);
+    expect(await workRows(coordinator(REPOSITORY_ID, 65))).toHaveLength(1);
+  });
+
+  it.each([
+    ['unset', undefined, DEFAULT_EVENTS_PER_HOUR],
+    ['empty', '', DEFAULT_EVENTS_PER_HOUR],
+    ['zero', '0', DEFAULT_EVENTS_PER_HOUR],
+    ['not a number', 'many', DEFAULT_EVENTS_PER_HOUR],
+    ['a fraction', '1.5', DEFAULT_EVENTS_PER_HOUR],
+    ['a whole number', ' 20 ', 20],
+  ])('reads the installation cap when it is %s', (_case, value, expected) => {
+    expect(eventsPerHour({ ...TEST_ENV, INSTALLATION_EVENTS_PER_HOUR: value })).toBe(expected);
   });
 
   it('leaves the coordinator alone for an ignored delivery', async () => {

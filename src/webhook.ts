@@ -1,4 +1,5 @@
 import { allowedRepos, type Env } from './env';
+import { eventsPerHour } from './limiter';
 import { log } from './log';
 import { routeDelivery, type Route, type WebhookPayload } from './routing';
 import { sha256Hex, verifyWebhookSignature } from './signature';
@@ -97,9 +98,21 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
   const routed = routeDelivery(event, payload);
   // Every routed delivery writes Durable Object storage, which the account's daily row quota pays for. Only the
   // listed repositories may spend it, so a script on another installation cannot use it up.
-  const route: Route = routed.type !== 'ignore' && !allowedRepos(env).has(routed.target.repositoryId)
+  let route: Route = routed.type !== 'ignore' && !allowedRepos(env).has(routed.target.repositoryId)
     ? { type: 'ignore', reason: `repository ${routed.target.repositoryId} is not in WEBHOOK_REPOS` }
     : routed;
+  // One installation may store only so many deliveries an hour, so a flood from it cannot use up the quota either.
+  if (route.type !== 'ignore') {
+    const limit = eventsPerHour(env);
+    try {
+      if (!await env.INSTALLATION_LIMITER.getByName(String(route.target.installationId)).take(limit)) {
+        route = { type: 'ignore', reason: `installation ${route.target.installationId} is over ${limit} events this hour` };
+      }
+    } catch (error) {
+      log('webhook_limiter_error', { delivery, error: String(error) });
+      return Response.json({ error: 'Could not queue the delivery' }, { status: 500 });
+    }
+  }
   log('webhook', { delivery, event, action: payload.action ?? null, ...summarize(route) });
   if (route.type !== 'ignore') {
     const coordinator = env.PR_COORDINATOR.getByName(`${route.target.repositoryId}:${route.target.number}`);
