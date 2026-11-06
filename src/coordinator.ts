@@ -950,7 +950,7 @@ export class PrCoordinator extends DurableObject<Env> {
       } else if (ticked && (REVIEW_MODES as readonly string[]).includes(box)) {
         effects.push(this.requestReview(item, box as ReviewMode));
       } else if (ticked && box === 'cancel') {
-        effects.push(await this.cancelReview(item));
+        effects.push(await this.cancelReview(item, at));
       }
     }
     if (this.isDispatching(item.id)) this.finish(item.id, 'done', effects.join(', ') || 'nothing changed');
@@ -981,9 +981,14 @@ export class PrCoordinator extends DurableObject<Env> {
     return `${mode} review in work ${review.id}`;
   }
 
-  /** Cancels the running review. A review not yet running, or one GitHub gave no run id, cannot be cancelled. */
-  private async cancelReview(item: WorkRow): Promise<string> {
-    const running = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE kind = 'review' AND status = 'running' AND run_id IS NOT NULL`).toArray()[0];
+  /**
+   * Cancels the running review, if it started before the edit at `at`, so a late Cancel cannot hit a newer run. A review
+   * not yet running, or one GitHub gave no run id, cannot be cancelled.
+   */
+  private async cancelReview(item: WorkRow, at: number): Promise<string> {
+    const running = this.sql.exec<WorkRow>(
+      `SELECT * FROM work WHERE kind = 'review' AND status = 'running' AND run_id IS NOT NULL AND dispatched_at <= ?`, at || Date.now(),
+    ).toArray()[0];
     if (!running) return 'no review to cancel';
     const target = await this.verifiedTarget();
     if (!target) throw new Error('the repository could not be read');

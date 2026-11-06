@@ -1400,6 +1400,14 @@ describe('PrCoordinator dispatch', () => {
       expect(github.cancels).toEqual([9000, 9001, 9001]);
       expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'done', note: 'cancel of work 3 requested' });
 
+      // A Cancel made before the running review started leaves it alone.
+      await pr.send('issue_comment', pr.comment('@manki review again'));
+      await runDurableObjectAlarm(pr.stub);
+      await edit([], ['cancel'], 'alice', new Date(Date.now() - MINUTE).toISOString());
+      expect(github.cancels).toEqual([9000, 9001, 9001]);
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'done', note: 'no review to cancel' });
+      await pr.stub.runCompleted(key('d-again'), 9002, 'success');
+
       // With nothing running, a Cancel tick changes nothing.
       await edit([], ['cancel']);
       expect(github.cancels).toEqual([9000, 9001, 9001]);
