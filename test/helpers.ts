@@ -24,6 +24,8 @@ export const appPrivateKeyPkcs8 = await exportPKCS8(appKeys.privateKey);
 export const appPrivateKeyPkcs1 = pkcs1Pem(appPrivateKeyPkcs8);
 
 const oidcJwk = { ...(await exportJWK(oidcKeys.publicKey)), kid: OIDC_KID, alg: 'RS256', use: 'sig' };
+/** The reply to `JWKS_URL`, which holds the key `oidcToken` signs with. */
+export const OIDC_JWKS = { keys: [oidcJwk] };
 
 export const WEBHOOK_SECRET = 'test-webhook-secret';
 
@@ -129,7 +131,7 @@ export function stubGitHub(stub: GitHubStub = {}): Request[] {
     if (typeof handler === 'function') return handler(request);
     if (handler) return reply(handler, {});
     if (request.url === JWKS_URL) {
-      return Response.json({ keys: [oidcJwk] });
+      return Response.json(OIDC_JWKS);
     }
     if (/^\/repositories\/[0-9]+$/.test(url.pathname)) {
       return reply(stub.repository, { name: REPO, owner: { login: OWNER, id: OWNER_ID }, default_branch: 'main' });
@@ -161,12 +163,14 @@ export function apiRequests(requests: Request[]): Request[] {
 }
 
 export interface PostTokenOptions {
+  /** The endpoint, `/token` when left out. */
+  path?: string;
   token?: string | null;
   body?: unknown;
   env?: Env;
 }
 
-/** Sends a `/token` request to the Worker. A missing `token` means a fresh valid OIDC token. */
+/** Sends a request to an OIDC endpoint of the Worker, `/token` by default. A missing `token` means a fresh valid OIDC token. */
 export async function postToken(options: PostTokenOptions = {}): Promise<Response> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   const token = options.token === undefined ? await oidcToken() : options.token;
@@ -174,7 +178,7 @@ export async function postToken(options: PostTokenOptions = {}): Promise<Respons
     headers.Authorization = `Bearer ${token}`;
   }
   const body = typeof options.body === 'string' ? options.body : JSON.stringify(options.body ?? { owner: OWNER, repo: REPO });
-  const request = new Request(`https://${OIDC_AUDIENCE}/token`, { method: 'POST', headers, body });
+  const request = new Request(`https://${OIDC_AUDIENCE}${options.path ?? '/token'}`, { method: 'POST', headers, body });
   return worker.fetch(request, options.env ?? TEST_ENV);
 }
 

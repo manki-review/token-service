@@ -78,6 +78,7 @@ export type Route =
   | { type: 'work'; target: Target; work: Work }
   | { type: 'close'; target: Target; merged: Work | null }
   | { type: 'seen'; target: Target; headSha: string }
+  | { type: 'reopen'; target: Target }
   | { type: 'run_completed'; target: Target; runId: number; conclusion: string | null };
 
 interface User {
@@ -244,6 +245,8 @@ export function routeDelivery(event: string, payload: WebhookPayload, now = Date
 
 function routePullRequest(target: Target, payload: WebhookPayload): Route {
   const { action } = payload;
+  // A reopen queues no review, but the coordinator keeps the PR's state as for an open PR again.
+  if (action === 'reopened') return { type: 'reopen', target };
   if (action !== 'opened' && action !== 'synchronize' && action !== 'ready_for_review') {
     return ignore(`pull_request action ${action}`);
   }

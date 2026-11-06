@@ -13,8 +13,13 @@ const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
 
-/** How long a delivery's id and body hash are remembered. Longer than the 3 days in which GitHub can redeliver it. */
+/**
+ * How long a delivery's id and body hash are remembered, and how long a closed PR's state is kept after its close.
+ * Longer than the 3 days in which GitHub can redeliver a delivery.
+ */
 export const DELIVERY_RETENTION_MS = 7 * DAY;
+/** An open PR's state is kept this long after its last delivery, in case its close was never seen. */
+export const IDLE_RETENTION_MS = 90 * DAY;
 /** A queued item older than this is dropped. A review is derived from the current head anyway. */
 export const QUEUED_MAX_AGE_MS = DAY;
 export const OPT_IN_TTL_MS = 5 * MINUTE;
@@ -99,6 +104,40 @@ interface PendingReaction {
 }
 
 export type ReceiveResult = { accepted: false; reason: string } | { accepted: true; effect: string };
+
+/** What the PR's runs reported, as stored. Times are in milliseconds. */
+interface ReportedState {
+  last_reviewed: { commit: string; run_id: number; at: number } | null;
+  last_approval: { commit: string; held: boolean; run_id: number; at: number } | null;
+  /** The automatic pause the Action decided from the round history, such as the round cap. */
+  pause: { reason: string; at: number } | null;
+}
+
+const EMPTY_STATE: ReportedState = {
+  last_reviewed: null,
+  last_approval: null,
+  pause: null,
+};
+
+/** What a run of the PR reports. A field left out keeps its value, and `pause: null` lifts the pause. */
+export interface StateReport {
+  reviewed?: { commit: string };
+  approval?: { commit: string; held: boolean };
+  pause?: { reason: string } | null;
+}
+
+/** The PR's running state as `/state` returns it. Times are ISO strings. */
+export interface PrState {
+  active: Array<{ lane: Lane; run_id: number | null; kind: Work['kind']; event: string; head_sha: string | null; dispatched_at: string | null }>;
+  queue: Array<{ lane: Lane; kind: Work['kind']; event: string; head_sha: string | null; enqueued_at: string }>;
+  last_reviewed: { commit: string; run_id: number; at: string } | null;
+  last_approval: { commit: string; held: boolean; run_id: number; at: string } | null;
+  pause: { reason: string; at: string } | null;
+}
+
+export type ReportResult = { accepted: false; reason: string } | { accepted: true; changed: string[] };
+
+const iso = (at: number) => new Date(at).toISOString();
 
 // Each entry runs once, in order. Append new entries; never edit a shipped one.
 export const MIGRATIONS = [
@@ -218,9 +257,13 @@ export class PrCoordinator extends DurableObject<Env> {
   async receive(delivery: Delivery, route: Extract<Route, { type: 'work' | 'close' }>): Promise<ReceiveResult> {
     // A close that neither drops work nor records a merge writes nothing, so closing and reopening in a loop costs no rows.
     if (route.type === 'close' && !route.merged && !this.hasPendingWork()) {
-      const result: ReceiveResult = { accepted: true, effect: 'closed, nothing queued' };
+      const recorded = this.hasState() ? this.recordClose(delivery, Date.now()) : 'unchanged';
+      const result: ReceiveResult = recorded === 'duplicate'
+        ? { accepted: false, reason: 'duplicate delivery' }
+        : { accepted: true, effect: 'closed, nothing queued' };
       const { owner, repo, number } = route.target;
       log('coordinator_receive', { repo: `${owner}/${repo}`, pr: number, delivery: delivery.id, ...result });
+      if (recorded === 'recorded') await this.scheduleNext();
       return result;
     }
     this.ensureSchema();
@@ -232,12 +275,14 @@ export class PrCoordinator extends DurableObject<Env> {
       this.setMeta('target', route.target);
 
       if (route.type === 'close') {
+        this.setMeta('closed_at', now);
         const dropped = this.sql.exec(
           `UPDATE work SET status = 'dropped', note = 'pull request closed' WHERE status IN ('queued', 'dispatching') RETURNING id`,
         ).toArray().length;
         const merged = route.merged ? `, queued ${this.insert(route.merged, delivery.id, now)}` : '';
         return { accepted: true, effect: `closed, dropped ${dropped}${merged}` };
       }
+      this.sql.exec(`DELETE FROM meta WHERE key = 'closed_at'`);
       if (route.work.kind === 'review' && route.work.event.startsWith('pull_request.')) {
         // A late redelivery of the push, after a catch-up already reviews this head, must not review it twice.
         const state = this.reviewState(route.work.headSha);
@@ -273,6 +318,62 @@ export class PrCoordinator extends DurableObject<Env> {
     return null;
   }
 
+  /** Returns the PR's running state. Writes nothing, so asking about a PR without state creates none. */
+  async state(): Promise<PrState> {
+    const { last_reviewed: reviewed, last_approval: approval, pause } = this.reported();
+    const work = this.hasState() ? this.sql.exec<WorkRow>(`SELECT * FROM work WHERE status = 'queued' OR ${ACTIVE} ORDER BY id`).toArray() : [];
+    return {
+      active: work.filter((row) => row.status !== 'queued').map((row) => ({
+        lane: row.lane, run_id: row.run_id, kind: row.kind, event: row.event, head_sha: row.head_sha,
+        dispatched_at: row.dispatched_at === null ? null : iso(row.dispatched_at),
+      })),
+      queue: work.filter((row) => row.status === 'queued').map((row) => ({
+        lane: row.lane, kind: row.kind, event: row.event, head_sha: row.head_sha, enqueued_at: iso(row.enqueued_at),
+      })),
+      last_reviewed: reviewed && { ...reviewed, at: iso(reviewed.at) },
+      last_approval: approval && { ...approval, at: iso(approval.at) },
+      pause: pause && { ...pause, at: iso(pause.at) },
+    };
+  }
+
+  /**
+   * Stores what run `runId` reports about the PR. Only a run this coordinator dispatched and still tracks as dispatching
+   * or running may report. A report that changes nothing writes nothing.
+   */
+  async report(runId: number, report: StateReport): Promise<ReportResult> {
+    const active = this.hasState()
+      && this.sql.exec(`SELECT 1 FROM work WHERE run_id = ? AND ${ACTIVE}`, runId).toArray().length > 0;
+    if (!active) return { accepted: false, reason: `run ${runId} is not active on this PR` };
+    const now = Date.now();
+    const state = this.reported();
+    const changed: string[] = [];
+    const { reviewed, approval, pause } = report;
+    if (reviewed && (state.last_reviewed?.commit !== reviewed.commit || state.last_reviewed.run_id !== runId)) {
+      state.last_reviewed = { commit: reviewed.commit, run_id: runId, at: now };
+      changed.push('reviewed');
+    }
+    const lastApproval = state.last_approval;
+    if (approval && (lastApproval?.commit !== approval.commit || lastApproval.held !== approval.held || lastApproval.run_id !== runId)) {
+      state.last_approval = { commit: approval.commit, held: approval.held, run_id: runId, at: now };
+      changed.push('approval');
+    }
+    if (pause !== undefined && (state.pause?.reason ?? null) !== (pause?.reason ?? null)) {
+      state.pause = pause && { reason: pause.reason, at: now };
+      changed.push('pause');
+    }
+    if (changed.length > 0) this.setMeta('pr_state', state);
+    return { accepted: true, changed };
+  }
+
+  private reported(): ReportedState {
+    let stored: Partial<ReportedState> | null = null;
+    if (this.hasState()) {
+      this.ensureSchema();
+      stored = this.getMeta<Partial<ReportedState>>('pr_state');
+    }
+    return { ...EMPTY_STATE, ...stored };
+  }
+
   /**
    * Where `head` stands for the cron. It is `handled` once a review run of it succeeded or a bot pushed it, `pending`
    * while a review is queued or running, and `needed` otherwise, also when that review was skipped, dropped or failed.
@@ -298,6 +399,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const work: Work = { lane: 'state', kind: 'review', event: 'pull_request.synchronize', headSha: head, objectId: null, sender: '', trusted: true, acknowledge: false, writer: true };
     const effect = this.ctx.storage.transactionSync(() => {
       this.sql.exec('INSERT OR REPLACE INTO deliveries (id, received_at) VALUES (?, ?)', delivery, now);
+      this.sql.exec(`DELETE FROM meta WHERE key = 'closed_at'`);
       this.setMeta('target', target);
       return this.enqueue(work, delivery, now);
     });
@@ -454,11 +556,51 @@ export class PrCoordinator extends DurableObject<Env> {
     }
   }
 
-  /** Deletes all storage once nothing is pending and the newest delivery has aged out. */
-  private async cleanUpWhenIdle(): Promise<boolean> {
-    const pending = this.sql.exec(`SELECT 1 FROM work WHERE status = 'queued' OR ${ACTIVE}`).toArray().length > 0;
+  /** Clears the PR's recorded close, so its state is kept as for an open PR. Writes nothing when none is recorded. */
+  async reopen(): Promise<void> {
+    if (!this.hasState()) return;
+    this.ensureSchema();
+    if (this.sql.exec(`DELETE FROM meta WHERE key = 'closed_at' RETURNING key`).toArray().length === 0) return;
+    log('coordinator_reopened', this.logFields());
+    await this.scheduleNext();
+  }
+
+  /** Whether an item is queued, dispatching or running. */
+  private hasUnfinishedWork(): boolean {
+    return this.sql.exec(`SELECT 1 FROM work WHERE status = 'queued' OR ${ACTIVE}`).toArray().length > 0;
+  }
+
+  /**
+   * Records the PR's close and its delivery, so a redelivered close cannot mark the PR closed again after a reopen.
+   * Writes nothing when the delivery was seen or a close is recorded already.
+   */
+  private recordClose(delivery: Delivery, now: number): 'recorded' | 'duplicate' | 'unchanged' {
+    this.ensureSchema();
+    return this.ctx.storage.transactionSync(() => {
+      if (this.isReplay(delivery)) return 'duplicate';
+      if (this.getMeta<number>('closed_at') !== null) return 'unchanged';
+      this.remember(delivery, now);
+      this.setMeta('closed_at', now);
+      return 'recorded';
+    });
+  }
+
+  /**
+   * Returns when the storage may go: a week after the PR closed, or `IDLE_RETENTION_MS` after the last delivery of a PR
+   * still open. A reopen or work queued after the close clears the close. Null when there is neither.
+   */
+  private retainUntil(): number | null {
+    const closedAt = this.getMeta<number>('closed_at');
+    if (closedAt !== null) return closedAt + DELIVERY_RETENTION_MS;
     const newest = this.sql.exec<{ at: number | null }>('SELECT MAX(received_at) AS at FROM deliveries').one().at;
-    if (pending || (newest !== null && Date.now() - newest < DELIVERY_RETENTION_MS)) return false;
+    return newest === null ? null : newest + IDLE_RETENTION_MS;
+  }
+
+  /** Deletes all storage once nothing is queued, dispatching or running and the retention ran out. */
+  private async cleanUpWhenIdle(): Promise<boolean> {
+    const pending = this.hasUnfinishedWork();
+    const until = this.retainUntil();
+    if (pending || (until !== null && Date.now() < until)) return false;
     log('coordinator_deleted', this.logFields());
     await this.ctx.storage.deleteAll();
     // The instance can stay in memory, so the next delivery must create the tables again.
@@ -932,8 +1074,10 @@ export class PrCoordinator extends DurableObject<Env> {
       if (active?.at) times.push(active.at);
       else if (next) times.push(next.check_at ?? now);
     }
-    const newest = this.sql.exec<{ at: number | null }>('SELECT MAX(received_at) AS at FROM deliveries').one().at;
-    if (newest !== null) times.push(newest + DELIVERY_RETENTION_MS);
+    // Past the retention an active item keeps the storage, and its own times wake the alarm.
+    const until = this.retainUntil();
+    const pending = this.hasUnfinishedWork();
+    if (until !== null && (until > now || !pending)) times.push(until);
     if (times.length > 0) await this.ctx.storage.setAlarm(Math.max(now, Math.min(...times)));
   }
 }

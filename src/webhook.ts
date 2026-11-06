@@ -22,6 +22,8 @@ function summarize(route: Route): Record<string, unknown> {
       return { route: 'close', pr: route.target.number, repository_id: route.target.repositoryId, merged: route.merged !== null };
     case 'seen':
       return { route: 'seen', pr: route.target.number, repository_id: route.target.repositoryId, head_sha: route.headSha };
+    case 'reopen':
+      return { route: 'reopen', pr: route.target.number, repository_id: route.target.repositoryId };
     case 'run_completed':
       return { route: 'run_completed', pr: route.target.number, run_id: route.runId, conclusion: route.conclusion };
   }
@@ -127,6 +129,7 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
     try {
       if (route.type === 'run_completed') await coordinator.runCompleted(key, route.runId, route.conclusion);
       else if (route.type === 'seen') await coordinator.markSeen(key, route.target, route.headSha);
+      else if (route.type === 'reopen') await coordinator.reopen();
       else stored = (await coordinator.receive(key, route)).accepted;
     } catch (error) {
       log('webhook_coordinator_error', { delivery, error: String(error) });

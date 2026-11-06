@@ -39,3 +39,37 @@ export async function verifyGitHubOIDC(token: string, expectedRepo: string): Pro
 
   return claims;
 }
+
+/** A workflow's request: its JSON body, which names the repository, and the verified claims of its OIDC token. */
+export interface WorkflowRequest {
+  claims: OIDCClaims;
+  body: Record<string, unknown> & { owner: string; repo: string };
+}
+
+/**
+ * Reads a request that carries a GitHub Actions OIDC token as its bearer token and a JSON body naming `owner` and
+ * `repo`. Returns the error response when the token is missing or not from a workflow in that repository.
+ */
+export async function verifyWorkflowRequest(request: Request): Promise<WorkflowRequest | Response> {
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return Response.json({ error: 'Authorization header with Bearer token required' }, { status: 401 });
+  }
+
+  let parsed: Record<string, unknown> | null;
+  try {
+    parsed = await request.json();
+  } catch {
+    return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
+  }
+  if (typeof parsed?.owner !== 'string' || typeof parsed?.repo !== 'string' || !parsed.owner || !parsed.repo) {
+    return Response.json({ error: 'owner and repo are required' }, { status: 400 });
+  }
+  const body = { ...parsed, owner: parsed.owner, repo: parsed.repo };
+
+  try {
+    return { claims: await verifyGitHubOIDC(authHeader.slice(7), `${body.owner}/${body.repo}`), body };
+  } catch (error) {
+    return Response.json({ error: `OIDC verification failed: ${error}` }, { status: 403 });
+  }
+}

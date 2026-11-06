@@ -21,7 +21,7 @@ import {
   workflowRunEvent,
 } from './payloads';
 
-/** A compact form of the route: `ignore`, `<lane>:<kind>`, `close`, `close+merged` or `run_completed`. */
+/** A compact form of the route: `ignore`, `<lane>:<kind>`, `close`, `close+merged`, `seen`, `reopen` or `run_completed`. */
 function verdict(route: Route): string {
   switch (route.type) {
     case 'ignore':
@@ -32,6 +32,8 @@ function verdict(route: Route): string {
       return route.merged ? 'close+merged' : 'close';
     case 'seen':
       return 'seen';
+    case 'reopen':
+      return 'reopen';
     case 'run_completed':
       return 'run_completed';
   }
@@ -51,7 +53,8 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['a bot push to a fork PR', 'pull_request', { ...forkPullRequestEvent('synchronize'), sender: BOT_SENDER }, 'ignore'],
   ['a PR labeled by a bot', 'pull_request', pullRequestEvent('labeled', {}, BOT_SENDER), 'ignore'],
   ['a labeled PR', 'pull_request', pullRequestEvent('labeled'), 'ignore'],
-  ['a reopened PR', 'pull_request', pullRequestEvent('reopened'), 'ignore'],
+  ['a reopened PR', 'pull_request', pullRequestEvent('reopened'), 'reopen'],
+  ['a reopened fork PR', 'pull_request', forkPullRequestEvent('reopened'), 'ignore'],
   ['a merge', 'pull_request', pullRequestEvent('closed', { merged: true }), 'close+merged'],
   ['a close without merge', 'pull_request', pullRequestEvent('closed'), 'close'],
   ['a merge by a bot', 'pull_request', pullRequestEvent('closed', { merged: true }, BOT_SENDER), 'close'],

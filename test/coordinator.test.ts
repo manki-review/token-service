@@ -6,6 +6,7 @@ import {
   DISPATCH_BACKOFF_MS,
   DISPATCHES_PER_HOUR,
   FINISHED_RETENTION_MS,
+  IDLE_RETENTION_MS,
   OPT_IN_TTL_MS,
   backoff,
   POLL_MS,
@@ -24,9 +25,13 @@ import {
   freezeClock,
   type GitHubStub,
   INSTALLATION_ID,
+  JWKS_URL,
   logged,
+  OIDC_JWKS,
+  oidcToken,
   OWNER,
   OWNER_ID,
+  postToken,
   postWebhook,
   REPO,
   setDispatchEnabled,
@@ -53,6 +58,7 @@ const SHA_1 = '1'.repeat(40);
 const SHA_2 = '2'.repeat(40);
 const SHA_3 = '3'.repeat(40);
 const MINUTE = 60_000;
+const DAY = 24 * 60 * MINUTE;
 
 const OPTED_IN: GitHubStub = { api: { 'POST /graphql': workflowsReply({ 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML }) } };
 
@@ -355,7 +361,7 @@ describe('PrCoordinator catch-up state', () => {
     expect(await pr.stub.markSeen(key('d-bot'), target(pr.number), SHA_1)).toEqual({ accepted: false, reason: 'duplicate delivery' });
     expect(await workRows(pr.stub)).toEqual([]);
     expect(await pr.stub.catchUpState(SHA_1)).toBe('handled');
-    expect(await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm())).toBe(Date.now() + DELIVERY_RETENTION_MS);
+    expect(await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm())).toBe(Date.now() + IDLE_RETENTION_MS);
   });
 });
 
@@ -527,22 +533,65 @@ describe('PrCoordinator.alarm', () => {
     expect(logged(log, 'coordinator_would_dispatch')).toEqual([]);
   });
 
-  it('deletes its storage and alarm a week after the last delivery', async () => {
+  it('deletes its storage a week after the PR closed, or after its last delivery when it stays open', async () => {
     stubGitHub(OPTED_IN);
-    const pr = pullRequest();
-    await pr.send('pull_request', pr.push(SHA_1));
-    await runDurableObjectAlarm(pr.stub);
-    const alarm = await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm());
-    expect(alarm).toBe(Date.now() + DELIVERY_RETENTION_MS);
+    const alarm = (stub: DurableObjectStub) => runInDurableObject(stub, (_instance, state) => state.storage.getAlarm());
+    const open = pullRequest();
+    await open.send('pull_request', open.push(SHA_1));
+    await runDurableObjectAlarm(open.stub);
+    expect(await alarm(open.stub)).toBe(Date.now() + IDLE_RETENTION_MS);
+
+    // A close with nothing queued writes only its time, once.
+    const closed = pullRequest();
+    await closed.send('pull_request', closed.push(SHA_1));
+    await runDurableObjectAlarm(closed.stub);
+    advanceClock(DAY);
+    expect(await closed.send('pull_request', closed.close(false))).toEqual({ accepted: true, effect: 'closed, nothing queued' });
+    const closedAt = Date.now();
+    expect(await alarm(closed.stub)).toBe(closedAt + DELIVERY_RETENTION_MS);
+    advanceClock(MINUTE);
+    await closed.send('pull_request', closed.close(false));
+    expect(await alarm(closed.stub)).toBe(closedAt + DELIVERY_RETENTION_MS);
 
     advanceClock(DELIVERY_RETENTION_MS);
-    await runDurableObjectAlarm(pr.stub);
-    expect(await workRows(pr.stub)).toEqual([]);
-    expect(await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm())).toBeNull();
-    expect(logged(log, 'coordinator_deleted')).toHaveLength(1);
+    await runDurableObjectAlarm(closed.stub);
+    expect(await tableNames(closed.stub)).toEqual([]);
+    expect(await alarm(closed.stub)).toBeNull();
+    await runDurableObjectAlarm(open.stub);
+    expect(await tableNames(open.stub)).not.toEqual([]);
+
+    advanceClock(IDLE_RETENTION_MS);
+    await runDurableObjectAlarm(open.stub);
+    expect(await tableNames(open.stub)).toEqual([]);
+    expect(logged(log, 'coordinator_deleted')).toHaveLength(2);
 
     // The same instance keeps working after the cleanup.
-    expect(await pr.send('pull_request', pr.push(SHA_2))).toEqual({ accepted: true, effect: 'queued work 1' });
+    expect(await open.send('pull_request', open.push(SHA_2))).toEqual({ accepted: true, effect: 'queued work 1' });
+
+    // Work queued after the close, as on a reopened PR, counts it as open again.
+    const reopened = pullRequest();
+    await reopened.send('pull_request', reopened.push(SHA_1));
+    await reopened.send('pull_request', reopened.close(false));
+    await runDurableObjectAlarm(reopened.stub);
+    expect(await alarm(reopened.stub)).toBe(Date.now() + DELIVERY_RETENTION_MS);
+    advanceClock(DAY);
+    await reopened.send('issue_comment', reopened.comment('@manki explain'));
+    expect(await alarm(reopened.stub)).toBe(Date.now());
+    await runDurableObjectAlarm(reopened.stub);
+    expect(await alarm(reopened.stub)).toBe(Date.now() + IDLE_RETENTION_MS);
+
+    // So does a reopen alone, which queues no work. A redelivered close does not mark the PR closed again.
+    const quiet = pullRequest();
+    await quiet.send('pull_request', quiet.push(SHA_1), 'd-quiet');
+    await quiet.send('pull_request', quiet.close(false), 'd-close');
+    await runDurableObjectAlarm(quiet.stub);
+    advanceClock(DAY);
+    expect((await postWebhook({ event: 'pull_request', payload: pullRequestEvent('reopened', { number: quiet.number }) })).status).toBe(202);
+    expect(await workRows(quiet.stub)).toMatchObject([{ status: 'dropped' }]);
+    expect(logged(log, 'coordinator_reopened')).toHaveLength(1);
+    expect(await alarm(quiet.stub)).toBe(Date.now() - DAY + IDLE_RETENTION_MS);
+    expect(await quiet.send('pull_request', quiet.close(false), 'd-close')).toEqual({ accepted: false, reason: 'duplicate delivery' });
+    expect(await alarm(quiet.stub)).toBe(Date.now() - DAY + IDLE_RETENTION_MS);
   });
 });
 
@@ -664,6 +713,7 @@ function fakeGitHub(number: number) {
       const found = state.runs.get(Number(run[1]));
       return found ? Response.json(found) : Response.json({ message: 'Not Found' }, { status: 404 });
     }
+    if (request.url === JWKS_URL) return Response.json(OIDC_JWKS);
     throw new Error(`Unexpected fetch: ${route}`);
   });
   return state;
@@ -793,6 +843,121 @@ describe('PrCoordinator dispatch', () => {
     expect(logged(log, 'coordinator_run_completed')).toMatchObject([{ accepted: false, reason: 'no coordinator state' }]);
     expect(await tableNames(stub)).toEqual([]);
     expect(await runInDurableObject(stub, (_instance, state) => state.storage.getAlarm())).toBeNull();
+  });
+
+  it('keeps the running state and the reports of the active run across a review, a failure and a cancel', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    const call = async (path: string, body: Record<string, unknown> = {}, runId = '9000') => {
+      const token = await oidcToken({ claims: { repository_id: String(REPOSITORY_ID), run_id: runId } });
+      const response = await postToken({ path, token, body: { owner: OWNER, repo: REPO, pr: pr.number, ...body } });
+      return { status: response.status, body: await response.json() as Record<string, unknown> };
+    };
+    const state = async () => (await call('/state')).body;
+    const reviewed = { reviewed: { commit: SHA_1 }, approval: { commit: SHA_1, held: true }, pause: { reason: 'Round cap reached.' } };
+
+    await pr.send('pull_request', pr.push(SHA_1));
+    await runDurableObjectAlarm(pr.stub);
+    await pr.send('pull_request', pr.push(SHA_2));
+    expect(await state()).toEqual({
+      active: [{ lane: 'state', run_id: 9000, kind: 'review', event: 'pull_request.synchronize', head_sha: SHA_1, dispatched_at: new Date().toISOString() }],
+      queue: [{ lane: 'state', kind: 'review', event: 'pull_request.synchronize', head_sha: SHA_2, enqueued_at: new Date().toISOString() }],
+      last_reviewed: null,
+      last_approval: null,
+      pause: null,
+    });
+
+    // Only the active run may report, and a replayed report writes nothing.
+    expect(await call('/state/report', reviewed, '1234')).toEqual({ status: 403, body: { error: 'run 1234 is not active on this PR' } });
+    expect(await call('/state/report', reviewed)).toEqual({ status: 200, body: { changed: ['reviewed', 'approval', 'pause'] } });
+    const at = new Date().toISOString();
+    advanceClock(MINUTE);
+    expect(await call('/state/report', reviewed)).toEqual({ status: 200, body: { changed: [] } });
+    expect(logged(log, 'state_report')).toEqual([
+      expect.objectContaining({ pr: pr.number, run_id: 1234, accepted: false }),
+      expect.objectContaining({ pr: pr.number, run_id: 9000, reviewed: { commit: SHA_1 }, accepted: true, changed: ['reviewed', 'approval', 'pause'] }),
+      expect.objectContaining({ pr: pr.number, run_id: 9000, accepted: true, changed: [] }),
+    ]);
+    expect(log.mock.calls.flat().join('\n')).not.toContain('Bearer');
+    const afterReview = {
+      last_reviewed: { commit: SHA_1, run_id: 9000, at },
+      last_approval: { commit: SHA_1, held: true, run_id: 9000, at },
+      pause: { reason: 'Round cap reached.', at },
+    };
+    expect(await state()).toMatchObject(afterReview);
+
+    // A run that fails and one that is cancelled leave the reported state as it was.
+    expect(await pr.stub.runCompleted(key('d-1'), 9000, 'success')).toMatchObject({ accepted: true });
+    expect(await call('/state/report', { pause: null })).toEqual({ status: 403, body: { error: 'run 9000 is not active on this PR' } });
+    github.head = SHA_2;
+    await runDurableObjectAlarm(pr.stub);
+    expect(await state()).toMatchObject({ active: [{ run_id: 9001, head_sha: SHA_2 }], queue: [], ...afterReview });
+    expect(await pr.stub.runCompleted(key('d-2'), 9001, 'failure')).toMatchObject({ accepted: true });
+    github.head = SHA_3;
+    await pr.send('pull_request', pr.push(SHA_3));
+    await runDurableObjectAlarm(pr.stub);
+    expect(await pr.stub.runCompleted(key('d-3'), 9002, 'cancelled')).toMatchObject({ accepted: true });
+    expect(await state()).toMatchObject({ active: [], queue: [], ...afterReview });
+
+    // A later run lifts the pause and records its own review.
+    github.head = SHA_2;
+    await pr.send('pull_request', pr.push(SHA_2));
+    await runDurableObjectAlarm(pr.stub);
+    expect(await call('/state/report', { reviewed: { commit: SHA_2 }, pause: null }, '9003')).toEqual({ status: 200, body: { changed: ['reviewed', 'pause'] } });
+    expect(await state()).toMatchObject({ last_reviewed: { commit: SHA_2, run_id: 9003 }, pause: null, last_approval: afterReview.last_approval });
+  });
+
+  it('keeps a closed PR while its run is still running, then deletes it a week after the close', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    await pr.send('pull_request', pr.push(SHA_1));
+    await runDurableObjectAlarm(pr.stub);
+    expect(await pr.send('pull_request', pr.close(false))).toEqual({ accepted: true, effect: 'closed, nothing queued' });
+    github.cancelStatuses = [500, 500];
+    advanceClock(DELIVERY_RETENTION_MS + 1);
+    await runDurableObjectAlarm(pr.stub);
+    expect(logged(log, 'coordinator_deleted')).toEqual([]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'running', run_id: 9000 }]);
+    // The past retention date does not wake the alarm at once. The next poll does.
+    expect(await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm())).toBeGreaterThan(Date.now());
+
+    // The run's end arrives after the close and does not count the PR as open again.
+    expect(await pr.stub.runCompleted(key('d-end'), 9000, 'success')).toMatchObject({ accepted: true });
+    await runDurableObjectAlarm(pr.stub);
+    expect(await tableNames(pr.stub)).toEqual([]);
+  });
+
+  it('returns an empty state for a PR it never saw, without creating storage', async () => {
+    const pr = pullRequest();
+    fakeGitHub(pr.number);
+    const token = await oidcToken({ claims: { repository_id: String(REPOSITORY_ID), run_id: '9000' } });
+    const response = await postToken({ path: '/state', token, body: { owner: OWNER, repo: REPO, pr: pr.number } });
+    expect(await response.json()).toMatchObject({ active: [], queue: [], last_reviewed: null, last_approval: null, pause: null });
+    const report = await postToken({ path: '/state/report', token, body: { owner: OWNER, repo: REPO, pr: pr.number, pause: null } });
+    expect(report.status).toBe(403);
+    expect(await tableNames(pr.stub)).toEqual([]);
+  });
+
+  it.each([
+    ['a missing PR', {}, undefined, 400, 'pr must be a positive integer'],
+    ['a PR given as a string', { pr: '7' }, undefined, 400, 'pr must be a positive integer'],
+    ['a short commit', { pr: 7, reviewed: { commit: 'abc1234' } }, undefined, 400, 'reviewed must be { commit } with a full commit SHA'],
+    ['an approval without held', { pr: 7, approval: { commit: SHA_1 } }, undefined, 400, 'approval must be { commit, held } with a full commit SHA'],
+    ['an empty pause reason', { pr: 7, pause: { reason: '' } }, undefined, 400, 'pause must be null or { reason } with a reason of 1 to 1024 characters'],
+    ['a pause reason over 1024 characters', { pr: 7, pause: { reason: 'x'.repeat(1025) } }, undefined, 400, 'pause must be null or { reason } with a reason of 1 to 1024 characters'],
+    ['a token without a run_id claim', { pr: 7 }, null, 403, 'OIDC token has no run_id claim'],
+  ])('refuses a report with %s', async (_case, body, runId, status, error) => {
+    fakeGitHub(7);
+    const token = await oidcToken({ claims: { repository_id: String(REPOSITORY_ID), ...(runId === null ? {} : { run_id: '9000' }) } });
+    const response = await postToken({ path: '/state/report', token, body: { owner: OWNER, repo: REPO, ...body } });
+    expect({ status: response.status, body: await response.json() }).toEqual({ status, body: { error } });
+  });
+
+  it('refuses a state request without a valid OIDC token for the repository', async () => {
+    fakeGitHub(7);
+    expect((await postToken({ path: '/state', token: null, body: { owner: OWNER, repo: REPO, pr: 7 } })).status).toBe(401);
+    const other = await oidcToken({ claims: { repository: `${OWNER}/other` } });
+    expect((await postToken({ path: '/state', token: other, body: { owner: OWNER, repo: REPO, pr: 7 } })).status).toBe(403);
   });
 
   it('ignores the end of a run it does not hold and a replayed run end', async () => {

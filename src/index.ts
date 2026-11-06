@@ -2,9 +2,10 @@ import { createAppJWT } from './app-jwt';
 import type { Env } from './env';
 import { createInstallationToken, getInstallation, type Installation, logMintedToken, type TokenAudit } from './github';
 import { log } from './log';
-import { type OIDCClaims, verifyGitHubOIDC } from './oidc';
+import { verifyWorkflowRequest } from './oidc';
 import { cappedPermissions, MANKI_PERMISSION_CAPS, MEMORY_PERMISSION_CAPS, type Permissions } from './permissions';
 import { RECONCILER_NAME } from './reconciler';
+import { handleState } from './state';
 import { handleWebhook } from './webhook';
 
 export { PrCoordinator } from './coordinator';
@@ -62,44 +63,21 @@ export default {
     if (url.pathname === '/webhook') {
       return handleWebhook(request, env);
     }
+    if (url.pathname === '/state' || url.pathname === '/state/report') {
+      return handleState(request, env, url.pathname === '/state/report');
+    }
     if (url.pathname !== '/token') {
       return Response.json({ error: 'Not found' }, { status: 404 });
     }
 
-    // Verify GitHub Actions OIDC token
-    const authHeader = request.headers.get('Authorization');
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return Response.json({ error: 'Authorization header with Bearer token required' }, { status: 401 });
-    }
-    const oidcToken = authHeader.slice(7);
-
-    let parsed: { owner?: unknown; repo?: unknown; memory?: unknown } | null;
-    try {
-      parsed = await request.json();
-    } catch {
-      return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
-    }
-
-    if (typeof parsed?.owner !== 'string' || typeof parsed?.repo !== 'string' || !parsed.owner || !parsed.repo) {
-      return Response.json({ error: 'owner and repo are required' }, { status: 400 });
-    }
+    const verified = await verifyWorkflowRequest(request);
+    if (verified instanceof Response) return verified;
+    const { claims, body: parsed } = verified;
     if (parsed.memory !== undefined && typeof parsed.memory !== 'boolean') {
       return Response.json({ error: 'memory must be a boolean' }, { status: 400 });
     }
     const body = { owner: parsed.owner, repo: parsed.repo, memory: parsed.memory === true };
 
-    const expectedRepo = `${body.owner}/${body.repo}`;
-
-    // Verify the OIDC token is from a GitHub Actions workflow in the requested repo
-    let claims: OIDCClaims;
-    try {
-      claims = await verifyGitHubOIDC(oidcToken, expectedRepo);
-    } catch (error) {
-      return Response.json(
-        { error: `OIDC verification failed: ${error}` },
-        { status: 403 },
-      );
-    }
     const repositoryId = Number(claims.repository_id);
     const workflow: WorkflowAudit = {
       repository_id: repositoryId,
