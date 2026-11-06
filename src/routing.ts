@@ -60,6 +60,12 @@ export interface Work {
   trusted: boolean;
   /** Whether the work comes from a comment that gets the eyes reaction as soon as it is queued. */
   acknowledge: boolean;
+  /**
+   * Whether someone with write access caused the work: a push to a branch of the repository, a thread resolved on a
+   * same-repository PR, a dismissed review, a Force review tick, or a comment or review by an `OWNER`, `MEMBER` or
+   * `COLLABORATOR`.
+   */
+  writer: boolean;
 }
 
 export type Route =
@@ -150,13 +156,18 @@ function isTrusted(payload: WebhookPayload): boolean {
 /** The `author_association` values Manki's `isTrustedAssociation` takes as write access. */
 const WRITER_ASSOCIATIONS = ['OWNER', 'MEMBER', 'COLLABORATOR'];
 
+/** Whether the comment's or review's author has write access, as its `author_association` shows it. */
+function isWriterAuthored(payload: WebhookPayload): boolean {
+  return WRITER_ASSOCIATIONS.includes((payload.comment ?? payload.review)?.author_association ?? '');
+}
+
 /**
  * Whether the comment is a Manki command whose author wrote it with write access, as the payload shows it. Only such a
  * comment gets the eyes reaction when it is queued, so a stranger cannot make the App react.
  */
 function isWriterCommand(payload: WebhookPayload): boolean {
   const { comment, sender } = payload;
-  return hasBotMention(comment?.body ?? '') && WRITER_ASSOCIATIONS.includes(comment?.author_association ?? '')
+  return hasBotMention(comment?.body ?? '') && isWriterAuthored(payload)
     && comment?.user?.login !== undefined && comment.user.login === sender?.login;
 }
 
@@ -170,6 +181,10 @@ function work(lane: Lane, kind: WorkKind, payload: WebhookPayload, event: string
     sender: payload.sender?.login ?? '',
     trusted: isTrusted(payload),
     acknowledge: isWriterCommand(payload),
+    // Fork heads are dropped before this, so a push and a thread resolution, which only a writer or the PR's author
+    // can make, both take write access. So does dismissing a review, whose payload names the reviewer's association.
+    writer: event === 'pull_request' || event === 'pull_request_review_thread'
+      || (event === 'pull_request_review' && payload.action === 'dismissed') || isWriterAuthored(payload),
   };
 }
 
@@ -274,7 +289,7 @@ function routeIssueComment(target: Target, payload: WebhookPayload): Route {
       return { type: 'work', target, work: work('state', 'comment', payload, 'issue_comment', objectId) };
     }
     // The association is that of Manki's comment. Editing someone else's comment takes write access, so the tick is trusted.
-    return { type: 'work', target, work: { ...work('state', 'review', payload, 'issue_comment', objectId), trusted: true, acknowledge: true } };
+    return { type: 'work', target, work: { ...work('state', 'review', payload, 'issue_comment', objectId), trusted: true, acknowledge: true, writer: true } };
   }
 
   // An edit that keeps an earlier mention is forwarded too. Manki skips one it already answered.

@@ -299,6 +299,17 @@ describe('PrCoordinator.receive', () => {
     await pr.send('pull_request', pr.push(SHA_1));
     expect(await pr.send('pull_request', pr.close(false))).toEqual({ accepted: true, effect: 'closed, dropped 1' });
     expect((await workRows(pr.stub)).map((row) => row.status)).toEqual(['dropped']);
+
+    // Closing again after a reopen has nothing to drop, so it stores nothing, not even the delivery.
+    const deliveries = () => runInDurableObject(pr.stub, (_instance, state) =>
+      state.storage.sql.exec<{ count: number }>('SELECT COUNT(*) AS count FROM deliveries').one().count);
+    const stored = await deliveries();
+    expect(await pr.send('pull_request', pr.close(false))).toEqual({ accepted: true, effect: 'closed, nothing queued' });
+    expect(await deliveries()).toBe(stored);
+
+    const unseen = pullRequest();
+    expect(await unseen.send('pull_request', unseen.close(false))).toEqual({ accepted: true, effect: 'closed, nothing queued' });
+    expect(await tableNames(unseen.stub)).toEqual([]);
   });
 });
 

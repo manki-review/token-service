@@ -1,4 +1,5 @@
 import type { PrCoordinator } from './coordinator';
+import type { InstallationLimiter } from './limiter';
 import type { Reconciler } from './reconciler';
 
 export interface Env {
@@ -13,7 +14,10 @@ export interface Env {
   DISPATCH_ENABLED?: string;
   /** Comma-separated ids of the repositories whose deliveries reach a coordinator. Any other is logged and dropped. */
   WEBHOOK_REPOS?: string;
+  /** The most deliveries per installation and clock hour that reach a coordinator. Defaults to 500. */
+  INSTALLATION_EVENTS_PER_HOUR?: string;
   PR_COORDINATOR: DurableObjectNamespace<PrCoordinator>;
+  INSTALLATION_LIMITER: DurableObjectNamespace<InstallationLimiter>;
   RECONCILER: DurableObjectNamespace<Reconciler>;
 }
 
