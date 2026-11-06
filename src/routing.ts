@@ -62,7 +62,8 @@ export interface Work {
   acknowledge: boolean;
   /**
    * Whether someone with write access caused the work: a push to a branch of the repository, a thread resolved on a
-   * same-repository PR, a Force review tick, or a comment or review by an `OWNER`, `MEMBER` or `COLLABORATOR`.
+   * same-repository PR, a dismissed review, a Force review tick, or a comment or review by an `OWNER`, `MEMBER` or
+   * `COLLABORATOR`.
    */
   writer: boolean;
 }
@@ -181,8 +182,9 @@ function work(lane: Lane, kind: WorkKind, payload: WebhookPayload, event: string
     trusted: isTrusted(payload),
     acknowledge: isWriterCommand(payload),
     // Fork heads are dropped before this, so a push and a thread resolution, which only a writer or the PR's author
-    // can make, both take write access.
-    writer: event === 'pull_request' || event === 'pull_request_review_thread' || isWriterAuthored(payload),
+    // can make, both take write access. So does dismissing a review, whose payload names the reviewer's association.
+    writer: event === 'pull_request' || event === 'pull_request_review_thread'
+      || (event === 'pull_request_review' && payload.action === 'dismissed') || isWriterAuthored(payload),
   };
 }
 

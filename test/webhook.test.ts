@@ -4,7 +4,7 @@ import { verifyWebhookSignature } from '../src/signature';
 import worker from '../src/index';
 import { DEFAULT_EVENTS_PER_HOUR, eventsPerHour, InstallationLimiter } from '../src/limiter';
 import { coordinator, DELIVERY_ID, freezeClock, logged, OIDC_AUDIENCE, postWebhook, signWebhook, stubGitHub, TEST_ENV, workRows } from './helpers';
-import { FORCE_REVIEW_COMMENT, HEAD_SHA, issueCommentEvent, MANKI_AUTHOR, PR_NUMBER, pullRequestEvent, REPOSITORY_ID, reviewThreadEvent, workflowRunEvent } from './payloads';
+import { FORCE_REVIEW_COMMENT, HEAD_SHA, issueCommentEvent, MANKI_AUTHOR, PR_NUMBER, pullRequestEvent, REPOSITORY_ID, reviewEvent, reviewThreadEvent, workflowRunEvent } from './payloads';
 
 const encoder = new TextEncoder();
 
@@ -166,8 +166,8 @@ describe('/webhook', () => {
     expect(logged(log, 'coordinator_receive')).toMatchObject([{ accepted: true }, { accepted: false, reason: 'duplicate delivery' }, { accepted: true }]);
     expect(await workRows(coordinator(REPOSITORY_ID, 62))).toHaveLength(1);
     expect(await workRows(coordinator(REPOSITORY_ID, 63))).toEqual([]);
-    // A writer's comment, a Force review tick, a resolved thread, a push to a branch of the repository, a close and a
-    // run's end still get through.
+    // A writer's comment, a Force review tick, a dismissed review, a resolved thread, a push to a branch of the
+    // repository, a close and a run's end still get through.
     for (const association of ['OWNER', 'MEMBER', 'COLLABORATOR']) {
       expect((await send(66, installation, `@manki explain ${association}`, undefined, association)).status).toBe(202);
     }
@@ -175,6 +175,9 @@ describe('/webhook', () => {
     const tick = issueCommentEvent(FORCE_REVIEW_COMMENT, { number: 67, action: 'edited', author: MANKI_AUTHOR, association: 'NONE' });
     expect((await postWebhook({ event: 'issue_comment', payload: { ...tick, installation: { id: installation } }, env })).status).toBe(202);
     expect(await workRows(coordinator(REPOSITORY_ID, 67))).toMatchObject([{ kind: 'review' }]);
+    const dismissed = { ...reviewEvent('dismissed', { author_association: 'NONE' }, { number: 69 }), installation: { id: installation } };
+    expect((await postWebhook({ event: 'pull_request_review', payload: dismissed, env })).status).toBe(202);
+    expect(await workRows(coordinator(REPOSITORY_ID, 69))).toMatchObject([{ kind: 'review_state' }]);
     const resolved = { ...reviewThreadEvent('resolved', { number: 68 }), installation: { id: installation } };
     expect((await postWebhook({ event: 'pull_request_review_thread', payload: resolved, env })).status).toBe(202);
     expect(await workRows(coordinator(REPOSITORY_ID, 68))).toMatchObject([{ kind: 'review_state' }]);
@@ -186,8 +189,8 @@ describe('/webhook', () => {
     expect(await workRows(coordinator(REPOSITORY_ID, 62))).toMatchObject([{ status: 'dropped', note: 'pull request closed' }]);
     const runEnd = { ...workflowRunEvent(), installation: { id: installation } };
     expect((await postWebhook({ event: 'workflow_run', payload: runEnd, env })).status).toBe(202);
-    expect(logged(log, 'webhook').slice(-8).map((line) => line.route))
-      .toEqual(['chat', 'chat', 'chat', 'state', 'state', 'state', 'close', 'run_completed']);
+    expect(logged(log, 'webhook').slice(-9).map((line) => line.route))
+      .toEqual(['chat', 'chat', 'chat', 'state', 'state', 'state', 'state', 'close', 'run_completed']);
     // Another installation has its own count.
     expect((await send(64, installation + 1)).status).toBe(202);
     expect(await workRows(coordinator(REPOSITORY_ID, 64))).toHaveLength(1);
