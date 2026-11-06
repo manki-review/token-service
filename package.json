@@ -18,7 +18,7 @@
   },
   "dependencies": {
     "jose": "^6.2.2",
-    "minimatch": "^10.2.6",
+    "minimatch": "^11.0.5",
     "yaml": "^2.9.1"
   }
 }
