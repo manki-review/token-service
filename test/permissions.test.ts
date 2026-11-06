@@ -41,19 +41,19 @@ describe('/token permissions', () => {
     });
   });
 
-  it('caps `actions` and the other read-only permissions at read', async () => {
+  it('caps `actions` and the other read-only permissions at read, `checks` at write', async () => {
     const requests = stubGitHub({
       installation: {
         body: {
           id: INSTALLATION_ID,
-          permissions: { actions: 'write', checks: 'write', metadata: 'read', security_events: 'write' },
+          permissions: { actions: 'write', checks: 'admin', metadata: 'read', security_events: 'write' },
         },
       },
     });
 
     expect((await postToken()).status).toBe(200);
     expect(await mintRequestBody(requests)).toEqual({
-      permissions: { actions: 'read', checks: 'read', metadata: 'read', security_events: 'read' },
+      permissions: { actions: 'read', checks: 'write', metadata: 'read', security_events: 'read' },
       ...SCOPE,
     });
   });
@@ -61,13 +61,16 @@ describe('/token permissions', () => {
   it('keeps a level the installation grants below the cap', async () => {
     const requests = stubGitHub({
       installation: {
-        body: { id: INSTALLATION_ID, permissions: { contents: 'read', issues: 'read', metadata: 'read', pull_requests: 'read' } },
+        body: {
+          id: INSTALLATION_ID,
+          permissions: { checks: 'read', contents: 'read', issues: 'read', metadata: 'read', pull_requests: 'read' },
+        },
       },
     });
 
     expect((await postToken()).status).toBe(200);
     expect(await mintRequestBody(requests)).toEqual({
-      permissions: { contents: 'read', issues: 'read', metadata: 'read', pull_requests: 'read' },
+      permissions: { checks: 'read', contents: 'read', issues: 'read', metadata: 'read', pull_requests: 'read' },
       ...SCOPE,
     });
   });
