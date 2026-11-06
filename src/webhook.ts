@@ -1,4 +1,4 @@
-import { allowedRepos, type Env } from './env';
+import { allowedAccounts, type Env } from './env';
 import { eventsPerHour } from './limiter';
 import { log } from './log';
 import { routeDelivery, type Route, type WebhookPayload } from './routing';
@@ -97,9 +97,9 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
 
   const routed = routeDelivery(event, payload);
   // Every routed delivery writes Durable Object storage, which the account's daily row quota pays for. Only the
-  // listed repositories may spend it, so a script on another installation cannot use it up.
-  let route: Route = routed.type !== 'ignore' && !allowedRepos(env).has(routed.target.repositoryId)
-    ? { type: 'ignore', reason: `repository ${routed.target.repositoryId} is not in WEBHOOK_REPOS` }
+  // repositories of listed accounts may spend it, so a script on another installation cannot use it up.
+  let route: Route = routed.type !== 'ignore' && !allowedAccounts(env).has(routed.target.ownerId)
+    ? { type: 'ignore', reason: `account ${routed.target.ownerId} is not in WEBHOOK_ACCOUNTS` }
     : routed;
   // One installation may store only so many deliveries from people without write access an hour, so a flood from it
   // cannot use up the quota either, and outsiders only use up their own share. A close or a run's end is never capped.

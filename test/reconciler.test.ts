@@ -8,9 +8,17 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { RUN_DEADLINE_MS } from '../src/coordinator';
-import { CATCH_UP_WINDOW_MS, MAX_DELIVERY_PAGES, MAX_REDELIVERIES, RECONCILER_NAME, REDELIVERY_WINDOW_MS, SUBREQUEST_BUDGET } from '../src/reconciler';
+import {
+  CATCH_UP_WINDOW_MS,
+  MAX_DELIVERY_PAGES,
+  MAX_REDELIVERIES,
+  RECONCILER_NAME,
+  Reconciler,
+  REDELIVERY_WINDOW_MS,
+  SUBREQUEST_BUDGET,
+} from '../src/reconciler';
 import { routeDelivery, type Target } from '../src/routing';
-import { coordinator, freezeClock, INSTALLATION_ID, logged, OWNER, postWebhook, RUNTIME_ENV, setDispatchEnabled, tableNames, TEST_ENV, workRows } from './helpers';
+import { coordinator, freezeClock, INSTALLATION_ID, logged, OWNER, OWNER_ID, postWebhook, RUNTIME_ENV, setDispatchEnabled, tableNames, TEST_ENV, workRows } from './helpers';
 import { DISPATCH_WORKFLOW_YAML, EVENT_WORKFLOW_YAML, pullRequestEvent, workflowsReply } from './payloads';
 
 const MINUTE = 60_000;
@@ -25,10 +33,9 @@ let nextId = 50_000;
 function setup() {
   const name = `reconciler-${nextId}`;
   const stub = RUNTIME_ENV.RECONCILER.getByName(name);
-  const repo = (suffix = '') => {
+  const repo = (suffix = '', ownerId = OWNER_ID) => {
     const id = nextId++;
-    RUNTIME_ENV.WEBHOOK_REPOS = `${RUNTIME_ENV.WEBHOOK_REPOS},${id}`;
-    const target: Target = { installationId: INSTALLATION_ID, repositoryId: id, owner: OWNER, repo: `repo-${id}${suffix}`, defaultBranch: 'main', number: 0 };
+    const target: Target = { installationId: INSTALLATION_ID, repositoryId: id, owner: OWNER, ownerId, repo: `repo-${id}${suffix}`, defaultBranch: 'main', number: 0 };
     return target;
   };
   return { stub, repo };
@@ -130,7 +137,7 @@ function fakeGitHub() {
     const repository = url.pathname.match(/^\/repositories\/(\d+)$/);
     if (repository && request.method === 'GET') {
       const id = Number(repository[1]);
-      return Response.json({ id, name: id === 4242 ? 'manki' : `repo-${id}`, owner: { login: OWNER }, default_branch: 'main' });
+      return Response.json({ id, name: id === 4242 ? 'manki' : `repo-${id}`, owner: { login: OWNER, id: OWNER_ID }, default_branch: 'main' });
     }
     if (route === 'POST /graphql') {
       const { query, variables } = await request.json() as { query: string; variables: { name: string; number: number } };
@@ -161,7 +168,6 @@ beforeEach(() => {
 });
 
 const realCoordinators = RUNTIME_ENV.PR_COORDINATOR;
-const realAllowlist = RUNTIME_ENV.WEBHOOK_REPOS;
 
 function key(id: string) {
   return { id, bodyHash: null };
@@ -170,7 +176,6 @@ function key(id: string) {
 afterEach(() => {
   vi.useRealTimers();
   RUNTIME_ENV.PR_COORDINATOR = realCoordinators;
-  RUNTIME_ENV.WEBHOOK_REPOS = realAllowlist;
   setDispatchEnabled(false);
 });
 
@@ -392,12 +397,41 @@ describe('Reconciler redelivery', () => {
     expect(rows).toBe(0);
   });
 
-  it('touches no repository outside WEBHOOK_REPOS, even one in the registry', async () => {
+  it('adds owner_id to a registry from before it and reads it from GitHub for an old row in the next pass', async () => {
+    const { stub, repo } = setup();
+    const target = repo();
+    const github = fakeGitHub();
+    github.pages = [[failure(target, 1, 0)]];
+    github.pulls.set(target.repo, [pull(1, SHA_1, { repo: target.repo })]);
+    const optedInAt = Date.now() - MINUTE;
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec('DROP TABLE opt_ins');
+      state.storage.sql.exec(`CREATE TABLE opt_ins (
+        repository_id INTEGER PRIMARY KEY, installation_id INTEGER NOT NULL, owner TEXT NOT NULL, repo TEXT NOT NULL,
+        default_branch TEXT NOT NULL, opted_in_at INTEGER NOT NULL
+      )`);
+      state.storage.sql.exec(
+        'INSERT INTO opt_ins VALUES (?, ?, ?, ?, ?, ?)', target.repositoryId, target.installationId, OWNER, target.repo, 'main', optedInAt,
+      );
+      // A new instance on the old schema, as after a deploy.
+      const upgraded = new Reconciler(state, RUNTIME_ENV);
+      await upgraded.reconcile();
+      expect(state.storage.sql.exec('SELECT owner_id, opted_in_at FROM opt_ins').toArray()).toEqual([{ owner_id: OWNER_ID, opted_in_at: optedInAt }]);
+      expect(logged(log, 'reconciler_owner_backfilled')).toEqual([expect.objectContaining({ repository_id: target.repositoryId, owner_id: OWNER_ID })]);
+      expect(github.redelivered).toEqual([1]);
+      expect(github.pullListCalls).toEqual([target.repo]);
+
+      // The owner is read once.
+      await upgraded.reconcile();
+      expect(logged(log, 'reconciler_owner_backfilled')).toHaveLength(1);
+    });
+  });
+
+  it('touches no repository of an account outside WEBHOOK_ACCOUNTS, even one in the registry', async () => {
     const { stub, repo } = setup();
     const allowed = repo();
-    const dropped = repo();
+    const dropped = repo('', OWNER_ID + 1);
     for (const target of [allowed, dropped]) await stub.recordOptIn(target, true);
-    RUNTIME_ENV.WEBHOOK_REPOS = String(allowed.repositoryId);
     const github = fakeGitHub();
     github.pages = [[failure(dropped, 2, 0), failure(allowed, 1, 0)]];
     github.pulls.set(allowed.repo, [pull(1, SHA_1, { repo: allowed.repo })]);
@@ -489,7 +523,7 @@ describe('opt-in timestamp', () => {
     vi.mocked(globalThis.fetch).mockImplementation(async (input, init) => {
       const path = new URL(new Request(input, init).url).pathname;
       if (path === '/graphql') return Response.json(workflowsReply({ 'manki.yml': EVENT_WORKFLOW_YAML }).body);
-      if (path === '/repositories/4242') return Response.json({ name: 'manki', owner: { login: OWNER }, default_branch: 'main' });
+      if (path === '/repositories/4242') return Response.json({ name: 'manki', owner: { login: OWNER, id: OWNER_ID }, default_branch: 'main' });
       return Response.json({ token: 'ghs_repo', expires_at: '2030-01-01T01:00:00Z' }, { status: 201 });
     });
     advanceClock(10 * MINUTE);
@@ -552,7 +586,7 @@ describe('Reconciler catch-up', () => {
     const pushed = coordinator(target.repositoryId, 1);
     const route = routeDelivery('pull_request', {
       ...pullRequestEvent('synchronize', { number: 1, head: { sha: SHA_1, repo: { full_name: `${OWNER}/${target.repo}` } } }),
-      repository: { id: target.repositoryId, name: target.repo, full_name: `${OWNER}/${target.repo}`, default_branch: 'main', owner: { login: OWNER } },
+      repository: { id: target.repositoryId, name: target.repo, full_name: `${OWNER}/${target.repo}`, default_branch: 'main', owner: { login: OWNER, id: OWNER_ID } },
     });
     if (route.type !== 'work') throw new Error('expected work');
     await pushed.receive(key(crypto.randomUUID()), route);
@@ -605,10 +639,9 @@ describe('Reconciler catch-up', () => {
     const github = fakeGitHub();
     const payload = {
       ...pullRequestEvent('synchronize', { number: 1, head: { sha: SHA_1, repo: { full_name: `${OWNER}/${target.repo}` } } }, { login: 'dependabot[bot]', type: 'Bot' }),
-      repository: { id: target.repositoryId, name: target.repo, full_name: `${OWNER}/${target.repo}`, default_branch: 'main', owner: { login: OWNER } },
+      repository: { id: target.repositoryId, name: target.repo, full_name: `${OWNER}/${target.repo}`, default_branch: 'main', owner: { login: OWNER, id: OWNER_ID } },
     };
-    // `TEST_ENV` holds the allowlist from before this test added its repository.
-    expect((await postWebhook({ event: 'pull_request', payload, env: { ...TEST_ENV, WEBHOOK_REPOS: RUNTIME_ENV.WEBHOOK_REPOS } })).status).toBe(202);
+    expect((await postWebhook({ event: 'pull_request', payload })).status).toBe(202);
     github.pulls.set(target.repo, [pull(1, SHA_1, { repo: target.repo })]);
     await stub.reconcile();
     expect(github.graphqlCalls).toBe(0);
@@ -707,7 +740,7 @@ describe('Reconciler catch-up', () => {
     await coordinator(target.repositoryId, 1).markSeen(key(crypto.randomUUID()), { ...target, number: 1 }, SHA_1);
     const pushed = routeDelivery('pull_request', {
       ...pullRequestEvent('synchronize', { number: 2, head: { sha: SHA_2, repo: { full_name: `${OWNER}/${target.repo}` } } }),
-      repository: { id: target.repositoryId, name: target.repo, full_name: `${OWNER}/${target.repo}`, default_branch: 'main', owner: { login: OWNER } },
+      repository: { id: target.repositoryId, name: target.repo, full_name: `${OWNER}/${target.repo}`, default_branch: 'main', owner: { login: OWNER, id: OWNER_ID } },
     });
     if (pushed.type !== 'work') throw new Error('expected work');
     await coordinator(target.repositoryId, 2).receive(key(crypto.randomUUID()), pushed);

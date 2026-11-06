@@ -38,6 +38,8 @@ export interface Target {
   installationId: number;
   repositoryId: number;
   owner: string;
+  /** The id of the account that owns the repository, which is the account the App is installed on. */
+  ownerId: number;
   repo: string;
   defaultBranch: string;
   number: number;
@@ -93,7 +95,7 @@ export interface WebhookPayload {
   action?: string;
   sender?: User;
   installation?: { id?: number };
-  repository?: { id?: number; name?: string; full_name?: string; default_branch?: string; owner?: { login?: string } };
+  repository?: { id?: number; name?: string; full_name?: string; default_branch?: string; owner?: { login?: string; id?: number } };
   pull_request?: PullRequest;
   issue?: { number?: number; pull_request?: unknown; user?: User };
   comment?: {
@@ -115,7 +117,7 @@ function targetOf(payload: WebhookPayload, number: number | undefined): Target |
   const { installation, repository } = payload;
   if (
     installation?.id === undefined || repository?.id === undefined || !repository.name || !repository.owner?.login
-    || !repository.default_branch || number === undefined
+    || repository.owner.id === undefined || !repository.default_branch || number === undefined
   ) {
     return null;
   }
@@ -123,6 +125,7 @@ function targetOf(payload: WebhookPayload, number: number | undefined): Target |
     installationId: installation.id,
     repositoryId: repository.id,
     owner: repository.owner.login,
+    ownerId: repository.owner.id,
     repo: repository.name,
     defaultBranch: repository.default_branch,
     number,

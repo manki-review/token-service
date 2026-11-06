@@ -14,7 +14,7 @@ export const INSTALLATION_ID = 987;
 export const OWNER = 'manki-review';
 export const REPO = 'manki';
 export const REPOSITORY_ID = 424242;
-export const OWNER_ID = 4242;
+export const OWNER_ID = 7070;
 
 const OIDC_KID = 'test-oidc-key';
 
@@ -132,7 +132,7 @@ export function stubGitHub(stub: GitHubStub = {}): Request[] {
       return Response.json({ keys: [oidcJwk] });
     }
     if (/^\/repositories\/[0-9]+$/.test(url.pathname)) {
-      return reply(stub.repository, { name: REPO, owner: { login: OWNER }, default_branch: 'main' });
+      return reply(stub.repository, { name: REPO, owner: { login: OWNER, id: OWNER_ID }, default_branch: 'main' });
     }
     if (url.pathname === `/repos/${OWNER}/${REPO}/installation`) {
       return reply(stub.installation, { id: INSTALLATION_ID, permissions: DEFAULT_INSTALLATION_PERMISSIONS });

@@ -13,8 +13,8 @@ export default defineConfig({
         APP_ID: '123456',
         APP_PRIVATE_KEY: privateKey.export({ type: 'pkcs1', format: 'pem' }).toString(),
         WEBHOOK_SECRET: 'test-webhook-secret',
-        // `REPOSITORY_ID` of `test/payloads.ts`, in place of the real ids in `wrangler.toml`.
-        WEBHOOK_REPOS: '4242',
+        // `OWNER_ID` of `test/helpers.ts`, in place of the real ids in `wrangler.toml`.
+        WEBHOOK_ACCOUNTS: '7070',
         // Pinned so the value in `wrangler.toml` never changes the tests. A test that needs dispatch turns it on.
         DISPATCH_ENABLED: 'false',
       },

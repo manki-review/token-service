@@ -1,6 +1,6 @@
 import { DurableObject } from 'cloudflare:workers';
 import { createAppJWT } from './app-jwt';
-import { allowedRepos, type Env } from './env';
+import { allowedAccounts, type Env } from './env';
 import { githubApi, githubGraphql, isRateLimited, mintRepositoryToken } from './github';
 import { log } from './log';
 import { BOT_LOGIN } from './manki';
@@ -30,10 +30,12 @@ const HANDLED_EVENTS = new Set([
   'workflow_run',
 ]);
 
-interface OptInRow extends Record<string, string | number> {
+interface OptInRow extends Record<string, string | number | null> {
   repository_id: number;
   installation_id: number;
   owner: string;
+  /** Null for a row recorded before the column existed, until the next pass reads it from GitHub. */
+  owner_id: number | null;
   repo: string;
   default_branch: string;
   opted_in_at: number;
@@ -83,6 +85,12 @@ function isSuccess(status: number): boolean {
   return status >= 200 && status < 300;
 }
 
+type AllowedRow = OptInRow & { owner_id: number };
+
+function isAllowed(env: Env, row: OptInRow): row is AllowedRow {
+  return row.owner_id !== null && allowedAccounts(env).has(row.owner_id);
+}
+
 /** Returns the path and query of the `rel="next"` link, if any. */
 function nextPage(link: string | null): string | null {
   const match = link?.match(/<https:\/\/api\.github\.com([^>]+)>;\s*rel="next"/);
@@ -109,6 +117,8 @@ export class Reconciler extends DurableObject<Env> {
       default_branch TEXT NOT NULL,
       opted_in_at INTEGER NOT NULL
     )`);
+    const columns = this.sql.exec<{ name: string }>(`SELECT name FROM pragma_table_info('opt_ins')`).toArray();
+    if (!columns.some((column) => column.name === 'owner_id')) this.sql.exec('ALTER TABLE opt_ins ADD COLUMN owner_id INTEGER');
     // One row per delivery GUID a scan found failed, or `done` once any attempt of it succeeded.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS failed_deliveries (
       guid TEXT PRIMARY KEY,
@@ -142,11 +152,12 @@ export class Reconciler extends DurableObject<Env> {
     }
     const now = Date.now();
     const optedInAt = this.sql.exec<{ opted_in_at: number }>(
-      `INSERT INTO opt_ins (repository_id, installation_id, owner, repo, default_branch, opted_in_at) VALUES (?, ?, ?, ?, ?, ?)
+      `INSERT INTO opt_ins (repository_id, installation_id, owner, owner_id, repo, default_branch, opted_in_at) VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (repository_id) DO UPDATE SET
-         installation_id = excluded.installation_id, owner = excluded.owner, repo = excluded.repo, default_branch = excluded.default_branch
+         installation_id = excluded.installation_id, owner = excluded.owner, owner_id = excluded.owner_id, repo = excluded.repo,
+         default_branch = excluded.default_branch
        RETURNING opted_in_at`,
-      target.repositoryId, target.installationId, target.owner, target.repo, target.defaultBranch, now,
+      target.repositoryId, target.installationId, target.owner, target.ownerId, target.repo, target.defaultBranch, now,
     ).one().opted_in_at;
     if (optedInAt === now) log('reconciler_opted_in', { repository_id: target.repositoryId, repo: `${target.owner}/${target.repo}` });
   }
@@ -170,6 +181,11 @@ export class Reconciler extends DurableObject<Env> {
   private async runPass(): Promise<void> {
     const budget = new Budget(SUBREQUEST_BUDGET);
     try {
+      await this.backfillOwners(budget);
+    } catch (error) {
+      log('reconciler_backfill_error', { error: String(error) });
+    }
+    try {
       await this.redeliver(budget);
     } catch (error) {
       log('reconciler_redeliver_error', { error: String(error) });
@@ -181,10 +197,41 @@ export class Reconciler extends DurableObject<Env> {
     }
   }
 
-  /** Returns the registry entry of an allowlisted repository. The cron touches no repository outside `WEBHOOK_REPOS`. */
+  /**
+   * Reads the owner id of each repository recorded before `owner_id` existed and stores it, so the repository is
+   * reconciled again without waiting for its next delivery. Each row costs a mint and a read, once.
+   */
+  private async backfillOwners(budget: Budget): Promise<void> {
+    const rows = this.sql.exec<OptInRow>('SELECT * FROM opt_ins WHERE owner_id IS NULL ORDER BY repository_id').toArray();
+    for (const row of rows) {
+      if (budget.left < 2) return;
+      budget.take();
+      const mint = await mintRepositoryToken(this.env, row.installation_id, row.repository_id, { metadata: 'read' }, {
+        purpose: 'reconciler',
+        repository: `${row.owner}/${row.repo}`,
+      });
+      if (!mint.ok) {
+        log('reconciler_token_refused', { repository_id: row.repository_id, status: mint.status });
+        if (mint.status === 404 || mint.status === 422) this.sql.exec('DELETE FROM opt_ins WHERE repository_id = ?', row.repository_id);
+        continue;
+      }
+      budget.take();
+      const response = await githubApi(mint.token, `/repositories/${row.repository_id}`);
+      if (!response.ok) {
+        log('reconciler_backfill_error', { repository_id: row.repository_id, status: response.status });
+        continue;
+      }
+      const ownerId = (await response.json() as { owner: { id: number } }).owner.id;
+      this.sql.exec('UPDATE opt_ins SET owner_id = ? WHERE repository_id = ?', ownerId, row.repository_id);
+      log('reconciler_owner_backfilled', { repository_id: row.repository_id, owner_id: ownerId });
+    }
+  }
+
+  /** Returns the registry entry of a repository. The cron touches no repository of an account outside `WEBHOOK_ACCOUNTS`. */
   private optIn(repositoryId: number | null): OptInRow | undefined {
-    if (repositoryId === null || !allowedRepos(this.env).has(repositoryId)) return undefined;
-    return this.sql.exec<OptInRow>('SELECT * FROM opt_ins WHERE repository_id = ?', repositoryId).toArray()[0];
+    if (repositoryId === null) return undefined;
+    const row = this.sql.exec<OptInRow>('SELECT * FROM opt_ins WHERE repository_id = ?', repositoryId).toArray()[0];
+    return row && isAllowed(this.env, row) ? row : undefined;
   }
 
   private getMeta<T>(key: string): T | null {
@@ -295,9 +342,8 @@ export class Reconciler extends DurableObject<Env> {
    */
   private async catchUp(budget: Budget): Promise<void> {
     const cursor = Number(this.sql.exec<{ value: string }>(`SELECT value FROM meta WHERE key = 'catch_up_cursor'`).toArray()[0]?.value ?? 0);
-    const allowed = allowedRepos(this.env);
     const repos = this.sql.exec<OptInRow>('SELECT * FROM opt_ins ORDER BY repository_id').toArray()
-      .filter((repo) => allowed.has(repo.repository_id));
+      .filter((repo) => isAllowed(this.env, repo));
     this.sql.exec('DELETE FROM checked_heads WHERE checked_at < ?', Date.now() - CATCH_UP_WINDOW_MS);
     const ordered = [...repos.filter((repo) => repo.repository_id > cursor), ...repos.filter((repo) => repo.repository_id <= cursor)];
 
@@ -322,7 +368,7 @@ export class Reconciler extends DurableObject<Env> {
   }
 
   /** Returns false when the budget ran out before every PR of `repo` was checked. */
-  private async catchUpRepository(repo: OptInRow, budget: Budget): Promise<boolean> {
+  private async catchUpRepository(repo: AllowedRow, budget: Budget): Promise<boolean> {
     budget.take();
     const mint = await mintRepositoryToken(this.env, repo.installation_id, repo.repository_id, { pull_requests: 'read' }, {
       purpose: 'reconciler',
@@ -373,6 +419,7 @@ export class Reconciler extends DurableObject<Env> {
         installationId: repo.installation_id,
         repositoryId: repo.repository_id,
         owner: repo.owner,
+        ownerId: repo.owner_id,
         repo: repo.repo,
         defaultBranch: repo.default_branch,
         number: pull.number,
