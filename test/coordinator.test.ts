@@ -668,6 +668,8 @@ function fakeGitHub(number: number) {
     /** Each login's permission on the repository. Anyone else reads as `read`. */
     permissions: {} as Record<string, string>,
     permissionReads: [] as string[],
+    /** Manki's comments by id, which a revert reads and edits. */
+    issueComments: new Map<number, string>(),
     /** The workflow files on the default branch, and the file each dispatch named. */
     workflows: { 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML } as Record<string, string>,
     dispatchedWorkflows: [] as string[],
@@ -737,6 +739,12 @@ function fakeGitHub(number: number) {
     if (route === `GET ${repo}/actions/workflows/manki-dispatch.yml/runs`) {
       if (state.listRunsStatus !== 200) return Response.json({ message: 'no' }, { status: state.listRunsStatus });
       return Response.json({ total_count: state.listedRuns.length, workflow_runs: state.listedRuns });
+    }
+    const issueComment = url.pathname.match(new RegExp(`^${repo}/issues/comments/(\\d+)$`));
+    if (issueComment && request.method === 'GET') return Response.json({ body: state.issueComments.get(Number(issueComment[1])) });
+    if (issueComment && request.method === 'PATCH') {
+      state.issueComments.set(Number(issueComment[1]), ((await request.json()) as { body: string }).body);
+      return Response.json({});
     }
     const reaction = url.pathname.match(new RegExp(`^${repo}/(issues|pulls)/comments/(\\d+)/reactions$`));
     if (reaction && request.method === 'POST') {
@@ -910,11 +918,12 @@ describe('PrCoordinator dispatch', () => {
     await runDurableObjectAlarm(pr.stub);
     await pr.send('pull_request', pr.push(SHA_2));
     expect(await state()).toEqual({
-      active: [{ lane: 'state', run_id: 9000, kind: 'review', event: 'pull_request.synchronize', head_sha: SHA_1, dispatched_at: new Date().toISOString() }],
-      queue: [{ lane: 'state', kind: 'review', event: 'pull_request.synchronize', head_sha: SHA_2, enqueued_at: new Date().toISOString() }],
+      active: [{ lane: 'state', run_id: 9000, kind: 'review', event: 'pull_request.synchronize', head_sha: SHA_1, dispatched_at: new Date().toISOString(), modes: [] }],
+      queue: [{ lane: 'state', kind: 'review', event: 'pull_request.synchronize', head_sha: SHA_2, enqueued_at: new Date().toISOString(), modes: [] }],
       last_reviewed: null,
       last_approval: null,
       pause: null,
+      settings: { paused: false },
     });
 
     // Only the active run may report, and a replayed report writes nothing.
@@ -992,7 +1001,7 @@ describe('PrCoordinator dispatch', () => {
     fakeGitHub(pr.number);
     const token = await oidcToken({ claims: { repository_id: String(REPOSITORY_ID), run_id: '9000' } });
     const response = await postToken({ path: '/state', token, body: { owner: OWNER, repo: REPO, pr: pr.number } });
-    expect(await response.json()).toMatchObject({ active: [], queue: [], last_reviewed: null, last_approval: null, pause: null });
+    expect(await response.json()).toEqual({ active: [], queue: [], last_reviewed: null, last_approval: null, pause: null, settings: { paused: false } });
     const report = await postToken({ path: '/state/report', token, body: { owner: OWNER, repo: REPO, pr: pr.number, pause: null } });
     expect(report.status).toBe(403);
     expect(await tableNames(pr.stub)).toEqual([]);
@@ -1288,8 +1297,151 @@ describe('PrCoordinator dispatch', () => {
     await pr.stub.runCompleted(key('d-bob'), 9000, 'success');
     await run('issue_comment', by('dave', 'COLLABORATOR', '@manki explain again'));
     expect(github.dispatches).toHaveLength(2);
-    expect(github.permissionReads).toEqual(['alice', 'alice', 'alice', 'mallory', 'bob']);
+    // Each login is looked up once and reused for a few minutes.
+    expect(github.permissionReads).toEqual(['alice', 'mallory', 'bob']);
     expect(github.mints).toContainEqual({ permissions: { metadata: 'read' }, repository_ids: [REPOSITORY_ID] });
+  });
+
+  describe('settings boxes', () => {
+    const SETTINGS = 1500;
+    const boxes = (ticked: string[] = []) => ['Last reviewed `1111111` · head `1111111` · up to date', '',
+      ...(['pause', 'full', 'deeper', 'cancel', 'draft', 'force'] as const).map((box) => `- [${ticked.includes(box) ? 'x' : ' '}] ${box} <!-- manki-box:${box} -->`),
+      '<!-- manki-settings -->', '<!-- manki-bot -->'].join('\n');
+    const setup = () => {
+      const pr = pullRequest();
+      const github = fakeGitHub(pr.number);
+      github.permissions = { alice: 'write' };
+      const state = async () => {
+        const token = await oidcToken({ claims: { repository_id: String(REPOSITORY_ID), run_id: '9000' } });
+        return (await postToken({ path: '/state', token, body: { owner: OWNER, repo: REPO, pr: pr.number } })).json() as Promise<Record<string, unknown>>;
+      };
+      /** Has `sender` change the boxes from `before` to `after`, and runs the alarm twice, so a review it queues starts. */
+      const edit = async (before: string[], after: string[], sender = 'alice', at = new Date().toISOString()) => {
+        const payload = issueCommentEvent(boxes(after), {
+          number: pr.number, action: 'edited', author: MANKI_AUTHOR, sender: { login: sender, type: 'User' }, previousBody: boxes(before),
+        });
+        github.issueComments.set(SETTINGS, boxes(after));
+        const result = await pr.send('issue_comment', { ...payload, comment: { ...payload.comment!, id: SETTINGS, updated_at: at } });
+        await runDurableObjectAlarm(pr.stub);
+        await runDurableObjectAlarm(pr.stub);
+        return result;
+      };
+      return { pr, github, state, edit };
+    };
+
+    it('pauses automatic reviews until a writer unticks Pause, and keeps reviewing on request meanwhile', async () => {
+      const { pr, github, state, edit } = setup();
+      await edit([], ['pause']);
+      expect(await state()).toMatchObject({ settings: { paused: true } });
+      await pr.send('pull_request', pr.push(SHA_1));
+      await runDurableObjectAlarm(pr.stub);
+      expect(github.dispatches).toEqual([]);
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ status: 'skipped', note: 'pull request is paused' });
+      await edit(['pause'], ['pause', 'force']);
+      expect(github.dispatches.at(-1)?.inputs).toMatchObject({ event: 'issue_comment', action: 'edited', comment_id: String(SETTINGS) });
+      expect(await state()).toMatchObject({ active: [{ kind: 'review', run_id: 9000, modes: ['force'] }], settings: { paused: true } });
+      await pr.stub.runCompleted(key('d-force'), 9000, 'success');
+
+      await edit(['pause'], []);
+      expect(await state()).toMatchObject({ settings: { paused: false } });
+      github.head = SHA_2;
+      await pr.send('pull_request', pr.push(SHA_2));
+      await runDurableObjectAlarm(pr.stub);
+      expect(github.dispatches.at(-1)?.inputs).toMatchObject({ event: 'pull_request', head_sha: SHA_2 });
+      expect((await workRows(pr.stub)).filter((row) => row.kind === 'settings').map((row) => row.note)).toEqual(['paused', 'force review work 4', 'resumed']);
+    });
+
+    it('turns a queued push review into one review with every mode ticked, which a pause cannot drop', async () => {
+      const { pr, github, state } = setup();
+      await pr.send('pull_request', pr.push(SHA_1));
+      const tick = async (before: string[], after: string[]) => {
+        const payload = issueCommentEvent(boxes(after), {
+          number: pr.number, action: 'edited', author: MANKI_AUTHOR, previousBody: boxes(before),
+        });
+        await pr.send('issue_comment', { ...payload, comment: { ...payload.comment!, id: SETTINGS } });
+      };
+      await tick([], ['full']);
+      await tick(['full'], ['full', 'deeper']);
+      await tick(['full', 'deeper'], ['full', 'deeper', 'pause']);
+      // The settings lane takes one edit per alarm while the state lane waits for the box review.
+      await runInDurableObject(pr.stub, async (_instance, ctx) => {
+        ctx.storage.sql.exec(`UPDATE work SET check_at = ? WHERE kind = 'review'`, Date.now() + MINUTE);
+      });
+      for (let i = 0; i < 3; i++) await runDurableObjectAlarm(pr.stub);
+      expect(await state()).toMatchObject({
+        queue: [{ kind: 'review', event: 'issue_comment.edited', head_sha: SHA_1, modes: ['full', 'deeper'] }],
+        settings: { paused: true },
+      });
+      advanceClock(MINUTE);
+      await runDurableObjectAlarm(pr.stub);
+      expect(github.dispatches).toHaveLength(1);
+      expect(github.dispatches[0].inputs).toMatchObject({ event: 'issue_comment', action: 'edited', comment_id: String(SETTINGS) });
+      expect(await state()).toMatchObject({ active: [{ kind: 'review', run_id: 9000, modes: ['full', 'deeper'] }] });
+    });
+
+    it('cancels the running review on a Cancel tick, which the cron then leaves alone', async () => {
+      const { pr, github, state, edit } = setup();
+      await pr.send('pull_request', pr.push(SHA_1));
+      await runDurableObjectAlarm(pr.stub);
+      await edit([], ['cancel']);
+      expect(github.cancels).toEqual([9000]);
+      expect((await workRows(pr.stub))[0]).toMatchObject({ status: 'skipped', conclusion: 'cancelled', note: 'cancelled by alice, cancel requested' });
+      expect(await pr.stub.catchUpState(SHA_1)).toBe('handled');
+      expect(await state()).toMatchObject({ active: [] });
+      // A cancel GitHub fails is tried again, so the tick is not lost.
+      await pr.send('issue_comment', pr.comment('@manki review'));
+      await runDurableObjectAlarm(pr.stub);
+      github.cancelStatuses = [500];
+      await edit([], ['cancel']);
+      expect(github.cancels).toEqual([9000, 9001]);
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'dispatching', errors: 1 });
+      advanceClock(backoff(0));
+      await runDurableObjectAlarm(pr.stub);
+      expect(github.cancels).toEqual([9000, 9001, 9001]);
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'done', note: 'cancel of work 3 requested' });
+
+      // A Cancel made before the running review started leaves it alone.
+      await pr.send('issue_comment', pr.comment('@manki review again'));
+      await runDurableObjectAlarm(pr.stub);
+      await edit([], ['cancel'], 'alice', new Date(Date.now() - MINUTE).toISOString());
+      expect(github.cancels).toEqual([9000, 9001, 9001]);
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'done', note: 'no review to cancel' });
+      await pr.stub.runCompleted(key('d-again'), 9002, 'success');
+
+      // With nothing running, a Cancel tick changes nothing.
+      await edit([], ['cancel']);
+      expect(github.cancels).toEqual([9000, 9001, 9001]);
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'done', note: 'no review to cancel' });
+    });
+
+    it('puts back the boxes as they apply after someone without write access changed them, looking them up once', async () => {
+      const { pr, github, state, edit } = setup();
+      await edit([], ['pause', 'full'], 'mallory');
+      expect(github.issueComments.get(SETTINGS)).toBe(boxes([]));
+      expect(await state()).toMatchObject({ queue: [], active: [], settings: { paused: false } });
+      expect((await workRows(pr.stub)).map((row) => [row.kind, row.status, row.note])).toEqual([['settings', 'skipped', 'commenter has no write access']]);
+      // A tick and an untick in a row leave Pause as it applies, not as the first revert left it.
+      await edit([], ['pause'], 'mallory');
+      await edit(['pause'], [], 'mallory');
+      expect(github.issueComments.get(SETTINGS)).toBe(boxes([]));
+      // An untick of a writer's Pause is put back ticked.
+      await edit([], ['pause']);
+      await edit(['pause'], [], 'mallory');
+      expect(github.issueComments.get(SETTINGS)).toBe(boxes(['pause']));
+      expect(await state()).toMatchObject({ settings: { paused: true } });
+      expect(github.permissionReads).toEqual(['mallory', 'alice']);
+      expect(github.dispatches).toEqual([]);
+    });
+
+    it('ignores a Pause change older than the last one applied, such as a late redelivery, and still applies its other boxes', async () => {
+      const { pr, github, state, edit } = setup();
+      await edit(['pause'], [], 'alice', '2030-01-01T00:00:02Z');
+      await edit([], ['pause', 'full'], 'alice', '2030-01-01T00:00:01Z');
+      expect(await state()).toMatchObject({ settings: { paused: false } });
+      expect(github.dispatches).toHaveLength(1);
+      expect((await workRows(pr.stub)).filter((row) => row.kind === 'settings').map((row) => row.note))
+        .toEqual(['nothing changed', 'pause older than the last pause change, full review work 3']);
+    });
   });
 
   it('polls a run every two minutes as a safety net and ends it once completed', async () => {

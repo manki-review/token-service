@@ -125,3 +125,43 @@ export function matchSkipRule(rules: SkipRules, facts: SkipFacts): string | null
   if (branch) return `branch ${facts.branch}`;
   return null;
 }
+
+/** Marks the progress comment that carries the settings boxes. */
+export const SETTINGS_MARKER = '<!-- manki-settings -->';
+
+export type SettingsBox = 'pause' | 'full' | 'deeper' | 'cancel' | 'draft' | 'force';
+
+/** The boxes that ask for one review, as the `modes` of that review. */
+export type ReviewMode = Extract<SettingsBox, 'full' | 'deeper' | 'draft' | 'force'>;
+
+export const REVIEW_MODES: readonly ReviewMode[] = ['full', 'deeper', 'draft', 'force'];
+
+/** A box whose tick changed in an edit. */
+export interface BoxChange {
+  box: SettingsBox;
+  ticked: boolean;
+}
+
+// A box is a task list line that ends with its hidden id, so the label can change without touching the Worker.
+const BOX_LINE = /^([ \t]*[-*] \[)([ xX])(\] .*<!-- manki-box:(pause|full|deeper|cancel|draft|force) -->[ \t]*)$/gm;
+
+function boxStates(body: string): Map<SettingsBox, boolean> {
+  const states = new Map<SettingsBox, boolean>();
+  for (const match of body.matchAll(BOX_LINE)) states.set(match[4] as SettingsBox, match[2] !== ' ');
+  return states;
+}
+
+/** Returns the boxes whose tick differs between `before` and `after`. A box missing from either side is no change. */
+export function changedBoxes(before: string, after: string): BoxChange[] {
+  const old = boxStates(before);
+  return [...boxStates(after)]
+    .filter(([box, ticked]) => old.has(box) && old.get(box) !== ticked)
+    .map(([box, ticked]) => ({ box, ticked }));
+}
+
+/** Returns `body` with each box in `changes` set to its `ticked`. */
+export function setBoxes(body: string, changes: BoxChange[]): string {
+  const wanted = new Map(changes.map(({ box, ticked }) => [box, ticked]));
+  return body.replace(BOX_LINE, (line, start: string, _tick: string, end: string, box: SettingsBox) =>
+    wanted.has(box) ? `${start}${wanted.get(box) ? 'x' : ' '}${end}` : line);
+}
