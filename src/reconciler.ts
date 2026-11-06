@@ -324,7 +324,10 @@ export class Reconciler extends DurableObject<Env> {
   /** Returns false when the budget ran out before every PR of `repo` was checked. */
   private async catchUpRepository(repo: OptInRow, budget: Budget): Promise<boolean> {
     budget.take();
-    const mint = await mintRepositoryToken(this.env, repo.installation_id, repo.repository_id, { pull_requests: 'read' });
+    const mint = await mintRepositoryToken(this.env, repo.installation_id, repo.repository_id, { pull_requests: 'read' }, {
+      purpose: 'reconciler',
+      repository: `${repo.owner}/${repo.repo}`,
+    });
     if (!mint.ok) {
       log('reconciler_token_refused', { repository_id: repo.repository_id, status: mint.status });
       // A 404 means the installation is gone, and a 422 that the repository left it, so neither can be opted in.

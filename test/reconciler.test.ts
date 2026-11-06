@@ -101,7 +101,8 @@ function fakeGitHub() {
     if (mint && request.method === 'POST') {
       if (Number(mint[1]) === LEFT_INSTALLATION) return Response.json({ message: 'There is at least one repository that does not exist or is not accessible' }, { status: 422 });
       if (Number(mint[1]) !== INSTALLATION_ID) return Response.json({ message: 'Not Found' }, { status: 404 });
-      return Response.json({ token: 'ghs_repo', expires_at: '2030-01-01T01:00:00Z' }, { status: 201 });
+      const { permissions } = await request.json() as { permissions: Record<string, string> };
+      return Response.json({ token: 'ghs_repo', expires_at: '2030-01-01T01:00:00Z', permissions }, { status: 201 });
     }
     const single = url.pathname.match(/^\/repos\/[^/]+\/([^/]+)\/pulls\/(\d+)$/);
     if (single && request.method === 'GET') {
@@ -526,6 +527,14 @@ describe('Reconciler catch-up', () => {
     await stub.reconcile();
 
     expect(logged(log, 'reconciler_caught_up')).toMatchObject([{ pr: 1, head_sha: SHA_1, accepted: true }]);
+    expect(logged(log, 'token_minted')).toContainEqual({
+      msg: 'token_minted',
+      purpose: 'reconciler',
+      repository: `${OWNER}/${target.repo}`,
+      repository_id: target.repositoryId,
+      installation_id: INSTALLATION_ID,
+      permissions: { pull_requests: 'read' },
+    });
     const pr = coordinator(target.repositoryId, 1);
     expect(await workRows(pr)).toMatchObject([
       { lane: 'state', kind: 'review', event: 'pull_request.synchronize', head_sha: SHA_1, delivery: `catch-up-${SHA_1.slice(0, 12)}`, status: 'queued' },

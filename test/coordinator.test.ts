@@ -604,7 +604,7 @@ function fakeGitHub(number: number) {
       if (state.refuseActionsWrite && body.permissions.actions === 'write') {
         return Response.json({ message: 'The permissions requested are not granted to this installation.' }, { status: 422 });
       }
-      return Response.json({ token: 'ghs_repo', expires_at: '2030-01-01T01:00:00Z' }, { status: 201 });
+      return Response.json({ token: 'ghs_repo', expires_at: '2030-01-01T01:00:00Z', permissions: body.permissions }, { status: 201 });
     }
     if (route === `GET /repositories/${REPOSITORY_ID}`) {
       state.repositoryReads++;
@@ -687,6 +687,9 @@ describe('PrCoordinator dispatch', () => {
       { permissions: { pull_requests: 'read' }, repository_ids: [REPOSITORY_ID] },
       { permissions: { actions: 'write' }, repository_ids: [REPOSITORY_ID] },
     ]);
+    const audit = { msg: 'token_minted', purpose: 'coordinator', repository: `${OWNER}/${REPO}`, repository_id: REPOSITORY_ID, installation_id: INSTALLATION_ID };
+    expect(logged(log, 'token_minted')).toEqual(github.mints.map(({ permissions }) => ({ ...audit, permissions })));
+    expect(log.mock.calls.flat().join('\n')).not.toContain('ghs_repo');
   });
 
   it('reacts to a queued command at once, with a token for that kind of comment alone', async () => {
@@ -1136,6 +1139,7 @@ describe('PrCoordinator dispatch', () => {
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches).toHaveLength(3);
     expect(actionsWrites()).toBe(2);
+    expect(logged(log, 'token_minted')).toHaveLength(github.mints.length);
   });
 
   it.each<[string, Reply]>([

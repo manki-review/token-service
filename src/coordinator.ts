@@ -506,7 +506,10 @@ export class PrCoordinator extends DurableObject<Env> {
     const key = JSON.stringify([target.installationId, target.repositoryId, Object.entries(permissions).sort()]);
     const cached = this.tokens.get(key);
     if (cached && cached.expiresAt - TOKEN_EXPIRY_MARGIN_MS > Date.now()) return { ok: true, ...cached };
-    const mint = await mintRepositoryToken(this.env, target.installationId, target.repositoryId, permissions);
+    const mint = await mintRepositoryToken(this.env, target.installationId, target.repositoryId, permissions, {
+      purpose: 'coordinator',
+      repository: `${target.owner}/${target.repo}`,
+    });
     if (mint.ok) this.tokens.set(key, { token: mint.token, expiresAt: mint.expiresAt });
     return mint;
   }

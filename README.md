@@ -18,6 +18,20 @@ With `memory: true`, the service mints a second token that holds only `contents:
 
 The repository name is fixed. A memory repo with any other name (`memory.repo` in `.manki.yml`) cannot get a token from this service and needs Manki's `memory_repo_token` input.
 
+### Audit log
+
+Every minted token logs one JSON line with `msg: token_minted`, never the token itself:
+
+| Field | Value |
+|---|---|
+| `purpose` | `review` or `memory` for `/token`, `coordinator` or `reconciler` for the Worker's own calls |
+| `repository_id`, `repository` | The repository the token is for. For a `memory` token, the requesting workflow's repository, while the token covers `review-memory` |
+| `installation_id` | The App installation the token comes from |
+| `permissions` | The permissions GitHub reports for the token |
+| `run_id`, `check_run_id` | The requesting workflow's OIDC claims, where present. `/token` mints only |
+
+Filter Workers Logs on `msg = token_minted` to see who got which token.
+
 ## Webhook
 
 `POST /webhook` receives the GitHub App's webhook deliveries for Manki's webhook mode. It checks the `X-Hub-Signature-256` HMAC against `WEBHOOK_SECRET`, checks that `X-GitHub-Hook-Installation-Target-ID` is `APP_ID`, and works out where the delivery would go: ignored, the PR's state lane (reviews, thread replies, `check`, `dismiss`, review state checks from reviews and from resolved or reopened threads) or its chat lane (explain, questions, help, remember, forget). Work and closes go to the PR's `PrCoordinator` Durable Object before the `202` leaves.
