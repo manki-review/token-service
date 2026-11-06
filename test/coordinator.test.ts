@@ -1166,16 +1166,21 @@ describe('PrCoordinator dispatch', () => {
     github.head = SHA_2;
     await runDurableObjectAlarm(pr.stub);
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'dispatching', head_sha: SHA_1, errors: 1 }]);
+    // The next try stores the newer head and fails to mint its dispatch token, so a retry must not see the bot's push.
     github.configStatus = 200;
-    github.dispatchStatuses = [502];
+    github.mintFailures = [{ permission: 'actions', reply: 502 }];
     advanceClock(backoff(0));
+    await runDurableObjectAlarm(pr.stub);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'dispatching', head_sha: SHA_2, sender: '', attempts: 0 }]);
+    github.dispatchStatuses = [502];
+    advanceClock(backoff(1));
     await runDurableObjectAlarm(pr.stub);
     expect(github.checkRuns).toEqual([]);
     // A label added after a dispatch attempt skips nothing, since that attempt's run may have started.
     github.labels = ['dependencies'];
     advanceClock(DISPATCH_BACKOFF_MS[0]);
     await runDurableObjectAlarm(pr.stub);
-    expect(github.configReads).toHaveLength(2);
+    expect(github.configReads).toHaveLength(3);
     expect(github.checkRuns).toEqual([]);
     expect(github.dispatches).toHaveLength(2);
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'running', head_sha: SHA_2 }]);
