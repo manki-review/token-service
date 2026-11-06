@@ -9,7 +9,7 @@ Workflows authenticate via [GitHub's OIDC provider](https://docs.github.com/en/a
 1. A GitHub Actions workflow requests an OIDC token with audience `manki-api.dustinface.me`
 2. The workflow POSTs to `https://manki-api.dustinface.me/token` with the OIDC token as a Bearer token and `{ owner, repo }` in the body, plus `memory: true` to also get a memory token
 3. The service verifies the OIDC token against GitHub's JWKS, checks that the repository claim matches, and refuses a token issued more than 10 minutes ago
-4. It creates a GitHub App JWT, looks up the installation for the repository, and requests an installation token for the requesting repository only (`repository_ids` from the OIDC `repository_id` claim). The token holds only the permissions Manki uses (see `src/permissions.ts`), each at no more than the installation grants. `contents` and `actions` never go above `read`
+4. It creates a GitHub App JWT, looks up the installation for the repository, and requests an installation token for the requesting repository only (`repository_ids` from the OIDC `repository_id` claim). The token holds only the permissions Manki uses (see `src/permissions.ts`), each at no more than the installation grants. `actions` never goes above `read`. `contents` is capped at `write`, because GitHub requires it to resolve review threads, and like every other permission it covers only the requesting repository.
 5. The installation token, its expiry and the permissions GitHub reports for it are returned to the workflow
 
 ### Memory token
