@@ -901,7 +901,9 @@ export class PrCoordinator extends DurableObject<Env> {
       const reaction = await githubApi(token, `${repo}/${comments}/comments/${item.object_id}/reactions`, { method: 'POST', body: { content: '+1' } });
       if (!reaction.ok) log('coordinator_reaction_failed', { ...this.logFields(), comment_id: item.object_id, status: reaction.status });
     }
-    const response = await githubApi(token, `${repo}/issues/${target.number}/comments`, { method: 'POST', body: { body: HELP_REPLY } });
+    // Manki marks the reply to a PR comment as its answer, as its `markAnswers` does.
+    const body = comments === 'issues' ? `${HELP_REPLY}\n<!-- manki-answered:${item.object_id} -->` : HELP_REPLY;
+    const response = await githubApi(token, `${repo}/issues/${target.number}/comments`, { method: 'POST', body: { body } });
     if (!response.ok) throw new Error(`posting the help reply failed with ${response.status}`);
     this.sql.exec('UPDATE work SET dispatched_at = ? WHERE id = ?', Date.now(), item.id);
     this.finish(item.id, 'done', 'answered help');

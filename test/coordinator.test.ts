@@ -382,18 +382,21 @@ describe('PrCoordinator.alarm', () => {
     await pr.send('pull_request', pr.push(SHA_1), 'd-push');
     await pr.send('pull_request_review_comment', pr.reply('Fixed'));
     await pr.send('issue_comment', pr.comment('@manki explain'));
+    await pr.send('issue_comment', pr.comment('@manki help'));
 
+    // A help answer is no run, but it writes to the PR, so it is held back too. `stubGitHub` refuses any other call.
     expect(await runDurableObjectAlarm(pr.stub)).toBe(true);
-    expect((await workRows(pr.stub)).map((row) => `${row.kind}:${row.status}`)).toEqual(['review:skipped', 'thread:queued', 'comment:skipped']);
+    expect((await workRows(pr.stub)).map((row) => `${row.kind}:${row.status}`)).toEqual(['review:skipped', 'thread:queued', 'comment:skipped', 'help:skipped']);
     expect(logged(log, 'coordinator_would_dispatch')).toEqual([
       expect.objectContaining({ work_id: 1, lane: 'state', kind: 'review', event: 'pull_request.synchronize', head_sha: SHA_1, delivery: 'd-push', opted_in: true }),
       expect.objectContaining({ work_id: 3, lane: 'chat', kind: 'comment', event: 'issue_comment.created', object_id: 1001, sender: 'alice' }),
+      expect.objectContaining({ work_id: 4, lane: 'help', kind: 'help' }),
     ]);
 
     expect(mints).toEqual([{ permissions: { contents: 'read', metadata: 'read' }, repository_ids: [REPOSITORY_ID] }]);
 
     expect(await runDurableObjectAlarm(pr.stub)).toBe(true);
-    expect((await workRows(pr.stub)).map((row) => row.status)).toEqual(['skipped', 'skipped', 'skipped']);
+    expect((await workRows(pr.stub)).map((row) => row.status)).toEqual(['skipped', 'skipped', 'skipped', 'skipped']);
   });
 
   it('logs the reason a repository is not opted in', async () => {
@@ -1233,7 +1236,7 @@ describe('PrCoordinator dispatch', () => {
     await runDurableObjectAlarm(pr.stub);
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches).toHaveLength(1);
-    expect(github.comments).toEqual([HELP_REPLY, HELP_REPLY]);
+    expect(github.comments).toEqual([`${HELP_REPLY}\n<!-- manki-answered:1001 -->`, HELP_REPLY]);
     expect(github.thumbsUp).toEqual(['issues/1001', 'pulls/1001']);
     // The eyes reaction on the explain minted the token the replies reuse, which holds nothing else.
     expect(github.mints.filter((mint) => mint.permissions.issues)).toEqual([{ permissions: { issues: 'write', pull_requests: 'write' }, repository_ids: [REPOSITORY_ID] }]);

@@ -114,6 +114,8 @@ export interface WebhookPayload {
     updated_at?: string;
   };
   review?: { id?: number; commit_id?: string; user?: User; author_association?: string };
+  /** What an `edited` action changed, with the earlier body. */
+  changes?: { body?: { from?: string } };
   workflow_run?: { id?: number; event?: string; path?: string; display_title?: string; conclusion?: string | null };
 }
 
@@ -323,7 +325,11 @@ function routeIssueComment(target: Target, payload: WebhookPayload): Route {
     return { type: 'work', target, work: work('state', 'review', payload, 'issue_comment', objectId) };
   }
   const command = parseCommandType(body);
-  if (command === 'help') return helpRoute(target, payload, 'issue_comment');
+  if (command === 'help') {
+    // The coordinator answers help itself and keeps no record of it, so only an edit that adds the command asks again.
+    if (action === 'edited' && parseCommandType(payload.changes?.body?.from ?? '') === 'help') return ignore('help was already asked');
+    return helpRoute(target, payload, 'issue_comment');
+  }
   const lane: Lane = command === 'check' || command === 'dismiss' ? 'state' : 'chat';
   return { type: 'work', target, work: work(lane, 'comment', payload, 'issue_comment', objectId) };
 }

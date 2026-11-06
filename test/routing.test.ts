@@ -101,6 +101,8 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['a free question', 'issue_comment', issueCommentEvent('@manki why is this slow?'), 'chat:comment'],
   ['a help', 'issue_comment', issueCommentEvent('@Manki help'), 'help:help'],
   ['a help that asks for a review', 'issue_comment', issueCommentEvent('@manki help me review this'), 'state:review'],
+  ['an edit that adds a help', 'issue_comment', issueCommentEvent('@manki help', { action: 'edited', previousBody: 'hmm' }), 'help:help'],
+  ['an edit that keeps a help', 'issue_comment', issueCommentEvent('@manki help, thanks', { action: 'edited', previousBody: '@manki help' }), 'ignore'],
   ['a remember', 'issue_comment', issueCommentEvent('@manki remember we use tabs'), 'chat:comment'],
   ['a forget', 'issue_comment', issueCommentEvent('@manki-review forget tabs'), 'chat:comment'],
   ['a check quoted in code', 'issue_comment', issueCommentEvent('@manki what does `@manki check` do?'), 'chat:comment'],
