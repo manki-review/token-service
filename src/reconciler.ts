@@ -34,7 +34,7 @@ interface OptInRow extends Record<string, string | number | null> {
   repository_id: number;
   installation_id: number;
   owner: string;
-  /** Null for a row recorded before the column existed, until a coordinator reports the repository again. */
+  /** Null for a row recorded before the column existed, until the next pass reads it from GitHub. */
   owner_id: number | null;
   repo: string;
   default_branch: string;
@@ -181,6 +181,11 @@ export class Reconciler extends DurableObject<Env> {
   private async runPass(): Promise<void> {
     const budget = new Budget(SUBREQUEST_BUDGET);
     try {
+      await this.backfillOwners(budget);
+    } catch (error) {
+      log('reconciler_backfill_error', { error: String(error) });
+    }
+    try {
       await this.redeliver(budget);
     } catch (error) {
       log('reconciler_redeliver_error', { error: String(error) });
@@ -189,6 +194,36 @@ export class Reconciler extends DurableObject<Env> {
       await this.catchUp(budget);
     } catch (error) {
       log('reconciler_catch_up_error', { error: String(error) });
+    }
+  }
+
+  /**
+   * Reads the owner id of each repository recorded before `owner_id` existed and stores it, so the repository is
+   * reconciled again without waiting for its next delivery. Each row costs a mint and a read, once.
+   */
+  private async backfillOwners(budget: Budget): Promise<void> {
+    const rows = this.sql.exec<OptInRow>('SELECT * FROM opt_ins WHERE owner_id IS NULL ORDER BY repository_id').toArray();
+    for (const row of rows) {
+      if (budget.left < 2) return;
+      budget.take();
+      const mint = await mintRepositoryToken(this.env, row.installation_id, row.repository_id, { metadata: 'read' }, {
+        purpose: 'reconciler',
+        repository: `${row.owner}/${row.repo}`,
+      });
+      if (!mint.ok) {
+        log('reconciler_token_refused', { repository_id: row.repository_id, status: mint.status });
+        if (mint.status === 404 || mint.status === 422) this.sql.exec('DELETE FROM opt_ins WHERE repository_id = ?', row.repository_id);
+        continue;
+      }
+      budget.take();
+      const response = await githubApi(mint.token, `/repositories/${row.repository_id}`);
+      if (!response.ok) {
+        log('reconciler_backfill_error', { repository_id: row.repository_id, status: response.status });
+        continue;
+      }
+      const ownerId = (await response.json() as { owner: { id: number } }).owner.id;
+      this.sql.exec('UPDATE opt_ins SET owner_id = ? WHERE repository_id = ?', ownerId, row.repository_id);
+      log('reconciler_owner_backfilled', { repository_id: row.repository_id, owner_id: ownerId });
     }
   }
 

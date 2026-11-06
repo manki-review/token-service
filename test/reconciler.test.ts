@@ -397,7 +397,7 @@ describe('Reconciler redelivery', () => {
     expect(rows).toBe(0);
   });
 
-  it('adds owner_id to a registry from before it and skips a row without one until it is recorded again', async () => {
+  it('adds owner_id to a registry from before it and reads it from GitHub for an old row in the next pass', async () => {
     const { stub, repo } = setup();
     const target = repo();
     const github = fakeGitHub();
@@ -416,13 +416,14 @@ describe('Reconciler redelivery', () => {
       // A new instance on the old schema, as after a deploy.
       const upgraded = new Reconciler(state, RUNTIME_ENV);
       await upgraded.reconcile();
-      expect(github.redelivered).toEqual([]);
-      expect(github.pullListCalls).toEqual([]);
-
-      await upgraded.recordOptIn(target, true);
-      await upgraded.reconcile();
-      expect(github.pullListCalls).toEqual([target.repo]);
       expect(state.storage.sql.exec('SELECT owner_id, opted_in_at FROM opt_ins').toArray()).toEqual([{ owner_id: OWNER_ID, opted_in_at: optedInAt }]);
+      expect(logged(log, 'reconciler_owner_backfilled')).toEqual([expect.objectContaining({ repository_id: target.repositoryId, owner_id: OWNER_ID })]);
+      expect(github.redelivered).toEqual([1]);
+      expect(github.pullListCalls).toEqual([target.repo]);
+
+      // The owner is read once.
+      await upgraded.reconcile();
+      expect(logged(log, 'reconciler_owner_backfilled')).toHaveLength(1);
     });
   });
 
