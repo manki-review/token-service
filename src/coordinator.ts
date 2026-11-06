@@ -124,6 +124,8 @@ export const MIGRATIONS = [
 ];
 
 const ACTIVE = `status IN ('dispatching', 'running')`;
+/** The event of a review command in a new comment. A Force review tick is always an edit, so it never has this event. */
+const REVIEW_COMMAND_EVENT = 'issue_comment.created';
 
 /** The wait before the next try after `errors` failures in a row: 2, 4, 8, then at most 16 minutes. */
 export function backoff(errors: number): number {
@@ -322,7 +324,8 @@ export class PrCoordinator extends DurableObject<Env> {
     if (work.kind === 'review') {
       // A request by someone outside the repository can neither take over a push review nor take on its head.
       if (!work.trusted) return `queued ${this.insert(work, delivery, now)}`;
-      const review = this.queued('state', ['review']).filter((row) => row.trusted).at(-1);
+      const reviews = this.queued('state', ['review']).filter((row) => row.trusted);
+      const review = reviews.at(-1);
       if (!review) return `queued ${this.insert(work, delivery, now)}`;
       const isPush = work.event.startsWith('pull_request.');
       const queuedPush = review.event.startsWith('pull_request.');
@@ -340,8 +343,16 @@ export class PrCoordinator extends DurableObject<Env> {
           'UPDATE work SET event = ?, head_sha = COALESCE(?, head_sha), object_id = ?, sender = ?, delivery = ? WHERE id = ?',
           work.event, work.headSha, work.objectId, work.sender, delivery, review.id,
         );
+      } else if (work.event === REVIEW_COMMAND_EVENT) {
+        // Manki reads the head when the run starts, so a queued review command answers every later one. The item names the
+        // newest command, so an edit or a delete of an earlier one cannot leave the later request without a run. An item
+        // with a dispatch attempt keeps its delivery id, which `findRun` looks for in the run title.
+        const command = reviews.filter((row) => row.event === REVIEW_COMMAND_EVENT && row.attempts === 0).at(-1);
+        if (!command) return `queued ${this.insert(work, delivery, now)}`;
+        this.sql.exec('UPDATE work SET object_id = ?, sender = ?, delivery = ? WHERE id = ?', work.objectId, work.sender, delivery, command.id);
+        return `merged into work ${command.id}`;
       } else {
-        // Each review request or tick is answered on its own, so one never hides another.
+        // Each tick, and each review request made by an edit, is answered on its own, so one never hides another.
         return `queued ${this.insert(work, delivery, now)}`;
       }
       return `merged into work ${review.id}`;
