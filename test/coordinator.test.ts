@@ -629,6 +629,7 @@ function fakeGitHub(number: number) {
     baseRef: 'main',
     /** The base branch's `.manki.yml`, or null when it has none. */
     config: null as string | null,
+    configStatus: 200,
     /** The refs `.manki.yml` was read at, and the check runs created. */
     configReads: [] as string[],
     checkRuns: [] as Array<Record<string, unknown>>,
@@ -700,6 +701,7 @@ function fakeGitHub(number: number) {
     }
     if (route === `GET ${repo}/contents/.manki.yml`) {
       state.configReads.push(url.searchParams.get('ref') ?? '');
+      if (state.configStatus !== 200) return Response.json({ message: 'no' }, { status: state.configStatus });
       if (state.config === null) return Response.json({ message: 'Not Found' }, { status: 404 });
       const content = btoa(String.fromCharCode(...new TextEncoder().encode(state.config)));
       return Response.json({ type: 'file', encoding: 'base64', size: state.config.length, content });
@@ -1152,6 +1154,31 @@ describe('PrCoordinator dispatch', () => {
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches).toHaveLength(1);
     expect(github.checkRuns).toEqual([]);
+  });
+
+  it('keeps judging a retried skip by the queued push, and applies skip rules only before the first dispatch attempt', async () => {
+    const pr = pullRequest();
+    const github = Object.assign(fakeGitHub(pr.number), { config: 'skip_authors: [renovate-bot]\nskip_labels: [dependencies]', author: 'renovate-bot' });
+    const push = pr.push(SHA_1);
+    await pr.send('pull_request', { ...push, sender: { ...push.sender, login: 'renovate-bot' } });
+    // The config read fails while a writer's push moves the head on, so the retry no longer credits the bot with it.
+    github.configStatus = 502;
+    github.head = SHA_2;
+    await runDurableObjectAlarm(pr.stub);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'dispatching', head_sha: SHA_1, errors: 1 }]);
+    github.configStatus = 200;
+    github.dispatchStatuses = [502];
+    advanceClock(backoff(0));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.checkRuns).toEqual([]);
+    // A label added after a dispatch attempt skips nothing, since that attempt's run may have started.
+    github.labels = ['dependencies'];
+    advanceClock(DISPATCH_BACKOFF_MS[0]);
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.configReads).toHaveLength(2);
+    expect(github.checkRuns).toEqual([]);
+    expect(github.dispatches).toHaveLength(2);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'running', head_sha: SHA_2 }]);
   });
 
   it('applies no skip rule to a review request, which only a push review reads', async () => {

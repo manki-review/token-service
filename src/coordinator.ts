@@ -866,12 +866,16 @@ export class PrCoordinator extends DurableObject<Env> {
         this.finish(item.id, 'dropped', 'pull request is a draft');
         return false;
       }
-      this.sql.exec('UPDATE work SET head_sha = ? WHERE id = ?', pr.head.sha, item.id);
-      const rule = await this.skipRule(pr, item.head_sha, item.sender, target);
+      // A retry after a dispatch attempt may find that attempt's run, so only the first attempt can skip. The head is
+      // stored once the decision is final, so a retry still compares the PR's head with the queued push's.
+      const rule = item.attempts === 0 ? await this.skipRule(pr, item.head_sha, item.sender, target) : null;
       if (!this.isDispatching(item.id)) return false;
       if (rule !== null) {
         await this.reportSkipped(pr.head.sha, rule, target);
         if (!this.isDispatching(item.id)) return false;
+      }
+      this.sql.exec('UPDATE work SET head_sha = ? WHERE id = ?', pr.head.sha, item.id);
+      if (rule !== null) {
         this.finish(item.id, 'skipped', `matches the skip rule for ${rule}`, 'skipped');
         return false;
       }
