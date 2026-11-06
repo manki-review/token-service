@@ -1414,6 +1414,8 @@ describe('PrCoordinator dispatch', () => {
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatchedWorkflows).toEqual([Object.hasOwn(workflows, 'manki.yml') ? 'manki.yml' : 'manki-dispatch.yml']);
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'running' }]);
+    const both = Object.keys(workflows).length > 1;
+    expect(logged(log, 'coordinator_opt_in_warning')).toEqual(both ? [expect.objectContaining({ workflow: 'manki.yml', ignored: ['manki-dispatch.yml'] })] : []);
   });
 
   it('takes the owner, name and default branch from the repository id, never from the payload', async () => {
