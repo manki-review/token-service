@@ -1,6 +1,8 @@
 import { numberFromRunTitle } from './dispatch';
 import {
   BOT_LOGIN,
+  type BoxChange,
+  changedBoxes,
   detectTickedMarker,
   hasBotMention,
   isBotMentionNonReview,
@@ -8,6 +10,8 @@ import {
   MANKI_COMMENT_MARKER,
   MANKI_LOGINS,
   parseCommandType,
+  type ReviewMode,
+  SETTINGS_MARKER,
 } from './manki';
 
 /** A comment event older than this when it arrives, such as a late redelivery, is dropped. */
@@ -22,9 +26,10 @@ const WORKFLOW_PATH = /^\.github\/workflows\/[^/@]+\.ya?ml(@.+)?$/;
 /**
  * The state lane carries everything that reads or changes threads, verdicts or approval. The chat lane carries
  * answers that change no PR state, so a question does not wait behind a review. The help lane carries help commands,
- * which the Worker answers itself, so they wait behind no run.
+ * which the Worker answers itself, so they wait behind no run. The settings lane carries edits of Manki's settings
+ * boxes, which the Worker applies itself, so a Cancel tick never waits behind the run it cancels.
  */
-export type Lane = 'state' | 'chat' | 'help';
+export type Lane = 'state' | 'chat' | 'help' | 'settings';
 
 /**
  * The Manki handler a work item ends up in. Only `review` items coalesce.
@@ -35,8 +40,9 @@ export type Lane = 'state' | 'chat' | 'help';
  * - `comment`: `handleInteraction`
  * - `issue`: `handleIssueInteraction`
  * - `help`: answered by the Worker, with no run
+ * - `settings`: applied by the Worker, with no run
  */
-export type WorkKind = 'review' | 'merged' | 'review_state' | 'thread' | 'comment' | 'issue' | 'help';
+export type WorkKind = 'review' | 'merged' | 'review_state' | 'thread' | 'comment' | 'issue' | 'help' | 'settings';
 
 /** The pull request or issue a delivery is about. Every field comes from the signed payload. */
 export interface Target {
@@ -73,6 +79,10 @@ export interface Work {
    * `COLLABORATOR`.
    */
   writer: boolean;
+  /** For a review, what the settings boxes asked of it. */
+  modes?: ReviewMode[];
+  /** For a settings edit, the boxes it ticked or unticked. */
+  boxes?: BoxChange[];
 }
 
 export type Route =
@@ -300,6 +310,14 @@ function routeIssueComment(target: Target, payload: WebhookPayload): Route {
   const body = comment?.body ?? '';
   const objectId = comment?.id ?? null;
   const onPullRequest = Boolean(payload.issue?.pull_request);
+
+  // Only the box ticks matter. Editing Manki's comment takes write access, which the coordinator checks for the editor.
+  if (onPullRequest && action === 'edited' && MANKI_LOGINS.includes(comment?.user?.login ?? '') && body.includes(SETTINGS_MARKER)) {
+    const before = payload.changes?.body?.from;
+    const boxes = before === undefined ? [] : changedBoxes(before, body);
+    if (boxes.length === 0) return ignore('no settings box changed');
+    return { type: 'work', target, work: { ...work('settings', 'settings', payload, 'issue_comment', objectId), acknowledge: false, writer: false, boxes } };
+  }
 
   // Manki decides whether the comment's author is one of its identities. Only a tick on a comment by its default
   // logins becomes a review trigger. Any other tick queues on its own, so it cannot replace a queued push review.

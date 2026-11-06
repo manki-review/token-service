@@ -46,18 +46,41 @@ Some decisions need no model, so the coordinator makes them without a run:
 - **Write access.** Manki only acts on a comment whose sender has write access. A comment item whose payload shows no write access (an `author_association` other than `OWNER`, `MEMBER` or `COLLABORATOR`, or an edit of someone else's comment) has its sender looked up with `GET /repos/{owner}/{repo}/collaborators/{login}/permission` before it starts. Without `admin` or `write` it ends skipped and starts no run. Such an item can neither take over a queued push review nor take on its head, so a refused comment never costs the push its review.
 - **Pause.** While the PR's reported `pause` is set, a review from a push, a ready for review or a catch-up ends skipped. Everything a person asks for still runs: a Force review tick, a review request, thread replies, other commands and review state checks, so resolving the last thread can still lead to an approval.
 
+### Settings boxes
+
+Manki's progress comment carries the settings boxes, and the Worker applies their ticks. The Action renders the boxes that apply, and the Worker keys on each line's hidden id only, never on its label:
+
+```
+- [ ] Pause automatic reviews <!-- manki-box:pause -->
+- [ ] Full review <!-- manki-box:full -->
+- [ ] Deeper review <!-- manki-box:deeper -->
+- [ ] Cancel this review <!-- manki-box:cancel -->
+- [ ] Review this draft <!-- manki-box:draft -->
+- [ ] Force review <!-- manki-box:force -->
+<!-- manki-settings -->
+```
+
+An `issue_comment.edited` delivery on a comment by one of Manki's logins that holds `<!-- manki-settings -->` goes to the settings lane. Only boxes whose tick differs between `changes.body.from` and the new body count, and Manki's own edits are dropped as a bot's. The editor's write access is looked up as for any comment, and reused for 5 minutes per login. Someone without it gets the changed boxes put back and changes nothing. A writer's change applies at once:
+
+- **Pause** sets `settings.paused` until a writer unticks it. While it is set, automatic reviews end skipped as for the reported `pause`.
+- **Full review**, **Deeper review**, **Review this draft** and **Force review** each ask for one review with that mode. The mode joins a review a writer already queued. A queued push review becomes the box's review, so a pause, a skip rule or a draft cannot drop it. Otherwise a review of the edited comment is queued. The run reads its modes from `/state`, never from the dispatch inputs, and the box clears when the Action renders the comment again.
+- **Cancel** cancels the running review with the coordinator's `actions: write` token. Its item ends `skipped` with conclusion `cancelled`, and the cron does not review that head again. With no review running, it changes nothing.
+- Unticking any box but Pause changes nothing.
+
 Only repositories owned by an account whose numeric id is in `WEBHOOK_ACCOUNTS` (comma-separated, in `wrangler.toml`) reach a coordinator. That is the account the App is installed on, a user or an organization. Any repository of a listed account works once it opts in as described above. A delivery for any other account is logged and answered `202` without touching Durable Object storage, so another installation cannot use up the account's daily storage write quota. Look up an account's id with `gh api users/<login> --jq .id`. Each installation may also store at most 500 comment, review and thread deliveries from people without write access an hour (per clock hour, `INSTALLATION_EVENTS_PER_HOUR` to change it). The `InstallationLimiter` Durable Object, one per installation, counts them. One over the cap is logged and answered `202` without touching a coordinator. Only stored work counts: a delivery the router ignores never reaches the limiter, and the limiter counts a delivery only after its coordinator stored it, so a refused replay writes nothing. `pull_request` deliveries are exempt, because a push to a branch of the repository takes write access and the router already drops fork pushes. A comment or review whose author's `author_association` is `OWNER`, `MEMBER` or `COLLABORATOR` is exempt too, and so are a Force review tick (an edit of Manki's comment), a dismissed review and a resolved or reopened thread, which take write access as well. So outsiders can only use up their own share. Run ends are exempt, since dropping one would leave a lane busy. A run end only comes from a run the App started and writes nothing unless it ends a running item. A close that is no merge and finds no queued work writes at most its close time and delivery id, once until the next reopen. A fork's reopen is dropped, so an outsider closing and reopening a PR in a loop costs no storage. Only a stored delivery writes the count, one row each, so a flood above the cap adds no storage writes. `workflow_run` deliveries are dropped unless `manki-review[bot]` sent them, and a body over 25 MiB is refused with `413` while it is read, with or without `Content-Length`.
 
 ## PR state
 
 The coordinator keeps each PR's running state, so Manki reads it there instead of from its comments. Both endpoints take the workflow's OIDC token as the bearer token and a JSON body `{ owner, repo, pr }`, checked as for `/token`. The coordinator is named from the token's `repository_id` claim, so a workflow only reaches the PRs of its own repository.
 
-- `POST /state` returns `{ active, queue, last_reviewed, last_approval, pause }`:
-  - `active`: the items dispatching or running, with `lane`, `run_id`, `kind`, `event`, `head_sha` and `dispatched_at`.
-  - `queue`: the queued items, with `lane`, `kind`, `event`, `head_sha` and `enqueued_at`.
+- `POST /state` returns `{ active, queue, last_reviewed, last_approval, pause, settings }`:
+  - `active`: the items dispatching or running, with `lane`, `run_id`, `kind`, `event`, `head_sha`, `dispatched_at` and `modes`. A run finds its own item by `run_id`.
+  - `queue`: the queued items, with `lane`, `kind`, `event`, `head_sha`, `enqueued_at` and `modes`.
+  - `modes`: what the settings boxes asked of a review, any of `full`, `deeper`, `draft` and `force`. Empty for any other item.
   - `last_reviewed`: `{ commit, run_id, at }`, the last commit a run reported as reviewed.
   - `last_approval`: `{ commit, held, run_id, at }`. `held` marks an approval Manki held because the PR conflicts with its base, which resets the round count like any approval.
   - `pause`: `{ reason, at }` while the automatic pause the Action decided is on, such as the round cap.
+  - `settings`: `{ paused }`, whether a writer ticked Pause. Its presence tells the Action that the Worker handles the settings boxes.
   - It writes nothing, and a PR the coordinator never saw returns an empty state.
 - `POST /state/report` stores what the PR's active run found. The body adds any of `reviewed: { commit }`, `approval: { commit, held }` and `pause: { reason }` or `pause: null`. Only the run in the token's `run_id` claim may report, and only while the coordinator tracks it as dispatching or running. Any other run gets `403`. A report that changes nothing writes nothing. Each report logs one `state_report` line with the PR, the run id, the fields and the result. It returns `{ changed }`, the fields that changed.
 

@@ -22,6 +22,8 @@ import {
 } from './payloads';
 
 /** A compact form of the route: `ignore`, `<lane>:<kind>`, `close`, `close+merged`, `seen`, `reopen` or `run_completed`. */
+const SETTINGS_COMMENT = '- [ ] Pause automatic reviews <!-- manki-box:pause -->\n- [ ] Full review <!-- manki-box:full -->\n<!-- manki-settings -->';
+
 function verdict(route: Route): string {
   switch (route.type) {
     case 'ignore':
@@ -121,6 +123,11 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['an edit that keeps a mention', 'issue_comment', issueCommentEvent('@manki explain this', { action: 'edited', previousBody: '@manki explain' }), 'chat:comment'],
   ['an edit that keeps a review request', 'issue_comment', issueCommentEvent('@manki review please', { action: 'edited', previousBody: '@manki review' }), 'state:review'],
   ['an edit that removes a mention', 'issue_comment', issueCommentEvent('never mind', { action: 'edited', previousBody: '@manki explain' }), 'ignore'],
+
+  ['a ticked settings box', 'issue_comment', issueCommentEvent(SETTINGS_COMMENT.replace('[ ] Pause', '[x] Pause'), { action: 'edited', author: MANKI_AUTHOR, previousBody: SETTINGS_COMMENT }), 'settings:settings'],
+  ['a settings edit that changes no box', 'issue_comment', issueCommentEvent(`${SETTINGS_COMMENT}\nmore`, { action: 'edited', author: MANKI_AUTHOR, previousBody: SETTINGS_COMMENT }), 'ignore'],
+  ['a settings edit without the earlier body', 'issue_comment', issueCommentEvent(SETTINGS_COMMENT, { action: 'edited', author: MANKI_AUTHOR }), 'ignore'],
+  ['a ticked box on a copy of the settings by someone else', 'issue_comment', issueCommentEvent(SETTINGS_COMMENT.replace('[ ] Pause', '[x] Pause'), { action: 'edited', previousBody: SETTINGS_COMMENT }), 'ignore'],
 
   // issue_comment on an issue
   ['a mention on an issue', 'issue_comment', issueCommentEvent('@manki help', { onIssue: true }), 'chat:issue'],
@@ -242,6 +249,15 @@ describe('routeDelivery', () => {
   ])('marks %s as a writer or not', (_case, event, payload, writer) => {
     const route = routeDelivery(event, payload);
     expect(route.type === 'work' && route.work.writer).toBe(writer);
+  });
+
+  it('names the boxes a settings edit ticked or unticked, and counts the editor as no writer until looked up', () => {
+    const before = SETTINGS_COMMENT.replace('[ ] Full', '[x] Full');
+    const after = SETTINGS_COMMENT.replace('[ ] Pause', '[X] Pause');
+    expect(routeDelivery('issue_comment', issueCommentEvent(after, { action: 'edited', author: MANKI_AUTHOR, previousBody: before }))).toMatchObject({
+      type: 'work',
+      work: { lane: 'settings', kind: 'settings', event: 'issue_comment.edited', writer: false, acknowledge: false, boxes: [{ box: 'pause', ticked: true }, { box: 'full', ticked: false }] },
+    });
   });
 
   it('fills the merge work and the run end', () => {

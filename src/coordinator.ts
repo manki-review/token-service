@@ -3,7 +3,7 @@ import { dispatchInputs, runTitle } from './dispatch';
 import type { Env } from './env';
 import { githubApi, isRateLimited, type MintResult, mintRepositoryToken } from './github';
 import { log } from './log';
-import { BOT_LOGIN, HELP_REPLY, matchSkipRule, parseSkipRules } from './manki';
+import { BOT_LOGIN, type BoxChange, HELP_REPLY, matchSkipRule, parseSkipRules, REVIEW_MODES, type ReviewMode, setBoxes } from './manki';
 import { LEGACY_DISPATCH_WORKFLOW, type OptIn, readOptIn, type Repository } from './opt-in';
 import type { Permissions } from './permissions';
 import { RECONCILER_NAME } from './reconciler';
@@ -27,7 +27,7 @@ export const OPT_IN_TTL_MS = 5 * MINUTE;
 export const FINISHED_RETENTION_MS = 7 * DAY;
 /** How long an alarm may hold an item in `dispatching` before another pass takes it back. */
 const LEASE_MS = 5 * MINUTE;
-const LANES: readonly Lane[] = ['state', 'chat', 'help'];
+const LANES: readonly Lane[] = ['state', 'chat', 'help', 'settings'];
 
 /** The wait before each retry of a dispatch that failed with a 5xx or a network error. */
 export const DISPATCH_BACKOFF_MS = [15_000, MINUTE, 5 * MINUTE];
@@ -50,6 +50,8 @@ export const DISPATCHES_PER_HOUR = 30;
 export const UNTRUSTED_DISPATCHES_PER_HOUR = 5;
 /** A token is minted again once it expires within this time. */
 const TOKEN_EXPIRY_MARGIN_MS = 5 * MINUTE;
+/** How long a looked-up write access is reused for the same login. */
+const WRITER_CACHE_MS = 5 * MINUTE;
 const NOT_STARTED = new Set(['queued', 'requested', 'waiting', 'pending']);
 /** A larger `.manki.yml` is not parsed for skip rules, as it costs too much CPU in an alarm. */
 const MAX_CONFIG_BYTES = 64 * 1024;
@@ -82,6 +84,10 @@ export interface WorkRow extends Record<string, string | number | null> {
   trusted: number;
   /** 1 when the payload shows the sender has write access. A comment item with 0 has its sender looked up before it starts. */
   writer: number;
+  /** For a review, the JSON list of the modes the settings boxes asked for. Null for none. */
+  modes: string | null;
+  /** For a settings edit, the JSON list of the boxes it changed. */
+  boxes: string | null;
   /** How often the item was queued again after its run never started or its workflow file was gone. */
   requeues: number;
   /** The workflow file the last dispatch attempt named. Null before the first attempt. */
@@ -125,12 +131,15 @@ interface ReportedState {
   last_approval: { commit: string; held: boolean; run_id: number; at: number } | null;
   /** The automatic pause the Action decided from the round history, such as the round cap. */
   pause: { reason: string; at: number } | null;
+  /** What a writer set with the settings boxes. Only Pause stays set, the other boxes ask for one review each. */
+  settings: { paused: boolean };
 }
 
 const EMPTY_STATE: ReportedState = {
   last_reviewed: null,
   last_approval: null,
   pause: null,
+  settings: { paused: false },
 };
 
 /** What a run of the PR reports. A field left out keeps its value, and `pause: null` lifts the pause. */
@@ -142,16 +151,21 @@ export interface StateReport {
 
 /** The PR's running state as `/state` returns it. Times are ISO strings. */
 export interface PrState {
-  active: Array<{ lane: Lane; run_id: number | null; kind: Work['kind']; event: string; head_sha: string | null; dispatched_at: string | null }>;
-  queue: Array<{ lane: Lane; kind: Work['kind']; event: string; head_sha: string | null; enqueued_at: string }>;
+  active: Array<{
+    lane: Lane; run_id: number | null; kind: Work['kind']; event: string; head_sha: string | null; dispatched_at: string | null; modes: ReviewMode[];
+  }>;
+  queue: Array<{ lane: Lane; kind: Work['kind']; event: string; head_sha: string | null; enqueued_at: string; modes: ReviewMode[] }>;
   last_reviewed: { commit: string; run_id: number; at: string } | null;
   last_approval: { commit: string; held: boolean; run_id: number; at: string } | null;
   pause: { reason: string; at: string } | null;
+  settings: { paused: boolean };
 }
 
 export type ReportResult = { accepted: false; reason: string } | { accepted: true; changed: string[] };
 
 const iso = (at: number) => new Date(at).toISOString();
+
+const modesOf = (row: WorkRow): ReviewMode[] => (row.modes === null ? [] : JSON.parse(row.modes) as ReviewMode[]);
 
 // Each entry runs once, in order. Append new entries; never edit a shipped one.
 export const MIGRATIONS = [
@@ -184,6 +198,8 @@ export const MIGRATIONS = [
   `ALTER TABLE work ADD COLUMN requeues INTEGER NOT NULL DEFAULT 0;`,
   `ALTER TABLE work ADD COLUMN workflow TEXT;`,
   `ALTER TABLE work ADD COLUMN writer INTEGER NOT NULL DEFAULT 0;`,
+  `ALTER TABLE work ADD COLUMN modes TEXT;
+   ALTER TABLE work ADD COLUMN boxes TEXT;`,
 ];
 
 const ACTIVE = `status IN ('dispatching', 'running')`;
@@ -205,6 +221,8 @@ export class PrCoordinator extends DurableObject<Env> {
   private optInRead: Promise<OptIn> | null = null;
   /** Tokens minted by this instance, by repository and permissions. Kept in memory only, so no token is stored. */
   private readonly tokens = new Map<string, { token: string; expiresAt: number }>();
+  /** Whether a login has write access, as last looked up, until the time it is looked up again. */
+  private readonly writers = new Map<string, { writer: boolean; until: number }>();
 
   /** Whether this instance created or upgraded its tables. They are created on first use, not in the constructor. */
   private schemaReady = false;
@@ -328,26 +346,27 @@ export class PrCoordinator extends DurableObject<Env> {
     const rows = this.sql.exec<{ status: WorkStatus; conclusion: string | null }>(
       `SELECT status, conclusion FROM work WHERE kind = 'review' AND head_sha = ?`, head,
     ).toArray();
-    if (rows.some((row) => (row.status === 'done' && row.conclusion === 'success') || (row.status === 'skipped' && row.conclusion === 'skipped'))) return 'handled';
+    if (rows.some((row) => (row.status === 'done' && row.conclusion === 'success') || (row.status === 'skipped' && (row.conclusion === 'skipped' || row.conclusion === 'cancelled')))) return 'handled';
     if (rows.some((row) => row.status === 'queued' || row.status === 'dispatching' || row.status === 'running')) return 'pending';
     return null;
   }
 
   /** Returns the PR's running state. Writes nothing, so asking about a PR without state creates none. */
   async state(): Promise<PrState> {
-    const { last_reviewed: reviewed, last_approval: approval, pause } = this.reported();
+    const { last_reviewed: reviewed, last_approval: approval, pause, settings } = this.reported();
     const work = this.hasState() ? this.sql.exec<WorkRow>(`SELECT * FROM work WHERE status = 'queued' OR ${ACTIVE} ORDER BY id`).toArray() : [];
     return {
       active: work.filter((row) => row.status !== 'queued').map((row) => ({
         lane: row.lane, run_id: row.run_id, kind: row.kind, event: row.event, head_sha: row.head_sha,
-        dispatched_at: row.dispatched_at === null ? null : iso(row.dispatched_at),
+        dispatched_at: row.dispatched_at === null ? null : iso(row.dispatched_at), modes: modesOf(row),
       })),
       queue: work.filter((row) => row.status === 'queued').map((row) => ({
-        lane: row.lane, kind: row.kind, event: row.event, head_sha: row.head_sha, enqueued_at: iso(row.enqueued_at),
+        lane: row.lane, kind: row.kind, event: row.event, head_sha: row.head_sha, enqueued_at: iso(row.enqueued_at), modes: modesOf(row),
       })),
       last_reviewed: reviewed && { ...reviewed, at: iso(reviewed.at) },
       last_approval: approval && { ...approval, at: iso(approval.at) },
       pause: pause && { ...pause, at: iso(pause.at) },
+      settings,
     };
   }
 
@@ -386,7 +405,7 @@ export class PrCoordinator extends DurableObject<Env> {
       this.ensureSchema();
       stored = this.getMeta<Partial<ReportedState>>('pr_state');
     }
-    return { ...EMPTY_STATE, ...stored };
+    return { ...EMPTY_STATE, ...stored, settings: { ...EMPTY_STATE.settings, ...stored?.settings } };
   }
 
   /**
@@ -444,9 +463,10 @@ export class PrCoordinator extends DurableObject<Env> {
 
   private insert(work: Work, delivery: string, now: number): string {
     const id = this.sql.exec<{ id: number }>(
-      `INSERT INTO work (lane, kind, event, head_sha, object_id, sender, delivery, enqueued_at, status, trusted, writer)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?) RETURNING id`,
+      `INSERT INTO work (lane, kind, event, head_sha, object_id, sender, delivery, enqueued_at, status, trusted, writer, modes, boxes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?) RETURNING id`,
       work.lane, work.kind, work.event, work.headSha, work.objectId, work.sender, delivery, now, Number(work.trusted), Number(work.writer),
+      work.modes?.length ? JSON.stringify(work.modes) : null, work.boxes ? JSON.stringify(work.boxes) : null,
     ).one().id;
     return `work ${id}`;
   }
@@ -460,8 +480,9 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /** Queues `work`, merging it with what is already queued where one run covers both. */
   private enqueue(work: Work, delivery: string, now: number): string {
-    if (work.event === 'issue_comment.edited' && work.objectId !== null) {
-      // The run reads the comment as it is then, so one queued item covers every edit of the comment.
+    if (work.event === 'issue_comment.edited' && work.objectId !== null && work.kind !== 'settings') {
+      // The run reads the comment as it is then, so one queued item covers every edit of the comment. A settings edit
+      // carries its own box changes, so each one is applied.
       const [same] = this.sql.exec<{ id: number }>(
         `SELECT id FROM work WHERE status = 'queued' AND lane = ? AND kind = ? AND object_id = ? AND trusted = ? AND event LIKE 'issue_comment.%'`,
         work.lane, work.kind, work.objectId, Number(work.trusted),
@@ -731,10 +752,16 @@ export class PrCoordinator extends DurableObject<Env> {
         return;
       }
       if (!(await this.senderMayAsk(item))) {
+        if (item.kind === 'settings') await this.revertBoxes(item);
         if (this.isDispatching(item.id)) this.finish(item.id, 'skipped', 'commenter has no write access');
         return;
       }
-      if (!this.isDispatching(item.id) || this.capped(item)) return;
+      if (!this.isDispatching(item.id)) return;
+      if (item.kind === 'settings') {
+        await this.applySettings(item);
+        return;
+      }
+      if (this.capped(item)) return;
       if (item.kind === 'help') await this.answerHelp(item);
       else await this.dispatch(item, optIn.workflow);
     } catch (error) {
@@ -791,7 +818,8 @@ export class PrCoordinator extends DurableObject<Env> {
     const target = await this.verifiedTarget();
     if (!target) throw new Error('the repository could not be read');
     // Only a review nobody asked for waits out a pause. A request, a reply or a Force review tick still runs.
-    if (item.kind === 'review' && item.event.startsWith('pull_request.') && this.reported().pause !== null) {
+    const { pause, settings } = this.reported();
+    if (item.kind === 'review' && item.event.startsWith('pull_request.') && (pause !== null || settings.paused)) {
       this.finish(item.id, 'skipped', 'pull request is paused');
       return;
     }
@@ -873,16 +901,93 @@ export class PrCoordinator extends DurableObject<Env> {
   private async senderMayAsk(item: WorkRow): Promise<boolean> {
     if (item.writer || !(item.event.startsWith('issue_comment.') || item.event.startsWith('pull_request_review_comment.'))) return true;
     if (!item.sender) return false;
+    const cached = this.writers.get(item.sender);
+    if (cached && cached.until > Date.now()) return cached.writer;
     const target = await this.verifiedTarget();
     if (!target) throw new Error('the repository could not be read');
     const token = await this.token({ metadata: 'read' });
     if (token === null) return false;
     const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/collaborators/${encodeURIComponent(item.sender)}/permission`);
-    if (response.status === 404) return false;
-    if (!response.ok) throw new Error(`reading the permission of ${item.sender} failed with ${response.status}`);
-    const { permission } = await response.json() as { permission?: string };
+    if (!response.ok && response.status !== 404) throw new Error(`reading the permission of ${item.sender} failed with ${response.status}`);
+    const { permission } = response.ok ? await response.json() as { permission?: string } : {};
     // GitHub reports `maintain` as `write` here, as Manki's `hasWriteAccess` expects.
-    return permission === 'admin' || permission === 'write';
+    const writer = permission === 'admin' || permission === 'write';
+    this.writers.set(item.sender, { writer, until: Date.now() + WRITER_CACHE_MS });
+    return writer;
+  }
+
+  /**
+   * Applies a writer's box changes. Pause is set and cleared. A tick of a review box asks for one review with that mode,
+   * and Cancel cancels the running review. Unticking any other box changes nothing, since it clears itself.
+   */
+  private async applySettings(item: WorkRow): Promise<void> {
+    const changes = JSON.parse(item.boxes ?? '[]') as BoxChange[];
+    const effects: string[] = [];
+    for (const { box, ticked } of changes) {
+      if (box === 'pause') {
+        const state = this.reported();
+        if (state.settings.paused === ticked) continue;
+        this.setMeta('pr_state', { ...state, settings: { paused: ticked } });
+        effects.push(ticked ? 'paused' : 'resumed');
+      } else if (ticked && (REVIEW_MODES as readonly string[]).includes(box)) {
+        effects.push(this.requestReview(item, box as ReviewMode));
+      } else if (ticked && box === 'cancel') {
+        effects.push(await this.cancelReview(item));
+      }
+    }
+    if (this.isDispatching(item.id)) this.finish(item.id, 'done', effects.join(', ') || 'nothing changed');
+  }
+
+  /**
+   * Asks for one review with `mode`. The mode joins a review a writer already queued, and a queued push review becomes
+   * the box's review, so a pause, a skip rule or a draft cannot drop it. Otherwise a review is queued.
+   */
+  private requestReview(item: WorkRow, mode: ReviewMode): string {
+    const review = this.queued('state', ['review']).filter((row) => row.writer).at(-1);
+    if (!review) {
+      const work: Work = {
+        lane: 'state', kind: 'review', event: item.event, headSha: null, objectId: item.object_id, sender: item.sender,
+        trusted: true, acknowledge: false, writer: true, modes: [mode],
+      };
+      return `${mode} review ${this.insert(work, item.delivery, Date.now())}`;
+    }
+    const modes = JSON.stringify([...new Set([...modesOf(review), mode])]);
+    if (review.event.startsWith('pull_request.')) {
+      this.sql.exec(
+        'UPDATE work SET event = ?, object_id = ?, sender = ?, delivery = ?, modes = ? WHERE id = ?',
+        item.event, item.object_id, item.sender, item.delivery, modes, review.id,
+      );
+    } else {
+      this.sql.exec('UPDATE work SET modes = ? WHERE id = ?', modes, review.id);
+    }
+    return `${mode} review in work ${review.id}`;
+  }
+
+  /** Cancels the running review. A review not yet running, or one GitHub gave no run id, cannot be cancelled. */
+  private async cancelReview(item: WorkRow): Promise<string> {
+    const running = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE kind = 'review' AND status = 'running' AND run_id IS NOT NULL`).toArray()[0];
+    if (!running) return 'no review to cancel';
+    const target = await this.verifiedTarget();
+    if (!target) throw new Error('the repository could not be read');
+    await this.cancel(running, target, `cancelled by ${item.sender}`, false, ['skipped', 'cancelled']);
+    return `cancel of work ${running.id} requested`;
+  }
+
+  /** Puts back the boxes someone without write access changed, so the comment shows what applies. */
+  private async revertBoxes(item: WorkRow): Promise<void> {
+    const target = await this.verifiedTarget();
+    if (!target) throw new Error('the repository could not be read');
+    const token = await this.token({ issues: 'write', pull_requests: 'write' });
+    if (token === null || item.object_id === null) return;
+    const path = `/repos/${target.owner}/${target.repo}/issues/comments/${item.object_id}`;
+    const read = await githubApi(token, path);
+    if (!read.ok) throw new Error(`reading the settings comment failed with ${read.status}`);
+    const { body } = await read.json() as { body?: string };
+    const changes = JSON.parse(item.boxes ?? '[]') as BoxChange[];
+    const reverted = setBoxes(body ?? '', changes.map(({ box, ticked }) => ({ box, ticked: !ticked })));
+    if (reverted === body) return;
+    const response = await githubApi(token, path, { method: 'PATCH', body: { body: reverted } });
+    if (!response.ok) throw new Error(`reverting the settings comment failed with ${response.status}`);
   }
 
   /** Answers a help command with Manki's command table and a thumbs-up on the command, with no run. */
@@ -1085,10 +1190,12 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Cancels a run that overran and ends its item, or queues the item again when `requeue` is set. A failed cancel
-   * keeps the item running, so the next poll tries again.
+   * Cancels a run and ends its item as `ended`, a status and conclusion, or queues the item again when `requeue` is set.
+   * A failed cancel keeps the item running, so the next poll tries again.
    */
-  private async cancel(item: WorkRow, target: Target, reason: string, requeue = false): Promise<void> {
+  private async cancel(
+    item: WorkRow, target: Target, reason: string, requeue = false, ended: [WorkStatus, string | null] = ['timed_out', null],
+  ): Promise<void> {
     const token = await this.token({ actions: 'write' });
     if (token === null) {
       // Without `actions: write` no other run can be dispatched either, so ending the item cannot let two overlap.
@@ -1102,7 +1209,7 @@ export class PrCoordinator extends DurableObject<Env> {
     } else if (requeue) {
       this.requeue(item.id, reason, `${reason}, cancel requested, queued again`);
     } else {
-      this.finish(item.id, 'timed_out', `${reason}, cancel requested`);
+      this.finish(item.id, ended[0], `${reason}, cancel requested`, ended[1]);
     }
   }
 
