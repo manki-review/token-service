@@ -706,7 +706,7 @@ describe('PrCoordinator dispatch', () => {
 
     expect(github.reactions).toEqual(['issues/1001', 'pulls/1001']);
     expect(github.mints).toEqual([
-      { permissions: { issues: 'write' }, repository_ids: [REPOSITORY_ID] },
+      { permissions: { issues: 'write', pull_requests: 'write' }, repository_ids: [REPOSITORY_ID] },
       { permissions: { pull_requests: 'write' }, repository_ids: [REPOSITORY_ID] },
     ]);
     expect(github.dispatches).toHaveLength(1);
