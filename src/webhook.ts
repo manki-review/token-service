@@ -102,7 +102,8 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
     ? { type: 'ignore', reason: `repository ${routed.target.repositoryId} is not in WEBHOOK_REPOS` }
     : routed;
   // One installation may store only so many deliveries an hour, so a flood from it cannot use up the quota either.
-  if (route.type !== 'ignore') {
+  // A close and a run's end are exempt, since dropping one would leave work queued or a lane busy.
+  if (route.type === 'work' || route.type === 'seen') {
     const limit = eventsPerHour(env);
     try {
       if (!await env.INSTALLATION_LIMITER.getByName(String(route.target.installationId)).take(limit)) {

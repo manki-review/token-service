@@ -145,7 +145,7 @@ describe('/webhook', () => {
     expect(await workRows(coordinator(REPOSITORY_ID, 33))).toHaveLength(1);
   });
 
-  it('ignores deliveries over the installation cap until the next hour, without touching their coordinators', async () => {
+  it('ignores work over the installation cap until the next hour, without touching its coordinator', async () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const installation = 5151;
     const env = { ...TEST_ENV, INSTALLATION_EVENTS_PER_HOUR: '2' };
@@ -158,6 +158,13 @@ describe('/webhook', () => {
     expect(logged(log, 'webhook').map((line) => line.reason ?? line.route)).toEqual(['chat', 'chat', `installation ${installation} is over 2 events this hour`]);
     expect(await workRows(coordinator(REPOSITORY_ID, 62))).toHaveLength(1);
     expect(await workRows(coordinator(REPOSITORY_ID, 63))).toEqual([]);
+    // A close and a run's end still get through.
+    const close = { ...pullRequestEvent('closed', { number: 62 }), installation: { id: installation } };
+    expect((await postWebhook({ event: 'pull_request', payload: close, env })).status).toBe(202);
+    expect(await workRows(coordinator(REPOSITORY_ID, 62))).toMatchObject([{ status: 'dropped', note: 'pull request closed' }]);
+    const runEnd = { ...workflowRunEvent(), installation: { id: installation } };
+    expect((await postWebhook({ event: 'workflow_run', payload: runEnd, env })).status).toBe(202);
+    expect(logged(log, 'webhook').slice(-2).map((line) => line.route)).toEqual(['close', 'run_completed']);
     // Another installation has its own count.
     expect((await send(64, installation + 1)).status).toBe(202);
     expect(await workRows(coordinator(REPOSITORY_ID, 64))).toHaveLength(1);
