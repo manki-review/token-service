@@ -111,9 +111,9 @@ function dispatchProblem(file: WorkflowText): { reason: string; dispatched: bool
 
 /**
  * Decides whether a repository opted in to webhook mode from the workflow files on its default branch, and which file
- * the Worker dispatches. A file qualifies when it runs Manki, runs only on `workflow_dispatch` and declares the dispatch
- * inputs. With several, `manki.yml` goes first, then the first by name. No other file may be an event-driven Manki
- * workflow.
+ * the Worker dispatches. A file qualifies when it runs only on `workflow_dispatch` and declares all the dispatch inputs,
+ * whether or not it names Manki: the input set alone marks it, as in manki's own file, which runs `uses: ./`. With
+ * several, `manki.yml` goes first, then the first by name. No other file may be an event-driven Manki workflow.
  */
 export function classifyWorkflows(files: WorkflowFile[]): OptIn {
   // A file that is not parsed cannot be ruled out, whether or not it looks like Manki.
@@ -124,9 +124,11 @@ export function classifyWorkflows(files: WorkflowFile[]): OptIn {
 
   const manki = mankiWorkflows(files);
   const rank = (file: WorkflowFile) => (file.name === DISPATCH_WORKFLOW ? 0 : 1);
+  // A file that names Manki is a candidate whatever its problem, so the reason can name what it lacks.
   const candidates = files
-    .filter((file): file is WorkflowText => isWorkflowFile(file.name) && file.text !== null && manki.has(file.name))
+    .filter((file): file is WorkflowText => isWorkflowFile(file.name) && file.text !== null)
     .map((file) => ({ file, problem: dispatchProblem(file) }))
+    .filter((candidate) => candidate.problem === null || manki.has(candidate.file.name))
     .sort((a, b) => rank(a.file) - rank(b.file) || a.file.name.localeCompare(b.file.name));
   const dispatch = candidates.find((candidate) => candidate.problem === null)?.file;
   if (!dispatch) {

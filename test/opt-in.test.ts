@@ -14,6 +14,30 @@ const CI_YAML = 'name: CI\non:\n  pull_request:\njobs:\n  test:\n    runs-on: ub
 const SELF_TEST_YAML = "on: [pull_request_review]\njobs:\n  review:\n    if: github.actor != 'manki-review[bot]'\n    steps:\n      - uses: ./\n";
 
 // A dispatch workflow whose review job is a reusable workflow in another repository, so its text does not name Manki.
+// manki's own dispatch workflow, cut down. It builds the PR head and runs it with `uses: ./`, so it names no Manki.
+const SELF_DISPATCH_YAML = `name: Manki dispatch
+run-name: 'Manki \${{ inputs.event }}.\${{ inputs.action }} on #\${{ inputs.pr }} (\${{ inputs.delivery_id }})'
+on:
+  workflow_dispatch:
+    inputs:
+      event: { type: string, required: true }
+      action: { type: string, required: true }
+      pr: { type: string, required: true }
+      head_sha: { type: string, required: false }
+      comment_id: { type: string, required: false }
+      review_id: { type: string, required: false }
+      delivery_id: { type: string, required: false }
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: npm ci && npm run build
+      - name: Manki Review
+        uses: ./  # Use local action for self-testing
+        with:
+          github_token: \${{ secrets.GITHUB_TOKEN }}
+`;
 const FOREIGN_DISPATCH_YAML = DISPATCH_WORKFLOW_YAML.replace(/jobs:[\s\S]*/, 'jobs:\n  review:\n    uses: acme/workflows/.github/workflows/review.yml@v1\n');
 
 function files(entries: Record<string, string | null>): WorkflowFile[] {
@@ -52,9 +76,10 @@ describe('classifyWorkflows', () => {
     ['a dispatch file with a duplicate key', { 'manki-dispatch.yml': `${DISPATCH_WORKFLOW_YAML}name: again\n` }, 'manki-dispatch.yml', 'manki-dispatch.yml and no event-driven Manki workflow'],
     ['the dispatch workflow as manki.yml', { 'manki.yml': DISPATCH_WORKFLOW_YAML }, 'manki.yml', 'manki.yml and no event-driven Manki workflow'],
     ['the dispatch workflow under any name', { 'review.yaml': DISPATCH_WORKFLOW_YAML }, 'review.yaml', 'review.yaml and no event-driven Manki workflow'],
-    ['the old name calling a reusable workflow in another repository', { 'manki-dispatch.yml': FOREIGN_DISPATCH_YAML }, null, 'no Manki workflow runs on workflow_dispatch'],
-    ['a file that names Manki next to the old name that does not', { 'manki-dispatch.yml': FOREIGN_DISPATCH_YAML, 'review.yml': DISPATCH_WORKFLOW_YAML }, 'review.yml', 'review.yml and no event-driven Manki workflow'],
-    ['a dispatch workflow that does not name Manki', { 'deploy.yml': FOREIGN_DISPATCH_YAML }, null, 'no Manki workflow runs on workflow_dispatch'],
+    ['a dispatch file calling a reusable workflow in another repository', { 'manki-dispatch.yml': FOREIGN_DISPATCH_YAML }, 'manki-dispatch.yml', 'manki-dispatch.yml and no event-driven Manki workflow'],
+    ["manki's own dispatch file, which runs `uses: ./`", { 'manki-dispatch.yml': SELF_DISPATCH_YAML, 'ci.yml': CI_YAML }, 'manki-dispatch.yml', 'manki-dispatch.yml and no event-driven Manki workflow'],
+    ["manki's own dispatch file without one dispatch input", { 'manki-dispatch.yml': SELF_DISPATCH_YAML.replace(/ {6}review_id:.*\n/, '') }, null, 'no Manki workflow runs on workflow_dispatch'],
+    ['a workflow_dispatch file without the dispatch inputs that does not name Manki', { 'deploy.yml': 'on: workflow_dispatch\njobs: { d: { runs-on: ubuntu-latest, steps: [{ run: make deploy }] } }' }, null, 'no Manki workflow runs on workflow_dispatch'],
   ])('classifies %s', (_case, entries, workflow, reason) => {
     expect(classifyWorkflows(files(entries))).toEqual(workflow === null ? { optedIn: false, reason } : { optedIn: true, workflow, reason });
   });
