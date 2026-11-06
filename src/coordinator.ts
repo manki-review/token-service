@@ -345,8 +345,9 @@ export class PrCoordinator extends DurableObject<Env> {
         );
       } else if (work.event === REVIEW_COMMAND_EVENT) {
         // Manki reads the head when the run starts, so a queued review command answers every later one. The item names the
-        // newest command, so an edit or a delete of an earlier one cannot leave the later request without a run.
-        const command = reviews.filter((row) => row.event === REVIEW_COMMAND_EVENT).at(-1);
+        // newest command, so an edit or a delete of an earlier one cannot leave the later request without a run. An item
+        // with a dispatch attempt keeps its delivery id, which `findRun` looks for in the run title.
+        const command = reviews.filter((row) => row.event === REVIEW_COMMAND_EVENT && row.attempts === 0).at(-1);
         if (!command) return `queued ${this.insert(work, delivery, now)}`;
         this.sql.exec('UPDATE work SET object_id = ?, sender = ?, delivery = ? WHERE id = ?', work.objectId, work.sender, delivery, command.id);
         return `merged into work ${command.id}`;
