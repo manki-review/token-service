@@ -5,10 +5,11 @@ type CappedLevel = 'read' | 'write';
 export type PermissionCaps = Record<string, CappedLevel>;
 
 // The most a token for a Manki run may hold, taken from the GitHub API calls the action makes.
-// `contents: write` is needed to resolve review threads. The token only covers the requesting repository.
+// `contents: write` is needed to resolve review threads, and `checks: write` to show a `Manki` check on a PR in
+// webhook mode. The token only covers the requesting repository.
 export const MANKI_PERMISSION_CAPS: PermissionCaps = {
   actions: 'read',
-  checks: 'read',
+  checks: 'write',
   contents: 'write',
   issues: 'write',
   metadata: 'read',
