@@ -292,6 +292,7 @@ export class PrCoordinator extends DurableObject<Env> {
         const merged = route.merged ? `, queued ${this.insert(route.merged, delivery.id, now)}` : '';
         return { accepted: true, effect: `closed, dropped ${dropped}${merged}` };
       }
+      this.sql.exec(`DELETE FROM meta WHERE key = 'closed_at'`);
       if (route.work.kind === 'review' && route.work.event.startsWith('pull_request.')) {
         // A late redelivery of the push, after a catch-up already reviews this head, must not review it twice.
         const state = this.reviewState(route.work.headSha);
@@ -410,6 +411,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const work: Work = { lane: 'state', kind: 'review', event: 'pull_request.synchronize', headSha: head, objectId: null, sender: '', trusted: true, acknowledge: false, writer: true };
     const effect = this.ctx.storage.transactionSync(() => {
       this.sql.exec('INSERT OR REPLACE INTO deliveries (id, received_at) VALUES (?, ?)', delivery, now);
+      this.sql.exec(`DELETE FROM meta WHERE key = 'closed_at'`);
       this.setMeta('target', target);
       return this.enqueue(work, delivery, now);
     });
@@ -566,33 +568,32 @@ export class PrCoordinator extends DurableObject<Env> {
     }
   }
 
-  /** Records the PR's close unless it is recorded already and no delivery came since. Returns whether it wrote. */
+  /** Whether an item is queued, dispatching or running. */
+  private hasUnfinishedWork(): boolean {
+    return this.sql.exec(`SELECT 1 FROM work WHERE status = 'queued' OR ${ACTIVE}`).toArray().length > 0;
+  }
+
+  /** Records the PR's close unless one is recorded already. Returns whether it wrote. */
   private recordClose(now: number): boolean {
-    const closedAt = this.getMeta<number>('closed_at');
-    const newest = this.newestDelivery();
-    if (closedAt !== null && (newest === null || newest <= closedAt)) return false;
+    if (this.getMeta<number>('closed_at') !== null) return false;
     this.setMeta('closed_at', now);
     return true;
   }
 
-  private newestDelivery(): number | null {
-    return this.sql.exec<{ at: number | null }>('SELECT MAX(received_at) AS at FROM deliveries').one().at;
-  }
-
   /**
    * Returns when the storage may go: a week after the PR closed, or `IDLE_RETENTION_MS` after the last delivery of a PR
-   * still open. A delivery after the close, as on a reopened PR, counts the PR as open again. Null when there is none.
+   * still open. Work queued after the close, as on a reopened PR, clears the close. Null when there is neither.
    */
   private retainUntil(): number | null {
-    const newest = this.newestDelivery();
     const closedAt = this.getMeta<number>('closed_at');
-    if (closedAt !== null && (newest === null || newest <= closedAt)) return closedAt + DELIVERY_RETENTION_MS;
+    if (closedAt !== null) return closedAt + DELIVERY_RETENTION_MS;
+    const newest = this.sql.exec<{ at: number | null }>('SELECT MAX(received_at) AS at FROM deliveries').one().at;
     return newest === null ? null : newest + IDLE_RETENTION_MS;
   }
 
   /** Deletes all storage once nothing is queued, dispatching or running and the retention ran out. */
   private async cleanUpWhenIdle(): Promise<boolean> {
-    const pending = this.sql.exec(`SELECT 1 FROM work WHERE status = 'queued' OR ${ACTIVE}`).toArray().length > 0;
+    const pending = this.hasUnfinishedWork();
     const until = this.retainUntil();
     if (pending || (until !== null && Date.now() < until)) return false;
     log('coordinator_deleted', this.logFields());
@@ -1068,8 +1069,10 @@ export class PrCoordinator extends DurableObject<Env> {
       if (active?.at) times.push(active.at);
       else if (next) times.push(next.check_at ?? now);
     }
+    // Past the retention an active item keeps the storage, and its own times wake the alarm.
     const until = this.retainUntil();
-    if (until !== null) times.push(until);
+    const pending = this.hasUnfinishedWork();
+    if (until !== null && (until > now || !pending)) times.push(until);
     if (times.length > 0) await this.ctx.storage.setAlarm(Math.max(now, Math.min(...times)));
   }
 }

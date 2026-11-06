@@ -567,6 +567,18 @@ describe('PrCoordinator.alarm', () => {
 
     // The same instance keeps working after the cleanup.
     expect(await open.send('pull_request', open.push(SHA_2))).toEqual({ accepted: true, effect: 'queued work 1' });
+
+    // Work queued after the close, as on a reopened PR, counts it as open again.
+    const reopened = pullRequest();
+    await reopened.send('pull_request', reopened.push(SHA_1));
+    await reopened.send('pull_request', reopened.close(false));
+    await runDurableObjectAlarm(reopened.stub);
+    expect(await alarm(reopened.stub)).toBe(Date.now() + DELIVERY_RETENTION_MS);
+    advanceClock(DAY);
+    await reopened.send('issue_comment', reopened.comment('@manki explain'));
+    expect(await alarm(reopened.stub)).toBe(Date.now());
+    await runDurableObjectAlarm(reopened.stub);
+    expect(await alarm(reopened.stub)).toBe(Date.now() + IDLE_RETENTION_MS);
   });
 });
 
@@ -883,7 +895,7 @@ describe('PrCoordinator dispatch', () => {
     expect(await state()).toMatchObject({ last_reviewed: { commit: SHA_2, run_id: 9003 }, pause: null, last_approval: afterReview.last_approval });
   });
 
-  it('keeps a closed PR whose run is still running past the retention', async () => {
+  it('keeps a closed PR while its run is still running, then deletes it a week after the close', async () => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
     await pr.send('pull_request', pr.push(SHA_1));
@@ -894,6 +906,13 @@ describe('PrCoordinator dispatch', () => {
     await runDurableObjectAlarm(pr.stub);
     expect(logged(log, 'coordinator_deleted')).toEqual([]);
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'running', run_id: 9000 }]);
+    // The past retention date does not wake the alarm at once. The next poll does.
+    expect(await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm())).toBeGreaterThan(Date.now());
+
+    // The run's end arrives after the close and does not count the PR as open again.
+    expect(await pr.stub.runCompleted(key('d-end'), 9000, 'success')).toMatchObject({ accepted: true });
+    await runDurableObjectAlarm(pr.stub);
+    expect(await tableNames(pr.stub)).toEqual([]);
   });
 
   it('returns an empty state for a PR it never saw, without creating storage', async () => {
