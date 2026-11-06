@@ -1,5 +1,5 @@
 import type { WebhookPayload } from '../src/routing';
-import { INSTALLATION_ID, OWNER, REPO } from './helpers';
+import { INSTALLATION_ID, OWNER, OWNER_ID, REPO } from './helpers';
 
 export const REPOSITORY_ID = 4242;
 export const PR_NUMBER = 7;
@@ -15,7 +15,7 @@ function base(action: string): WebhookPayload {
     action,
     sender: HUMAN,
     installation: { id: INSTALLATION_ID },
-    repository: { id: REPOSITORY_ID, name: REPO, full_name: `${OWNER}/${REPO}`, default_branch: 'main', owner: { login: OWNER } },
+    repository: { id: REPOSITORY_ID, name: REPO, full_name: `${OWNER}/${REPO}`, default_branch: 'main', owner: { login: OWNER, id: OWNER_ID } },
   };
 }
 

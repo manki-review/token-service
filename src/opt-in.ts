@@ -9,7 +9,7 @@ export interface OptIn {
 }
 
 /** A repository as GitHub names it, read by its id. */
-export type Repository = Pick<Target, 'owner' | 'repo' | 'defaultBranch'>;
+export type Repository = Pick<Target, 'owner' | 'ownerId' | 'repo' | 'defaultBranch'>;
 
 export interface WorkflowFile {
   name: string;

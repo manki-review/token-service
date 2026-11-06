@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { classifyWorkflows, MAX_WORKFLOW_BYTES, readOptIn, type WorkflowFile } from '../src/opt-in';
 import type { Target } from '../src/routing';
-import { INSTALLATION_ID, OWNER, REPO, stubGitHub } from './helpers';
+import { INSTALLATION_ID, OWNER, OWNER_ID, REPO, stubGitHub } from './helpers';
 import { DISPATCH_WORKFLOW_YAML, EVENT_WORKFLOW_YAML, REPOSITORY_ID, workflowsReply } from './payloads';
 
 /** Pads `text` with a YAML comment to exactly `bytes` bytes. */
@@ -60,7 +60,7 @@ describe('classifyWorkflows', () => {
 });
 
 describe('readOptIn', () => {
-  const target: Target = { installationId: INSTALLATION_ID, repositoryId: REPOSITORY_ID, owner: OWNER, repo: REPO, defaultBranch: 'trunk', number: 1 };
+  const target: Target = { installationId: INSTALLATION_ID, repositoryId: REPOSITORY_ID, owner: OWNER, ownerId: OWNER_ID, repo: REPO, defaultBranch: 'trunk', number: 1 };
 
   it('reads the workflows directory of the default branch in one query', async () => {
     const requests = stubGitHub({ api: { 'POST /graphql': workflowsReply({ 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML }) } });

@@ -26,6 +26,7 @@ import {
   INSTALLATION_ID,
   logged,
   OWNER,
+  OWNER_ID,
   postWebhook,
   REPO,
   setDispatchEnabled,
@@ -315,7 +316,7 @@ describe('PrCoordinator.receive', () => {
 
 describe('PrCoordinator catch-up state', () => {
   const target = (number: number): Target => ({
-    installationId: INSTALLATION_ID, repositoryId: REPOSITORY_ID, owner: 'manki-review', repo: 'manki', defaultBranch: 'main', number,
+    installationId: INSTALLATION_ID, repositoryId: REPOSITORY_ID, owner: 'manki-review', ownerId: OWNER_ID, repo: 'manki', defaultBranch: 'main', number,
   });
 
   it('reports a head as needed until a review of it is queued, and again once that review is dropped', async () => {
@@ -587,7 +588,7 @@ function fakeGitHub(number: number) {
     cancels: [] as number[],
     graphqlCalls: 0,
     /** The repository `GET /repositories/<id>` names, and its status. */
-    repository: { name: REPO, owner: { login: OWNER }, default_branch: 'main' },
+    repository: { name: REPO, owner: { login: OWNER, id: OWNER_ID }, default_branch: 'main' },
     /** Failures the next mints for a permission get, in order: a status, a status with headers, or a network error. */
     mintFailures: [] as Array<{ permission: string; reply: Reply | 'network' }>,
     graphqlVariables: [] as Array<Record<string, string>>,
@@ -833,7 +834,7 @@ describe('PrCoordinator dispatch', () => {
     const pr = pullRequest();
     fakeGitHub(pr.number);
     await pr.stub.catchUp(
-      { installationId: INSTALLATION_ID, repositoryId: REPOSITORY_ID, owner: OWNER, repo: REPO, defaultBranch: 'main', number: pr.number },
+      { installationId: INSTALLATION_ID, repositoryId: REPOSITORY_ID, owner: OWNER, ownerId: OWNER_ID, repo: REPO, defaultBranch: 'main', number: pr.number },
       SHA_1,
     );
     await runDurableObjectAlarm(pr.stub);
@@ -1376,7 +1377,7 @@ describe('PrCoordinator dispatch', () => {
     const github = fakeGitHub(pr.number);
     github.repository = { ...github.repository, default_branch: 'trunk' };
     const forged = pr.push(SHA_1);
-    forged.repository = { ...forged.repository, name: 'forged', owner: { login: 'mallory' }, default_branch: 'attacker-branch' };
+    forged.repository = { ...forged.repository, name: 'forged', owner: { login: 'mallory', id: OWNER_ID }, default_branch: 'attacker-branch' };
     await pr.send('pull_request', forged);
     await runDurableObjectAlarm(pr.stub);
     // The fake serves `manki-review/manki` only, so a call under the forged names would throw.

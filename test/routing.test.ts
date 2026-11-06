@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { routeDelivery, type Route, type WebhookPayload } from '../src/routing';
-import { INSTALLATION_ID, OWNER, REPO } from './helpers';
+import { INSTALLATION_ID, OWNER, OWNER_ID, REPO } from './helpers';
 import {
   ACTIONS_AUTHOR,
   BOT_SENDER,
@@ -164,7 +164,7 @@ describe('routeDelivery', () => {
   it('names the target from the payload', () => {
     const route = routeDelivery('pull_request', pullRequestEvent('synchronize'));
     expect(route).toMatchObject({
-      target: { installationId: INSTALLATION_ID, repositoryId: REPOSITORY_ID, owner: OWNER, repo: REPO, defaultBranch: 'main', number: PR_NUMBER },
+      target: { installationId: INSTALLATION_ID, repositoryId: REPOSITORY_ID, owner: OWNER, ownerId: OWNER_ID, repo: REPO, defaultBranch: 'main', number: PR_NUMBER },
     });
   });
 

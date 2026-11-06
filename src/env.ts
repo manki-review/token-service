@@ -12,8 +12,11 @@ export interface Env {
   WEBHOOK_SECRET_PREVIOUS?: string;
   /** `"true"` lets the coordinators start runs. Anything else only logs what they would start. */
   DISPATCH_ENABLED?: string;
-  /** Comma-separated ids of the repositories whose deliveries reach a coordinator. Any other is logged and dropped. */
-  WEBHOOK_REPOS?: string;
+  /**
+   * Comma-separated ids of the accounts whose repositories' deliveries reach a coordinator. Any other is logged and
+   * dropped.
+   */
+  WEBHOOK_ACCOUNTS?: string;
   /** The most deliveries per installation and clock hour that reach a coordinator. Defaults to 500. */
   INSTALLATION_EVENTS_PER_HOUR?: string;
   PR_COORDINATOR: DurableObjectNamespace<PrCoordinator>;
@@ -21,8 +24,8 @@ export interface Env {
   RECONCILER: DurableObjectNamespace<Reconciler>;
 }
 
-/** Returns the repository ids in `WEBHOOK_REPOS`. An unset or empty list allows none. */
-export function allowedRepos(env: Env): Set<number> {
-  const ids = (env.WEBHOOK_REPOS ?? '').split(',').map((id) => id.trim()).filter((id) => /^[1-9][0-9]*$/.test(id));
+/** Returns the account ids in `WEBHOOK_ACCOUNTS`. An unset or empty list allows none. */
+export function allowedAccounts(env: Env): Set<number> {
+  const ids = (env.WEBHOOK_ACCOUNTS ?? '').split(',').map((id) => id.trim()).filter((id) => /^[1-9][0-9]*$/.test(id));
   return new Set(ids.map(Number));
 }

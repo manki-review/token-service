@@ -638,7 +638,7 @@ export class PrCoordinator extends DurableObject<Env> {
         optedIn: false,
         reason: 'installation lacks actions: write',
         expires: Date.now() + OPT_IN_TTL_MS,
-        repository: { owner: target.owner, repo: target.repo, defaultBranch: target.defaultBranch },
+        repository: { owner: target.owner, ownerId: target.ownerId, repo: target.repo, defaultBranch: target.defaultBranch },
       } satisfies CachedOptIn);
       this.finish(item.id, 'skipped', 'installation lacks actions: write');
       return;
@@ -883,8 +883,8 @@ export class PrCoordinator extends DurableObject<Env> {
       } else if (!response.ok) {
         throw new Error(`reading the repository failed with ${response.status}`);
       } else {
-        const repo = await response.json() as { name: string; owner: { login: string }; default_branch: string };
-        repository = { owner: repo.owner.login, repo: repo.name, defaultBranch: repo.default_branch };
+        const repo = await response.json() as { name: string; owner: { login: string; id: number }; default_branch: string };
+        repository = { owner: repo.owner.login, ownerId: repo.owner.id, repo: repo.name, defaultBranch: repo.default_branch };
         optIn = await readOptIn(mint.token, repository);
       }
       await this.reportOptIn(repository === null ? target : { ...target, ...repository }, optIn.optedIn);

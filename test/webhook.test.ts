@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { verifyWebhookSignature } from '../src/signature';
 import worker from '../src/index';
 import { DEFAULT_EVENTS_PER_HOUR, eventsPerHour, InstallationLimiter } from '../src/limiter';
-import { coordinator, DELIVERY_ID, freezeClock, logged, OIDC_AUDIENCE, postWebhook, signWebhook, stubGitHub, TEST_ENV, workRows } from './helpers';
+import { coordinator, DELIVERY_ID, freezeClock, logged, OIDC_AUDIENCE, OWNER_ID, postWebhook, signWebhook, stubGitHub, TEST_ENV, workRows } from './helpers';
 import { FORCE_REVIEW_COMMENT, HEAD_SHA, issueCommentEvent, MANKI_AUTHOR, PR_NUMBER, pullRequestEvent, REPOSITORY_ID, reviewEvent, reviewThreadEvent, workflowRunEvent } from './payloads';
 
 const encoder = new TextEncoder();
@@ -124,23 +124,24 @@ describe('/webhook', () => {
   });
 
   it.each([
-    ['a repository missing from WEBHOOK_REPOS', '1,2'],
-    ['an empty WEBHOOK_REPOS', ''],
-    ['an unset WEBHOOK_REPOS', undefined],
-  ])('answers 202 without touching a coordinator for %s', async (_case, repos) => {
+    ['an account missing from WEBHOOK_ACCOUNTS', '1,2'],
+    ['the repository id in place of its account', String(REPOSITORY_ID)],
+    ['an empty WEBHOOK_ACCOUNTS', ''],
+    ['an unset WEBHOOK_ACCOUNTS', undefined],
+  ])('answers 202 without touching a coordinator for %s', async (_case, accounts) => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const untouched = { getByName: () => { throw new Error('no coordinator may be called'); } };
-    const env = { ...TEST_ENV, WEBHOOK_REPOS: repos, PR_COORDINATOR: untouched as unknown as typeof TEST_ENV.PR_COORDINATOR };
+    const env = { ...TEST_ENV, WEBHOOK_ACCOUNTS: accounts, PR_COORDINATOR: untouched as unknown as typeof TEST_ENV.PR_COORDINATOR };
     for (const [event, payload] of [['pull_request', pullRequestEvent('synchronize')], ['workflow_run', workflowRunEvent()]] as const) {
       expect((await postWebhook({ event, payload, env })).status).toBe(202);
     }
-    const reason = `repository ${REPOSITORY_ID} is not in WEBHOOK_REPOS`;
+    const reason = `account ${OWNER_ID} is not in WEBHOOK_ACCOUNTS`;
     expect(logged(log)).toMatchObject([{ route: 'ignore', reason }, { route: 'ignore', reason }]);
   });
 
-  it('accepts a repository anywhere in WEBHOOK_REPOS', async () => {
+  it('accepts any repository of an account anywhere in WEBHOOK_ACCOUNTS', async () => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
-    const env = { ...TEST_ENV, WEBHOOK_REPOS: ` 1, ${REPOSITORY_ID} ,3` };
+    const env = { ...TEST_ENV, WEBHOOK_ACCOUNTS: ` 1, ${OWNER_ID} ,3` };
     expect((await postWebhook({ event: 'issue_comment', payload: issueCommentEvent('@manki explain', { number: 33 }), env })).status).toBe(202);
     expect(await workRows(coordinator(REPOSITORY_ID, 33))).toHaveLength(1);
   });
