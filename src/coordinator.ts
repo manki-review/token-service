@@ -30,6 +30,8 @@ export const OPT_IN_TTL_MS = 5 * MINUTE;
 export const FINISHED_RETENTION_MS = 7 * DAY;
 /** How long an alarm may hold an item in `dispatching` before another pass takes it back. */
 const LEASE_MS = 5 * MINUTE;
+/** How much older than the state's creation a close must be to count as a late redelivery. */
+const STALE_CLOSE_MARGIN_MS = 5 * MINUTE;
 const LANES: readonly Lane[] = ['state', 'chat', 'help', 'settings'];
 
 /** The wait before each retry of a dispatch that failed with a 5xx or a network error. */
@@ -301,8 +303,10 @@ export class PrCoordinator extends DurableObject<Env> {
   /** Records a routed delivery and queues its work. A delivery whose id or body was seen before is refused. */
   async receive(delivery: Delivery, route: Extract<Route, { type: 'work' | 'close' }>): Promise<ReceiveResult> {
     // A close from before the PR's last reopen or before its state existed is a late redelivery, so it changes nothing.
-    if (route.type === 'close' && route.at > 0 && this.hasState()
-      && route.at < Math.max(this.getMeta<number>('created_at') ?? 0, this.getMeta<number>('reopened_at') ?? 0)) {
+    // The creation time is the Worker's own and the delivery that created the state may lag, so it gets a margin. A
+    // merge is never stale, since a merged PR cannot reopen.
+    if (route.type === 'close' && !route.merged && route.at > 0 && this.hasState()
+      && route.at < Math.max((this.getMeta<number>('created_at') ?? 0) - STALE_CLOSE_MARGIN_MS, this.getMeta<number>('reopened_at') ?? 0)) {
       log('coordinator_receive', { ...this.logFields(), delivery: delivery.id, accepted: false, reason: 'close older than the open PR' });
       return { accepted: false, reason: 'close older than the open PR' };
     }

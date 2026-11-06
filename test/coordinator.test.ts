@@ -605,18 +605,21 @@ describe('PrCoordinator.alarm', () => {
     const reopenedAt = Date.now() - DELIVERY_RETENTION_MS;
     expect(await quiet.send('pull_request', closedBefore(quiet, reopenedAt - DAY), 'd-close')).toEqual({ accepted: false, reason: 'close older than the open PR' });
     expect(await alarm(quiet.stub)).toBe(reopenedAt - DAY + IDLE_RETENTION_MS);
+    // A merge is never stale, since a merged PR cannot reopen.
+    const merge = pullRequestEvent('closed', { number: quiet.number, merged: true, closed_at: new Date(reopenedAt - DAY).toISOString() });
+    expect(await quiet.send('pull_request', merge)).toMatchObject({ accepted: true, effect: expect.stringContaining('queued') });
 
     // A close that stored nothing, of a PR whose state came later, is no newer than that state either.
     const late = pullRequest();
-    const lateClose = Date.now() - MINUTE;
+    const lateClose = Date.now() - 10 * MINUTE;
     expect(await late.send('pull_request', closedBefore(late, lateClose))).toEqual({ accepted: true, effect: 'closed, nothing queued' });
     expect(await tableNames(late.stub)).toEqual([]);
     await late.send('pull_request', late.push(SHA_1));
     expect(await late.send('pull_request', closedBefore(late, lateClose))).toEqual({ accepted: false, reason: 'close older than the open PR' });
     await runDurableObjectAlarm(late.stub);
     expect(await alarm(late.stub)).toBe(Date.now() + IDLE_RETENTION_MS);
-    // A later close still counts.
-    expect(await late.send('pull_request', closedBefore(late, Date.now()))).toMatchObject({ accepted: true });
+    // A close GitHub dates shortly before the state's creation, as when its push arrived first, still counts.
+    expect(await late.send('pull_request', closedBefore(late, Date.now() - MINUTE))).toMatchObject({ accepted: true });
     expect(await alarm(late.stub)).toBe(Date.now() + DELIVERY_RETENTION_MS);
   });
 });
