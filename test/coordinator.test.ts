@@ -580,15 +580,17 @@ describe('PrCoordinator.alarm', () => {
     await runDurableObjectAlarm(reopened.stub);
     expect(await alarm(reopened.stub)).toBe(Date.now() + IDLE_RETENTION_MS);
 
-    // So does a reopen alone, which queues no work.
+    // So does a reopen alone, which queues no work. A redelivered close does not mark the PR closed again.
     const quiet = pullRequest();
     await quiet.send('pull_request', quiet.push(SHA_1), 'd-quiet');
-    await quiet.send('pull_request', quiet.close(false));
+    await quiet.send('pull_request', quiet.close(false), 'd-close');
     await runDurableObjectAlarm(quiet.stub);
     advanceClock(DAY);
     expect((await postWebhook({ event: 'pull_request', payload: pullRequestEvent('reopened', { number: quiet.number }) })).status).toBe(202);
     expect(await workRows(quiet.stub)).toMatchObject([{ status: 'dropped' }]);
     expect(logged(log, 'coordinator_reopened')).toHaveLength(1);
+    expect(await alarm(quiet.stub)).toBe(Date.now() - DAY + IDLE_RETENTION_MS);
+    expect(await quiet.send('pull_request', quiet.close(false), 'd-close')).toEqual({ accepted: false, reason: 'duplicate delivery' });
     expect(await alarm(quiet.stub)).toBe(Date.now() - DAY + IDLE_RETENTION_MS);
   });
 });

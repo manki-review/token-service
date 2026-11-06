@@ -269,11 +269,13 @@ export class PrCoordinator extends DurableObject<Env> {
   async receive(delivery: Delivery, route: Extract<Route, { type: 'work' | 'close' }>): Promise<ReceiveResult> {
     // A close that neither drops work nor records a merge writes nothing, so closing and reopening in a loop costs no rows.
     if (route.type === 'close' && !route.merged && !this.hasPendingWork()) {
-      const result: ReceiveResult = { accepted: true, effect: 'closed, nothing queued' };
+      const recorded = this.hasState() ? this.recordClose(delivery, Date.now()) : 'unchanged';
+      const result: ReceiveResult = recorded === 'duplicate'
+        ? { accepted: false, reason: 'duplicate delivery' }
+        : { accepted: true, effect: 'closed, nothing queued' };
       const { owner, repo, number } = route.target;
       log('coordinator_receive', { repo: `${owner}/${repo}`, pr: number, delivery: delivery.id, ...result });
-      // Only the close time is written, and only when a delivery came after the last recorded close.
-      if (this.hasState() && this.recordClose(Date.now())) await this.scheduleNext();
+      if (recorded === 'recorded') await this.scheduleNext();
       return result;
     }
     this.ensureSchema();
@@ -582,11 +584,19 @@ export class PrCoordinator extends DurableObject<Env> {
     return this.sql.exec(`SELECT 1 FROM work WHERE status = 'queued' OR ${ACTIVE}`).toArray().length > 0;
   }
 
-  /** Records the PR's close unless one is recorded already. Returns whether it wrote. */
-  private recordClose(now: number): boolean {
-    if (this.getMeta<number>('closed_at') !== null) return false;
-    this.setMeta('closed_at', now);
-    return true;
+  /**
+   * Records the PR's close and its delivery, so a redelivered close cannot mark the PR closed again after a reopen.
+   * Writes nothing when the delivery was seen or a close is recorded already.
+   */
+  private recordClose(delivery: Delivery, now: number): 'recorded' | 'duplicate' | 'unchanged' {
+    this.ensureSchema();
+    return this.ctx.storage.transactionSync(() => {
+      if (this.isReplay(delivery)) return 'duplicate';
+      if (this.getMeta<number>('closed_at') !== null) return 'unchanged';
+      this.remember(delivery, now);
+      this.setMeta('closed_at', now);
+      return 'recorded';
+    });
   }
 
   /**
