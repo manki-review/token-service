@@ -58,6 +58,8 @@ export interface Work {
    * trusted comment may merge with a push review.
    */
   trusted: boolean;
+  /** Whether the work comes from a comment that gets the eyes reaction as soon as it is queued. */
+  acknowledge: boolean;
 }
 
 export type Route =
@@ -145,6 +147,19 @@ function isTrusted(payload: WebhookPayload): boolean {
   return author !== undefined && payload.sender?.login?.toLowerCase() === author;
 }
 
+/** The `author_association` values Manki's `isTrustedAssociation` takes as write access. */
+const WRITER_ASSOCIATIONS = ['OWNER', 'MEMBER', 'COLLABORATOR'];
+
+/**
+ * Whether the comment is a Manki command whose author wrote it with write access, as the payload shows it. Only such a
+ * comment gets the eyes reaction when it is queued, so a stranger cannot make the App react.
+ */
+function isWriterCommand(payload: WebhookPayload): boolean {
+  const { comment, sender } = payload;
+  return hasBotMention(comment?.body ?? '') && WRITER_ASSOCIATIONS.includes(comment?.author_association ?? '')
+    && comment?.user?.login !== undefined && comment.user.login === sender?.login;
+}
+
 function work(lane: Lane, kind: WorkKind, payload: WebhookPayload, event: string, objectId: number | null = null): Work {
   return {
     lane,
@@ -154,6 +169,7 @@ function work(lane: Lane, kind: WorkKind, payload: WebhookPayload, event: string
     objectId,
     sender: payload.sender?.login ?? '',
     trusted: isTrusted(payload),
+    acknowledge: isWriterCommand(payload),
   };
 }
 
@@ -258,10 +274,10 @@ function routeIssueComment(target: Target, payload: WebhookPayload): Route {
       return { type: 'work', target, work: work('state', 'comment', payload, 'issue_comment', objectId) };
     }
     // The association is that of Manki's comment. Editing someone else's comment takes write access, so the tick is trusted.
-    return { type: 'work', target, work: { ...work('state', 'review', payload, 'issue_comment', objectId), trusted: true } };
+    return { type: 'work', target, work: { ...work('state', 'review', payload, 'issue_comment', objectId), trusted: true, acknowledge: true } };
   }
 
-  // An edit that keeps an earlier mention is forwarded too. Manki's eyes reaction check skips one it answered.
+  // An edit that keeps an earlier mention is forwarded too. Manki skips one it already answered.
   if (!hasBotMention(body)) return ignore('comment does not mention Manki');
 
   if (!onPullRequest) {

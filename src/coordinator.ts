@@ -90,6 +90,12 @@ export interface Delivery {
   bodyHash: string | null;
 }
 
+/** A comment `receive` queued a command from, waiting for its eyes reaction. `pulls` names a review comment. */
+interface PendingReaction {
+  comments: 'issues' | 'pulls';
+  commentId: number;
+}
+
 export type ReceiveResult = { accepted: false; reason: string } | { accepted: true; effect: string };
 
 // Each entry runs once, in order. Append new entries; never edit a shipped one.
@@ -220,6 +226,16 @@ export class PrCoordinator extends DurableObject<Env> {
         const state = this.reviewState(route.work.headSha);
         if (state !== null) return { accepted: true, effect: 'head already reviewed or under review' };
       }
+      if (route.work.acknowledge && route.work.objectId !== null) {
+        const reaction: PendingReaction = {
+          comments: route.work.event.startsWith('pull_request_review_comment.') ? 'pulls' : 'issues',
+          commentId: route.work.objectId,
+        };
+        const pending = this.getMeta<PendingReaction[]>('reactions') ?? [];
+        if (!pending.some((entry) => entry.comments === reaction.comments && entry.commentId === reaction.commentId)) {
+          this.setMeta('reactions', [...pending, reaction]);
+        }
+      }
       return { accepted: true, effect: this.enqueue(route.work, delivery.id, now) };
     });
     log('coordinator_receive', { ...this.logFields(), delivery: delivery.id, ...result });
@@ -262,7 +278,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const now = Date.now();
     const delivery = `catch-up-${head.slice(0, 12)}`;
     // The head is a same-repository push, which the webhook path trusts too.
-    const work: Work = { lane: 'state', kind: 'review', event: 'pull_request.synchronize', headSha: head, objectId: null, sender: '', trusted: true };
+    const work: Work = { lane: 'state', kind: 'review', event: 'pull_request.synchronize', headSha: head, objectId: null, sender: '', trusted: true, acknowledge: false };
     const effect = this.ctx.storage.transactionSync(() => {
       this.sql.exec('INSERT OR REPLACE INTO deliveries (id, received_at) VALUES (?, ?)', delivery, now);
       this.setMeta('target', target);
@@ -382,11 +398,42 @@ export class PrCoordinator extends DurableObject<Env> {
     this.ensureSchema();
     try {
       if (await this.cleanUpWhenIdle()) return;
-      await this.advance();
+      // Both read the opt-in through `optIn`, which shares one read between them.
+      await Promise.all([this.react(), this.advance()]);
     } catch (error) {
       log('coordinator_alarm_error', { ...this.logFields(), error: String(error) });
     }
     await this.scheduleNext();
+  }
+
+  /**
+   * Adds the eyes reaction to each comment `receive` queued a command from, so the commenter sees it was received
+   * before the run starts. Only a repository that takes dispatches gets one. A failure is logged and never retried.
+   */
+  private async react(): Promise<void> {
+    const pending = this.getMeta<PendingReaction[]>('reactions');
+    if (!pending) return;
+    this.sql.exec(`DELETE FROM meta WHERE key = 'reactions'`);
+    let target: Target | null;
+    try {
+      if (this.env.DISPATCH_ENABLED !== 'true' || !(await this.optIn()).optedIn) return;
+      target = await this.verifiedTarget();
+    } catch (error) {
+      log('coordinator_reaction_error', { ...this.logFields(), error: String(error) });
+      return;
+    }
+    if (!target) return;
+    for (const { comments, commentId } of pending) {
+      try {
+        const token = await this.token(comments === 'pulls' ? { pull_requests: 'write' } : { issues: 'write' });
+        if (token === null) continue;
+        const path = `/repos/${target.owner}/${target.repo}/${comments}/comments/${commentId}/reactions`;
+        const response = await githubApi(token, path, { method: 'POST', body: { content: 'eyes' } });
+        if (!response.ok) log('coordinator_reaction_failed', { ...this.logFields(), comment_id: commentId, status: response.status });
+      } catch (error) {
+        log('coordinator_reaction_error', { ...this.logFields(), comment_id: commentId, error: String(error) });
+      }
+    }
   }
 
   /** Deletes all storage once nothing is pending and the newest delivery has aged out. */
