@@ -83,6 +83,8 @@ export interface Work {
   modes?: ReviewMode[];
   /** For a settings edit, the boxes it ticked or unticked. */
   boxes?: BoxChange[];
+  /** For a settings edit, when the comment was edited, so a late delivery cannot undo a newer edit. */
+  editedAt?: number;
 }
 
 export type Route =
@@ -316,7 +318,10 @@ function routeIssueComment(target: Target, payload: WebhookPayload): Route {
     const before = payload.changes?.body?.from;
     const boxes = before === undefined ? [] : changedBoxes(before, body);
     if (boxes.length === 0) return ignore('no settings box changed');
-    return { type: 'work', target, work: { ...work('settings', 'settings', payload, 'issue_comment', objectId), acknowledge: false, writer: false, boxes } };
+    return { type: 'work', target, work: {
+      ...work('settings', 'settings', payload, 'issue_comment', objectId),
+      acknowledge: false, writer: false, boxes, editedAt: Date.parse(comment?.updated_at ?? '') || 0,
+    } };
   }
 
   // Manki decides whether the comment's author is one of its identities. Only a tick on a comment by its default

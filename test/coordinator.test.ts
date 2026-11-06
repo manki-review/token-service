@@ -1316,12 +1316,12 @@ describe('PrCoordinator dispatch', () => {
         return (await postToken({ path: '/state', token, body: { owner: OWNER, repo: REPO, pr: pr.number } })).json() as Promise<Record<string, unknown>>;
       };
       /** Has `sender` change the boxes from `before` to `after`, and runs the alarm twice, so a review it queues starts. */
-      const edit = async (before: string[], after: string[], sender = 'alice') => {
+      const edit = async (before: string[], after: string[], sender = 'alice', at = new Date().toISOString()) => {
         const payload = issueCommentEvent(boxes(after), {
           number: pr.number, action: 'edited', author: MANKI_AUTHOR, sender: { login: sender, type: 'User' }, previousBody: boxes(before),
         });
         github.issueComments.set(SETTINGS, boxes(after));
-        const result = await pr.send('issue_comment', { ...payload, comment: { ...payload.comment!, id: SETTINGS } });
+        const result = await pr.send('issue_comment', { ...payload, comment: { ...payload.comment!, id: SETTINGS, updated_at: at } });
         await runDurableObjectAlarm(pr.stub);
         await runDurableObjectAlarm(pr.stub);
         return result;
@@ -1388,22 +1388,49 @@ describe('PrCoordinator dispatch', () => {
       expect((await workRows(pr.stub))[0]).toMatchObject({ status: 'skipped', conclusion: 'cancelled', note: 'cancelled by alice, cancel requested' });
       expect(await pr.stub.catchUpState(SHA_1)).toBe('handled');
       expect(await state()).toMatchObject({ active: [] });
+      // A cancel GitHub fails is tried again, so the tick is not lost.
+      await pr.send('issue_comment', pr.comment('@manki review'));
+      await runDurableObjectAlarm(pr.stub);
+      github.cancelStatuses = [500];
+      await edit([], ['cancel']);
+      expect(github.cancels).toEqual([9000, 9001]);
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'dispatching', errors: 1 });
+      advanceClock(backoff(0));
+      await runDurableObjectAlarm(pr.stub);
+      expect(github.cancels).toEqual([9000, 9001, 9001]);
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'done', note: 'cancel of work 3 requested' });
+
       // With nothing running, a Cancel tick changes nothing.
       await edit([], ['cancel']);
-      expect(github.cancels).toEqual([9000]);
+      expect(github.cancels).toEqual([9000, 9001, 9001]);
       expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'done', note: 'no review to cancel' });
     });
 
-    it('puts back a box someone without write access ticked and changes nothing, looking them up once', async () => {
+    it('puts back the boxes as they apply after someone without write access changed them, looking them up once', async () => {
       const { pr, github, state, edit } = setup();
       await edit([], ['pause', 'full'], 'mallory');
       expect(github.issueComments.get(SETTINGS)).toBe(boxes([]));
       expect(await state()).toMatchObject({ queue: [], active: [], settings: { paused: false } });
       expect((await workRows(pr.stub)).map((row) => [row.kind, row.status, row.note])).toEqual([['settings', 'skipped', 'commenter has no write access']]);
-      await edit([], ['deeper'], 'mallory');
+      // A tick and an untick in a row leave Pause as it applies, not as the first revert left it.
+      await edit([], ['pause'], 'mallory');
+      await edit(['pause'], [], 'mallory');
       expect(github.issueComments.get(SETTINGS)).toBe(boxes([]));
-      expect(github.permissionReads).toEqual(['mallory']);
+      // An untick of a writer's Pause is put back ticked.
+      await edit([], ['pause']);
+      await edit(['pause'], [], 'mallory');
+      expect(github.issueComments.get(SETTINGS)).toBe(boxes(['pause']));
+      expect(await state()).toMatchObject({ settings: { paused: true } });
+      expect(github.permissionReads).toEqual(['mallory', 'alice']);
       expect(github.dispatches).toEqual([]);
+    });
+
+    it('ignores a settings edit older than the last one applied, such as a late redelivery', async () => {
+      const { pr, state, edit } = setup();
+      await edit(['pause'], [], 'alice', '2030-01-01T00:00:02Z');
+      await edit([], ['pause'], 'alice', '2030-01-01T00:00:01Z');
+      expect(await state()).toMatchObject({ settings: { paused: false } });
+      expect((await workRows(pr.stub)).map((row) => row.note)).toEqual(['nothing changed', 'older than the last settings edit']);
     });
   });
 

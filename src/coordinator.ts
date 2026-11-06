@@ -86,7 +86,7 @@ export interface WorkRow extends Record<string, string | number | null> {
   writer: number;
   /** For a review, the JSON list of the modes the settings boxes asked for. Null for none. */
   modes: string | null;
-  /** For a settings edit, the JSON list of the boxes it changed. */
+  /** For a settings edit, the JSON of its `SettingsEdit`. */
   boxes: string | null;
   /** How often the item was queued again after its run never started or its workflow file was gone. */
   requeues: number;
@@ -164,6 +164,14 @@ export interface PrState {
 export type ReportResult = { accepted: false; reason: string } | { accepted: true; changed: string[] };
 
 const iso = (at: number) => new Date(at).toISOString();
+
+/** A settings edit as stored: the boxes it changed and the comment's edit time in milliseconds. */
+interface SettingsEdit {
+  at: number;
+  changes: BoxChange[];
+}
+
+const editOf = (row: WorkRow): SettingsEdit => JSON.parse(row.boxes ?? '{"at":0,"changes":[]}') as SettingsEdit;
 
 const modesOf = (row: WorkRow): ReviewMode[] => (row.modes === null ? [] : JSON.parse(row.modes) as ReviewMode[]);
 
@@ -466,7 +474,8 @@ export class PrCoordinator extends DurableObject<Env> {
       `INSERT INTO work (lane, kind, event, head_sha, object_id, sender, delivery, enqueued_at, status, trusted, writer, modes, boxes)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?) RETURNING id`,
       work.lane, work.kind, work.event, work.headSha, work.objectId, work.sender, delivery, now, Number(work.trusted), Number(work.writer),
-      work.modes?.length ? JSON.stringify(work.modes) : null, work.boxes ? JSON.stringify(work.boxes) : null,
+      work.modes?.length ? JSON.stringify(work.modes) : null,
+      work.boxes ? JSON.stringify({ at: work.editedAt ?? 0, changes: work.boxes } satisfies SettingsEdit) : null,
     ).one().id;
     return `work ${id}`;
   }
@@ -918,12 +927,19 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /**
    * Applies a writer's box changes. Pause is set and cleared. A tick of a review box asks for one review with that mode,
-   * and Cancel cancels the running review. Unticking any other box changes nothing, since it clears itself.
+   * and Cancel cancels the running review. Unticking any other box changes nothing, since it clears itself. An edit older
+   * than the last one applied, such as a late redelivery, changes nothing.
    */
   private async applySettings(item: WorkRow): Promise<void> {
-    const changes = JSON.parse(item.boxes ?? '[]') as BoxChange[];
+    const { at, changes } = editOf(item);
+    if (at < (this.getMeta<number>('settings_at') ?? 0)) {
+      this.finish(item.id, 'skipped', 'older than the last settings edit');
+      return;
+    }
+    // Cancel goes first, since a failed cancel throws and the whole edit is tried again.
+    const ordered = [...changes].sort((a, b) => Number(b.box === 'cancel') - Number(a.box === 'cancel'));
     const effects: string[] = [];
-    for (const { box, ticked } of changes) {
+    for (const { box, ticked } of ordered) {
       if (box === 'pause') {
         const state = this.reported();
         if (state.settings.paused === ticked) continue;
@@ -935,7 +951,9 @@ export class PrCoordinator extends DurableObject<Env> {
         effects.push(await this.cancelReview(item));
       }
     }
-    if (this.isDispatching(item.id)) this.finish(item.id, 'done', effects.join(', ') || 'nothing changed');
+    if (!this.isDispatching(item.id)) return;
+    this.setMeta('settings_at', at);
+    this.finish(item.id, 'done', effects.join(', ') || 'nothing changed');
   }
 
   /**
@@ -969,11 +987,13 @@ export class PrCoordinator extends DurableObject<Env> {
     if (!running) return 'no review to cancel';
     const target = await this.verifiedTarget();
     if (!target) throw new Error('the repository could not be read');
-    await this.cancel(running, target, `cancelled by ${item.sender}`, false, ['skipped', 'cancelled']);
+    if (!(await this.cancel(running, target, `cancelled by ${item.sender}`, false, ['skipped', 'cancelled']))) {
+      throw new Error(`cancelling the run of work ${running.id} failed`);
+    }
     return `cancel of work ${running.id} requested`;
   }
 
-  /** Puts back the boxes someone without write access changed, so the comment shows what applies. */
+  /** Puts back the boxes someone without write access changed: Pause as it applies, and every other box unticked. */
   private async revertBoxes(item: WorkRow): Promise<void> {
     const target = await this.verifiedTarget();
     if (!target) throw new Error('the repository could not be read');
@@ -983,8 +1003,8 @@ export class PrCoordinator extends DurableObject<Env> {
     const read = await githubApi(token, path);
     if (!read.ok) throw new Error(`reading the settings comment failed with ${read.status}`);
     const { body } = await read.json() as { body?: string };
-    const changes = JSON.parse(item.boxes ?? '[]') as BoxChange[];
-    const reverted = setBoxes(body ?? '', changes.map(({ box, ticked }) => ({ box, ticked: !ticked })));
+    const { paused } = this.reported().settings;
+    const reverted = setBoxes(body ?? '', editOf(item).changes.map(({ box }) => ({ box, ticked: box === 'pause' && paused })));
     if (reverted === body) return;
     const response = await githubApi(token, path, { method: 'PATCH', body: { body: reverted } });
     if (!response.ok) throw new Error(`reverting the settings comment failed with ${response.status}`);
@@ -1191,26 +1211,28 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /**
    * Cancels a run and ends its item as `ended`, a status and conclusion, or queues the item again when `requeue` is set.
-   * A failed cancel keeps the item running, so the next poll tries again.
+   * A failed cancel keeps the item running, so the next poll tries again. Returns false only for a failed cancel.
    */
   private async cancel(
     item: WorkRow, target: Target, reason: string, requeue = false, ended: [WorkStatus, string | null] = ['timed_out', null],
-  ): Promise<void> {
+  ): Promise<boolean> {
     const token = await this.token({ actions: 'write' });
     if (token === null) {
       // Without `actions: write` no other run can be dispatched either, so ending the item cannot let two overlap.
       if (this.row(item.id)?.status === 'running') this.finish(item.id, 'timed_out', `${reason}, cannot cancel without actions: write`);
-      return;
+      return true;
     }
     const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/actions/runs/${item.run_id}/cancel`, { method: 'POST' });
-    if (this.row(item.id)?.status !== 'running') return;
+    if (this.row(item.id)?.status !== 'running') return true;
     if (!response.ok) {
       log('coordinator_cancel_failed', { ...this.logFields(), work_id: item.id, run_id: item.run_id, reason, status: response.status });
+      return false;
     } else if (requeue) {
       this.requeue(item.id, reason, `${reason}, cancel requested, queued again`);
     } else {
       this.finish(item.id, ended[0], `${reason}, cancel requested`, ended[1]);
     }
+    return true;
   }
 
   /** Queues an item that started no run again. The fresh attempt count keeps its next dispatch from adopting an old run. */
