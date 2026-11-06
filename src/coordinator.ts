@@ -3,7 +3,7 @@ import { dispatchInputs, runTitle } from './dispatch';
 import type { Env } from './env';
 import { githubApi, isRateLimited, type MintResult, mintRepositoryToken } from './github';
 import { log } from './log';
-import { BOT_LOGIN, matchSkipRule, parseSkipRules } from './manki';
+import { BOT_LOGIN, HELP_REPLY, matchSkipRule, parseSkipRules } from './manki';
 import { LEGACY_DISPATCH_WORKFLOW, type OptIn, readOptIn, type Repository } from './opt-in';
 import type { Permissions } from './permissions';
 import { RECONCILER_NAME } from './reconciler';
@@ -27,7 +27,7 @@ export const OPT_IN_TTL_MS = 5 * MINUTE;
 export const FINISHED_RETENTION_MS = 7 * DAY;
 /** How long an alarm may hold an item in `dispatching` before another pass takes it back. */
 const LEASE_MS = 5 * MINUTE;
-const LANES: readonly Lane[] = ['state', 'chat'];
+const LANES: readonly Lane[] = ['state', 'chat', 'help'];
 
 /** The wait before each retry of a dispatch that failed with a 5xx or a network error. */
 export const DISPATCH_BACKOFF_MS = [15_000, MINUTE, 5 * MINUTE];
@@ -80,6 +80,8 @@ export interface WorkRow extends Record<string, string | number | null> {
   errors: number;
   /** 1 when a repository user caused the work, 0 for a comment by anyone else. */
   trusted: number;
+  /** 1 when the payload shows the sender has write access. A comment item with 0 has its sender looked up before it starts. */
+  writer: number;
   /** How often the item was queued again after its run never started or its workflow file was gone. */
   requeues: number;
   /** The workflow file the last dispatch attempt named. Null before the first attempt. */
@@ -181,6 +183,7 @@ export const MIGRATIONS = [
   `ALTER TABLE work ADD COLUMN trusted INTEGER NOT NULL DEFAULT 1;`,
   `ALTER TABLE work ADD COLUMN requeues INTEGER NOT NULL DEFAULT 0;`,
   `ALTER TABLE work ADD COLUMN workflow TEXT;`,
+  `ALTER TABLE work ADD COLUMN writer INTEGER NOT NULL DEFAULT 0;`,
 ];
 
 const ACTIVE = `status IN ('dispatching', 'running')`;
@@ -441,9 +444,9 @@ export class PrCoordinator extends DurableObject<Env> {
 
   private insert(work: Work, delivery: string, now: number): string {
     const id = this.sql.exec<{ id: number }>(
-      `INSERT INTO work (lane, kind, event, head_sha, object_id, sender, delivery, enqueued_at, status, trusted)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?) RETURNING id`,
-      work.lane, work.kind, work.event, work.headSha, work.objectId, work.sender, delivery, now, Number(work.trusted),
+      `INSERT INTO work (lane, kind, event, head_sha, object_id, sender, delivery, enqueued_at, status, trusted, writer)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?) RETURNING id`,
+      work.lane, work.kind, work.event, work.headSha, work.objectId, work.sender, delivery, now, Number(work.trusted), Number(work.writer),
     ).one().id;
     return `work ${id}`;
   }
@@ -464,15 +467,19 @@ export class PrCoordinator extends DurableObject<Env> {
         work.lane, work.kind, work.objectId, Number(work.trusted),
       ).toArray();
       if (same) {
-        this.sql.exec('UPDATE work SET event = ?, sender = ?, delivery = ? WHERE id = ?', work.event, work.sender, delivery, same.id);
+        this.sql.exec(
+          'UPDATE work SET event = ?, sender = ?, delivery = ?, writer = ? WHERE id = ?',
+          work.event, work.sender, delivery, Number(work.writer), same.id,
+        );
         return `merged into work ${same.id}`;
       }
     }
 
     if (work.kind === 'review') {
-      // A request by someone outside the repository can neither take over a push review nor take on its head.
-      if (!work.trusted) return `queued ${this.insert(work, delivery, now)}`;
-      const reviews = this.queued('state', ['review']).filter((row) => row.trusted);
+      // A request whose sender may lack write access can neither take over a push review nor take on its head, since
+      // the sender's lookup can still drop it.
+      if (!work.writer) return `queued ${this.insert(work, delivery, now)}`;
+      const reviews = this.queued('state', ['review']).filter((row) => row.writer);
       const review = reviews.at(-1);
       if (!review) return `queued ${this.insert(work, delivery, now)}`;
       const isPush = work.event.startsWith('pull_request.');
@@ -723,8 +730,13 @@ export class PrCoordinator extends DurableObject<Env> {
         this.finish(item.id, 'skipped', `not opted in: ${optIn.reason}`);
         return;
       }
-      if (this.capped(item)) return;
-      await this.dispatch(item, optIn.workflow);
+      if (!(await this.senderMayAsk(item))) {
+        if (this.isDispatching(item.id)) this.finish(item.id, 'skipped', 'commenter has no write access');
+        return;
+      }
+      if (!this.isDispatching(item.id) || this.capped(item)) return;
+      if (item.kind === 'help') await this.answerHelp(item);
+      else await this.dispatch(item, optIn.workflow);
     } catch (error) {
       // The lease runs out after the backoff, and the next pass takes the item again.
       this.sql.exec(
@@ -778,6 +790,11 @@ export class PrCoordinator extends DurableObject<Env> {
   private async dispatch(item: WorkRow, workflow: string): Promise<void> {
     const target = await this.verifiedTarget();
     if (!target) throw new Error('the repository could not be read');
+    // Only a review nobody asked for waits out a pause. A request, a reply or a Force review tick still runs.
+    if (item.kind === 'review' && item.event.startsWith('pull_request.') && this.reported().pause !== null) {
+      this.finish(item.id, 'skipped', 'pull request is paused');
+      return;
+    }
     if (item.kind === 'review' && !(await this.refreshReview(item, target))) return;
 
     const current = this.row(item.id);
@@ -847,6 +864,49 @@ export class PrCoordinator extends DurableObject<Env> {
       this.sql.exec(`DELETE FROM meta WHERE key = 'opt_in'`);
       this.finish(item.id, 'failed', `dispatch refused with ${response.status}: ${failure.slice(0, 200)}`);
     }
+  }
+
+  /**
+   * Whether the sender of a comment item has write access, as Manki requires of anyone who starts it from a comment.
+   * Only a sender the payload does not show as a writer is looked up. Other items need no check.
+   */
+  private async senderMayAsk(item: WorkRow): Promise<boolean> {
+    if (item.writer || !(item.event.startsWith('issue_comment.') || item.event.startsWith('pull_request_review_comment.'))) return true;
+    if (!item.sender) return false;
+    const target = await this.verifiedTarget();
+    if (!target) throw new Error('the repository could not be read');
+    const token = await this.token({ metadata: 'read' });
+    if (token === null) return false;
+    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/collaborators/${encodeURIComponent(item.sender)}/permission`);
+    if (response.status === 404) return false;
+    if (!response.ok) throw new Error(`reading the permission of ${item.sender} failed with ${response.status}`);
+    const { permission } = await response.json() as { permission?: string };
+    // GitHub reports `maintain` as `write` here, as Manki's `hasWriteAccess` expects.
+    return permission === 'admin' || permission === 'write';
+  }
+
+  /** Answers a help command with Manki's command table and a thumbs-up on the command, with no run. */
+  private async answerHelp(item: WorkRow): Promise<void> {
+    const target = await this.verifiedTarget();
+    if (!target) throw new Error('the repository could not be read');
+    const token = await this.token({ issues: 'write', pull_requests: 'write' });
+    if (!this.isDispatching(item.id)) return;
+    if (token === null) {
+      this.finish(item.id, 'skipped', 'installation lacks issues: write');
+      return;
+    }
+    const repo = `/repos/${target.owner}/${target.repo}`;
+    const comments = item.event.startsWith('pull_request_review_comment.') ? 'pulls' : 'issues';
+    if (item.object_id !== null) {
+      const reaction = await githubApi(token, `${repo}/${comments}/comments/${item.object_id}/reactions`, { method: 'POST', body: { content: '+1' } });
+      if (!reaction.ok) log('coordinator_reaction_failed', { ...this.logFields(), comment_id: item.object_id, status: reaction.status });
+    }
+    // Manki marks the reply to a PR comment as its answer, as its `markAnswers` does.
+    const body = comments === 'issues' ? `${HELP_REPLY}\n<!-- manki-answered:${item.object_id} -->` : HELP_REPLY;
+    const response = await githubApi(token, `${repo}/issues/${target.number}/comments`, { method: 'POST', body: { body } });
+    if (!response.ok) throw new Error(`posting the help reply failed with ${response.status}`);
+    this.sql.exec('UPDATE work SET dispatched_at = ? WHERE id = ?', Date.now(), item.id);
+    this.finish(item.id, 'done', 'answered help');
   }
 
   /** Re-reads the PR before a review starts. Returns false when the review was dropped. */

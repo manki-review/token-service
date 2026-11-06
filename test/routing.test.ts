@@ -84,7 +84,7 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['a dismiss in a thread', 'pull_request_review_comment', reviewCommentEvent('@manki dismiss', { in_reply_to_id: 1 }), 'state:thread'],
   ['a remember in a thread', 'pull_request_review_comment', reviewCommentEvent('@manki remember use tabs', { in_reply_to_id: 1 }), 'state:thread'],
   ['a forget in a thread', 'pull_request_review_comment', reviewCommentEvent('@manki forget tabs'), 'state:thread'],
-  ['a help in a thread', 'pull_request_review_comment', reviewCommentEvent('/manki help'), 'state:thread'],
+  ['a help in a thread', 'pull_request_review_comment', reviewCommentEvent('/manki help'), 'help:help'],
   ['a check in a thread', 'pull_request_review_comment', reviewCommentEvent('@manki check'), 'state:thread'],
   ['a new thread without a mention', 'pull_request_review_comment', reviewCommentEvent('nit: rename this'), 'ignore'],
   ['a review comment by a bot', 'pull_request_review_comment', reviewCommentEvent('@manki hi', { user: ACTIONS_AUTHOR }), 'ignore'],
@@ -99,7 +99,10 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['a dismiss', 'issue_comment', issueCommentEvent('@manki dismiss the null check finding'), 'state:comment'],
   ['an explain', 'issue_comment', issueCommentEvent('@manki explain the cache'), 'chat:comment'],
   ['a free question', 'issue_comment', issueCommentEvent('@manki why is this slow?'), 'chat:comment'],
-  ['a help', 'issue_comment', issueCommentEvent('@Manki help'), 'chat:comment'],
+  ['a help', 'issue_comment', issueCommentEvent('@Manki help'), 'help:help'],
+  ['a help that asks for a review', 'issue_comment', issueCommentEvent('@manki help me review this'), 'state:review'],
+  ['an edit that adds a help', 'issue_comment', issueCommentEvent('@manki help', { action: 'edited', previousBody: 'hmm' }), 'help:help'],
+  ['an edit that keeps a help', 'issue_comment', issueCommentEvent('@manki help, thanks', { action: 'edited', previousBody: '@manki help' }), 'ignore'],
   ['a remember', 'issue_comment', issueCommentEvent('@manki remember we use tabs'), 'chat:comment'],
   ['a forget', 'issue_comment', issueCommentEvent('@manki-review forget tabs'), 'chat:comment'],
   ['a check quoted in code', 'issue_comment', issueCommentEvent('@manki what does `@manki check` do?'), 'chat:comment'],
@@ -221,11 +224,24 @@ describe('routeDelivery', () => {
     ['a tick on an outsider\'s comment', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { action: 'edited', association: 'NONE' }), false],
     ['a thread reply without a mention', 'pull_request_review_comment', reviewCommentEvent('Fixed', { in_reply_to_id: 1 }), false],
     ['a mention in a review comment by an outsider', 'pull_request_review_comment', reviewCommentEvent('@manki is this safe?', { author_association: 'NONE' }), false],
+    ['a help, which gets a thumbs-up with its answer instead', 'issue_comment', issueCommentEvent('@manki help'), false],
     ['a push', 'pull_request', pullRequestEvent('synchronize'), false],
   ])('reacts to %s when it is queued or not', (_case, event, payload, acknowledge) => {
     const route = routeDelivery(event, payload);
     expect(route.type).toBe('work');
     expect(route.type === 'work' && route.work.acknowledge).toBe(acknowledge);
+  });
+
+  it.each<[string, string, WebhookPayload, boolean]>([
+    ['a collaborator\'s comment', 'issue_comment', issueCommentEvent('@manki explain'), true],
+    ['a collaborator\'s edit of their own comment', 'issue_comment', issueCommentEvent('@manki explain', { action: 'edited' }), true],
+    ['an edit of a collaborator\'s comment by someone else', 'issue_comment', issueCommentEvent('@manki explain', { action: 'edited', sender: { login: 'mallory', type: 'User' } }), false],
+    ['a contributor\'s comment', 'issue_comment', issueCommentEvent('@manki explain', { association: 'CONTRIBUTOR' }), false],
+    ['an outsider\'s thread reply', 'pull_request_review_comment', reviewCommentEvent('ok', { in_reply_to_id: 1, author_association: 'NONE' }), false],
+    ['a Force review tick', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { action: 'edited', author: MANKI_AUTHOR, association: 'NONE' }), true],
+  ])('marks %s as a writer or not', (_case, event, payload, writer) => {
+    const route = routeDelivery(event, payload);
+    expect(route.type === 'work' && route.work.writer).toBe(writer);
   });
 
   it('fills the merge work and the run end', () => {
