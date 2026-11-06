@@ -867,7 +867,7 @@ export class PrCoordinator extends DurableObject<Env> {
         return false;
       }
       this.sql.exec('UPDATE work SET head_sha = ? WHERE id = ?', pr.head.sha, item.id);
-      const rule = await this.skipRule(pr, item.sender, target);
+      const rule = await this.skipRule(pr, item.head_sha, item.sender, target);
       if (!this.isDispatching(item.id)) return false;
       if (rule !== null) {
         await this.reportSkipped(pr.head.sha, rule, target);
@@ -883,7 +883,7 @@ export class PrCoordinator extends DurableObject<Env> {
    * Returns the skip rule of the base branch's `.manki.yml` the PR matches, or null when none does. A missing,
    * oversized or invalid file skips nothing, as it does in Manki.
    */
-  private async skipRule(pr: PullRequestRead, sender: string, target: Target): Promise<string | null> {
+  private async skipRule(pr: PullRequestRead, queuedHead: string | null, sender: string, target: Target): Promise<string | null> {
     const token = await this.token({ contents: 'read', metadata: 'read' });
     if (token === null) return null;
     const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/contents/.manki.yml?ref=${encodeURIComponent(pr.base.ref)}`);
@@ -897,8 +897,8 @@ export class PrCoordinator extends DurableObject<Env> {
     return matchSkipRule(rules, {
       labels: pr.labels?.map((label) => label.name) ?? [],
       author: pr.user?.login,
-      // A catch-up names no sender, so Manki's rule for an event without one applies.
-      sender: sender || undefined,
+      // Who pushed a head other than the queued one is unknown, as for a catch-up, so no author rule matches it.
+      sender: pr.head.sha === queuedHead ? sender : '',
       branch: pr.head.ref,
       fromFork: pr.head.repo?.id !== target.repositoryId,
     });

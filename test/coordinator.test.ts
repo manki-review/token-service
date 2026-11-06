@@ -1137,6 +1137,7 @@ describe('PrCoordinator dispatch', () => {
 
   it.each([
     ['a listed author when someone else pushed', { config: 'skip_authors: [renovate-bot]', author: 'renovate-bot' }],
+    ['a listed author whose push is no longer the head', { config: 'skip_authors: [renovate-bot]', author: 'renovate-bot', sender: 'renovate-bot', head: SHA_2 }],
     ['a label on a fork head', { config: 'skip_labels: [dependencies]', labels: ['dependencies'], headRepositoryId: 1 }],
     ['a branch on a fork head', { config: 'skip_branches: ["release/*"]', headRef: 'release/1', headRepositoryId: 1 }],
     ['rules that are not lists of non-empty strings', { config: 'skip_labels: dependencies\nskip_branches: ["feature"]' }],
@@ -1144,8 +1145,10 @@ describe('PrCoordinator dispatch', () => {
     ['no config', {}],
   ])('reviews a push matching %s', async (_case, change) => {
     const pr = pullRequest();
-    const github = Object.assign(fakeGitHub(pr.number), change);
-    await pr.send('pull_request', pr.push(SHA_1));
+    const { sender, ...pull } = { sender: 'alice', ...change };
+    const github = Object.assign(fakeGitHub(pr.number), pull);
+    const push = pr.push(SHA_1);
+    await pr.send('pull_request', { ...push, sender: { ...push.sender, login: sender } });
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches).toHaveLength(1);
     expect(github.checkRuns).toEqual([]);
