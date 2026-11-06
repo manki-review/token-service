@@ -8,7 +8,15 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { RUN_DEADLINE_MS } from '../src/coordinator';
-import { CATCH_UP_WINDOW_MS, MAX_DELIVERY_PAGES, MAX_REDELIVERIES, RECONCILER_NAME, REDELIVERY_WINDOW_MS, SUBREQUEST_BUDGET } from '../src/reconciler';
+import {
+  CATCH_UP_WINDOW_MS,
+  MAX_DELIVERY_PAGES,
+  MAX_REDELIVERIES,
+  RECONCILER_NAME,
+  Reconciler,
+  REDELIVERY_WINDOW_MS,
+  SUBREQUEST_BUDGET,
+} from '../src/reconciler';
 import { routeDelivery, type Target } from '../src/routing';
 import { coordinator, freezeClock, INSTALLATION_ID, logged, OWNER, OWNER_ID, postWebhook, RUNTIME_ENV, setDispatchEnabled, tableNames, TEST_ENV, workRows } from './helpers';
 import { DISPATCH_WORKFLOW_YAML, EVENT_WORKFLOW_YAML, pullRequestEvent, workflowsReply } from './payloads';
@@ -387,6 +395,35 @@ describe('Reconciler redelivery', () => {
     const rows = await runInDurableObject(stub, (_instance, state) =>
       state.storage.sql.exec<{ count: number }>('SELECT COUNT(*) AS count FROM failed_deliveries').one().count);
     expect(rows).toBe(0);
+  });
+
+  it('adds owner_id to a registry from before it and skips a row without one until it is recorded again', async () => {
+    const { stub, repo } = setup();
+    const target = repo();
+    const github = fakeGitHub();
+    github.pages = [[failure(target, 1, 0)]];
+    github.pulls.set(target.repo, [pull(1, SHA_1, { repo: target.repo })]);
+    const optedInAt = Date.now() - MINUTE;
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec('DROP TABLE opt_ins');
+      state.storage.sql.exec(`CREATE TABLE opt_ins (
+        repository_id INTEGER PRIMARY KEY, installation_id INTEGER NOT NULL, owner TEXT NOT NULL, repo TEXT NOT NULL,
+        default_branch TEXT NOT NULL, opted_in_at INTEGER NOT NULL
+      )`);
+      state.storage.sql.exec(
+        'INSERT INTO opt_ins VALUES (?, ?, ?, ?, ?, ?)', target.repositoryId, target.installationId, OWNER, target.repo, 'main', optedInAt,
+      );
+      // A new instance on the old schema, as after a deploy.
+      const upgraded = new Reconciler(state, RUNTIME_ENV);
+      await upgraded.reconcile();
+      expect(github.redelivered).toEqual([]);
+      expect(github.pullListCalls).toEqual([]);
+
+      await upgraded.recordOptIn(target, true);
+      await upgraded.reconcile();
+      expect(github.pullListCalls).toEqual([target.repo]);
+      expect(state.storage.sql.exec('SELECT owner_id, opted_in_at FROM opt_ins').toArray()).toEqual([{ owner_id: OWNER_ID, opted_in_at: optedInAt }]);
+    });
   });
 
   it('touches no repository of an account outside WEBHOOK_ACCOUNTS, even one in the registry', async () => {
