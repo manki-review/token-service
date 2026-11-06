@@ -21,9 +21,10 @@ const WORKFLOW_PATH = /^\.github\/workflows\/[^/@]+\.ya?ml(@.+)?$/;
 
 /**
  * The state lane carries everything that reads or changes threads, verdicts or approval. The chat lane carries
- * answers that change no PR state, so a question does not wait behind a review.
+ * answers that change no PR state, so a question does not wait behind a review. The help lane carries help commands,
+ * which the Worker answers itself, so they wait behind no run.
  */
-export type Lane = 'state' | 'chat';
+export type Lane = 'state' | 'chat' | 'help';
 
 /**
  * The Manki handler a work item ends up in. Only `review` items coalesce.
@@ -33,8 +34,9 @@ export type Lane = 'state' | 'chat';
  * - `thread`: `handleReviewCommentInteraction`
  * - `comment`: `handleInteraction`
  * - `issue`: `handleIssueInteraction`
+ * - `help`: answered by the Worker, with no run
  */
-export type WorkKind = 'review' | 'merged' | 'review_state' | 'thread' | 'comment' | 'issue';
+export type WorkKind = 'review' | 'merged' | 'review_state' | 'thread' | 'comment' | 'issue' | 'help';
 
 /** The pull request or issue a delivery is about. Every field comes from the signed payload. */
 export interface Target {
@@ -163,9 +165,14 @@ function isTrusted(payload: WebhookPayload): boolean {
 /** The `author_association` values Manki's `isTrustedAssociation` takes as write access. */
 const WRITER_ASSOCIATIONS = ['OWNER', 'MEMBER', 'COLLABORATOR'];
 
-/** Whether the comment's or review's author has write access, as its `author_association` shows it. */
+/**
+ * Whether the sender has write access, as the `author_association` of the comment or review they wrote shows it. On an
+ * edit of someone else's comment, the association is the author's, so it says nothing about the sender.
+ */
 function isWriterAuthored(payload: WebhookPayload): boolean {
-  return WRITER_ASSOCIATIONS.includes((payload.comment ?? payload.review)?.author_association ?? '');
+  const { action, comment, sender } = payload;
+  if (action === 'edited' && comment && comment.user?.login !== sender?.login) return false;
+  return WRITER_ASSOCIATIONS.includes((comment ?? payload.review)?.author_association ?? '');
 }
 
 /**
@@ -280,6 +287,7 @@ function routeReviewComment(target: Target, payload: WebhookPayload): Route {
   const body = comment?.body ?? '';
   if (comment?.user?.type === 'Bot' || body.includes(MANKI_COMMENT_MARKER)) return ignore('comment is from a bot');
   if (!comment?.in_reply_to_id && !hasBotMention(body)) return ignore('comment is neither a reply nor a mention');
+  if (parseCommandType(body) === 'help') return helpRoute(target, payload, 'pull_request_review_comment');
   // Every thread command ends with Manki's auto-approve check, so none may run beside a review.
   return { type: 'work', target, work: work('state', 'thread', payload, 'pull_request_review_comment', comment?.id ?? null) };
 }
@@ -315,8 +323,14 @@ function routeIssueComment(target: Target, payload: WebhookPayload): Route {
     return { type: 'work', target, work: work('state', 'review', payload, 'issue_comment', objectId) };
   }
   const command = parseCommandType(body);
+  if (command === 'help') return helpRoute(target, payload, 'issue_comment');
   const lane: Lane = command === 'check' || command === 'dismiss' ? 'state' : 'chat';
   return { type: 'work', target, work: work(lane, 'comment', payload, 'issue_comment', objectId) };
+}
+
+/** A help command on a pull request. It gets a thumbs-up reaction with the answer, never the eyes reaction. */
+function helpRoute(target: Target, payload: WebhookPayload, event: string): Route {
+  return { type: 'work', target, work: { ...work('help', 'help', payload, event, payload.comment?.id ?? null), acknowledge: false } };
 }
 
 /**

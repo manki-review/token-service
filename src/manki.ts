@@ -13,6 +13,23 @@ export const MANKI_LOGINS: readonly string[] = [BOT_LOGIN, 'github-actions[bot]'
 /** The marker every comment and review comment Manki writes carries. */
 export const MANKI_COMMENT_MARKER = '<!-- manki';
 
+/** The answer to a help command, as Manki's `handleHelp` posts it. */
+export const HELP_REPLY = [
+  '| Command | What it does |',
+  '|---|---|',
+  '| `/manki review` | Reviews the head commit unless Manki already has a complete review of it. Tick Force review on the reply to review it again |',
+  '| `/manki explain [topic]` | Explains something about this PR |',
+  '| `/manki check` | Checks for open blocking threads and approves when there are none |',
+  '| `/manki dismiss [finding]` | Dismisses a finding |',
+  '| `/manki remember <instruction>` | Stores an instruction for future reviews |',
+  '| `/manki forget <text>` | Removes a learning or suppression |',
+  '| `/manki help` | Shows this message |',
+  '',
+  '`@manki` and `@manki-review` work as the prefix too. A reply to a Manki review comment gets an answer in its thread.',
+  '',
+  '<!-- manki -->',
+].join('\n');
+
 const FORCE_REVIEW_MARKER = '<!-- manki-force-review -->';
 const FORCE_CAP_MARKER = '<!-- manki-force-cap -->';
 const TICKED_FORCE_REVIEW = '- [x] Force review';

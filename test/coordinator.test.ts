@@ -18,6 +18,7 @@ import {
   type Delivery,
   UNTRUSTED_DISPATCHES_PER_HOUR,
 } from '../src/coordinator';
+import { HELP_REPLY } from '../src/manki';
 import { routeDelivery, type Target, type WebhookPayload } from '../src/routing';
 import {
   apiRequests,
@@ -200,7 +201,7 @@ describe('PrCoordinator.receive', () => {
 
   it('merges a review command into the queued one, and queues a tick or an edited request on its own', async () => {
     const pr = pullRequest();
-    const comment = (id: number, body: string, action = 'created', user = { login: 'bob', type: 'User' }) =>
+    const comment = (id: number, body: string, action = 'created', user = { login: 'alice', type: 'User' }) =>
       ({ ...pr.comment(body, action), comment: { id, body, user, author_association: 'MEMBER' } });
     await pr.send('pull_request', pr.push(SHA_1));
     await pr.send('issue_comment', pr.comment('@manki review'), 'd-request');
@@ -417,7 +418,7 @@ describe('PrCoordinator.alarm', () => {
     expect(graphqlCalls()).toBe(1);
 
     advanceClock(OPT_IN_TTL_MS);
-    await pr.send('issue_comment', pr.comment('@manki help'));
+    await pr.send('issue_comment', pr.comment('@manki explain'));
     await runDurableObjectAlarm(pr.stub);
     expect(graphqlCalls()).toBe(2);
   });
@@ -517,7 +518,7 @@ describe('PrCoordinator.alarm', () => {
     await pr.send('issue_comment', pr.comment('@manki explain'));
     await runDurableObjectAlarm(pr.stub);
     advanceClock(FINISHED_RETENTION_MS - MINUTE);
-    await pr.send('issue_comment', pr.comment('@manki help'));
+    await pr.send('issue_comment', pr.comment('@manki explain'));
     advanceClock(2 * MINUTE);
     await runDurableObjectAlarm(pr.stub);
     expect((await workRows(pr.stub)).map((row) => row.id)).toEqual([2]);
@@ -657,6 +658,13 @@ function fakeGitHub(number: number) {
     /** The eyes reactions added, as `<issues or pulls>/<comment id>`, and the status each kind gets. */
     reactions: [] as string[],
     reactionStatus: { issues: 201, pulls: 201 } as Record<string, number>,
+    /** The thumbs-up reactions added, as for `reactions`, and the comments posted on the PR. */
+    thumbsUp: [] as string[],
+    comments: [] as string[],
+    commentStatus: 201,
+    /** Each login's permission on the repository. Anyone else reads as `read`. */
+    permissions: {} as Record<string, string>,
+    permissionReads: [] as string[],
     /** The workflow files on the default branch, and the file each dispatch named. */
     workflows: { 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML } as Record<string, string>,
     dispatchedWorkflows: [] as string[],
@@ -728,9 +736,19 @@ function fakeGitHub(number: number) {
       return Response.json({ total_count: state.listedRuns.length, workflow_runs: state.listedRuns });
     }
     const reaction = url.pathname.match(new RegExp(`^${repo}/(issues|pulls)/comments/(\\d+)/reactions$`));
-    if (reaction && request.method === 'POST' && ((await request.json()) as { content: string }).content === 'eyes') {
-      state.reactions.push(`${reaction[1]}/${reaction[2]}`);
-      return Response.json({ content: 'eyes' }, { status: state.reactionStatus[reaction[1]] });
+    if (reaction && request.method === 'POST') {
+      const { content } = await request.json() as { content: string };
+      (content === 'eyes' ? state.reactions : state.thumbsUp).push(`${reaction[1]}/${reaction[2]}`);
+      return Response.json({ content }, { status: state.reactionStatus[reaction[1]] });
+    }
+    if (route === `POST ${repo}/issues/${number}/comments`) {
+      state.comments.push(((await request.json()) as { body: string }).body);
+      return Response.json({ id: 5005 }, { status: state.commentStatus });
+    }
+    const permission = url.pathname.match(new RegExp(`^${repo}/collaborators/([^/]+)/permission$`));
+    if (permission && request.method === 'GET') {
+      state.permissionReads.push(permission[1]);
+      return Response.json({ permission: state.permissions[permission[1]] ?? 'read' });
     }
     const run = url.pathname.match(new RegExp(`^${repo}/actions/runs/(\\d+)(/cancel)?$`));
     if (run && request.method === 'POST' && run[2]) {
@@ -826,7 +844,7 @@ describe('PrCoordinator dispatch', () => {
     github.repositoryStatus = 404;
     advanceClock(OPT_IN_TTL_MS + 1);
     setDispatchEnabled(true);
-    await pr.send('issue_comment', pr.comment('@manki help'));
+    await pr.send('issue_comment', pr.comment('@manki explain'));
     await runDurableObjectAlarm(pr.stub);
     expect(github.reactions).toEqual([]);
   });
@@ -874,7 +892,7 @@ describe('PrCoordinator dispatch', () => {
     expect(await runInDurableObject(stub, (_instance, state) => state.storage.getAlarm())).toBeNull();
   });
 
-  it('keeps the running state and the reports of the active run across a review, a failure and a cancel', async () => {
+  it('keeps the running state and the reports of the active run across a review, a pause, a failure and a cancel', async () => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
     const call = async (path: string, body: Record<string, unknown> = {}, runId = '9000') => {
@@ -915,25 +933,35 @@ describe('PrCoordinator dispatch', () => {
     };
     expect(await state()).toMatchObject(afterReview);
 
-    // A run that fails and one that is cancelled leave the reported state as it was.
+    // While paused, a push starts nothing. A Force review tick, a thread reply and a review request still run, and a
+    // failed or cancelled run leaves the reported state as it was.
     expect(await pr.stub.runCompleted(key('d-1'), 9000, 'success')).toMatchObject({ accepted: true });
     expect(await call('/state/report', { pause: null })).toEqual({ status: 403, body: { error: 'run 9000 is not active on this PR' } });
-    github.head = SHA_2;
     await runDurableObjectAlarm(pr.stub);
-    expect(await state()).toMatchObject({ active: [{ run_id: 9001, head_sha: SHA_2 }], queue: [], ...afterReview });
+    expect(github.dispatches).toHaveLength(1);
+    expect((await workRows(pr.stub)).at(-1)).toMatchObject({ head_sha: SHA_2, status: 'skipped', note: 'pull request is paused' });
+    const request = async (event: string, payload: WebhookPayload) => {
+      await pr.send(event, payload);
+      await runDurableObjectAlarm(pr.stub);
+    };
+    await request('issue_comment', { ...pr.comment(FORCE_REVIEW_COMMENT, 'edited'), comment: { id: 1002, body: FORCE_REVIEW_COMMENT, user: MANKI_AUTHOR } });
+    expect(await state()).toMatchObject({ active: [{ run_id: 9001, event: 'issue_comment.edited' }], queue: [], ...afterReview });
     expect(await pr.stub.runCompleted(key('d-2'), 9001, 'failure')).toMatchObject({ accepted: true });
-    github.head = SHA_3;
-    await pr.send('pull_request', pr.push(SHA_3));
-    await runDurableObjectAlarm(pr.stub);
+    await request('pull_request_review_comment', pr.reply('Fixed'));
+    expect(await state()).toMatchObject({ active: [{ run_id: 9002, event: 'pull_request_review_comment.created' }] });
     expect(await pr.stub.runCompleted(key('d-3'), 9002, 'cancelled')).toMatchObject({ accepted: true });
     expect(await state()).toMatchObject({ active: [], queue: [], ...afterReview });
 
-    // A later run lifts the pause and records its own review.
-    github.head = SHA_2;
-    await pr.send('pull_request', pr.push(SHA_2));
-    await runDurableObjectAlarm(pr.stub);
+    // A later run lifts the pause and records its own review, and pushes start runs again.
+    await request('issue_comment', pr.comment('@manki review'));
+    expect(await state()).toMatchObject({ active: [{ run_id: 9003, event: 'issue_comment.created' }] });
     expect(await call('/state/report', { reviewed: { commit: SHA_2 }, pause: null }, '9003')).toEqual({ status: 200, body: { changed: ['reviewed', 'pause'] } });
     expect(await state()).toMatchObject({ last_reviewed: { commit: SHA_2, run_id: 9003 }, pause: null, last_approval: afterReview.last_approval });
+    expect(await pr.stub.runCompleted(key('d-4'), 9003, 'success')).toMatchObject({ accepted: true });
+    github.head = SHA_3;
+    await pr.send('pull_request', pr.push(SHA_3));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches.at(-1)?.inputs).toMatchObject({ event: 'pull_request', head_sha: SHA_3 });
   });
 
   it('keeps a closed PR while its run is still running, then deletes it a week after the close', async () => {
@@ -1195,6 +1223,71 @@ describe('PrCoordinator dispatch', () => {
     expect(github.configReads).toEqual([]);
   });
 
+  it('answers a help command at once with Manki\'s command table and a thumbs-up, with no run, while a run holds the chat lane', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    await runDurableObjectAlarm(pr.stub);
+    await pr.send('issue_comment', pr.comment('@manki help'));
+    await pr.send('pull_request_review_comment', pr.reply('@manki help'));
+    await runDurableObjectAlarm(pr.stub);
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches).toHaveLength(1);
+    expect(github.comments).toEqual([HELP_REPLY, HELP_REPLY]);
+    expect(github.thumbsUp).toEqual(['issues/1001', 'pulls/1001']);
+    // The eyes reaction on the explain minted the token the replies reuse, which holds nothing else.
+    expect(github.mints.filter((mint) => mint.permissions.issues)).toEqual([{ permissions: { issues: 'write', pull_requests: 'write' }, repository_ids: [REPOSITORY_ID] }]);
+    expect((await workRows(pr.stub)).map((row) => [row.lane, row.status, row.note])).toEqual([
+      ['chat', 'running', 'dispatched'], ['help', 'done', 'answered help'], ['help', 'done', 'answered help'],
+    ]);
+  });
+
+  it('retries a help reply that failed to post', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    github.commentStatus = 502;
+    await pr.send('issue_comment', pr.comment('@manki help'));
+    await runDurableObjectAlarm(pr.stub);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'dispatching', errors: 1 }]);
+    github.commentStatus = 201;
+    advanceClock(backoff(0));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.comments).toHaveLength(2);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'done', note: 'answered help' }]);
+  });
+
+  it('looks up a commenter the payload does not show as a writer, and skips their comment without write access', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    github.permissions = { bob: 'write', mallory: 'triage' };
+    const by = (login: string, association: string, body: string, action = 'created', author = login) => ({
+      ...issueCommentEvent(body, { number: pr.number, action, association, sender: { login, type: 'User' }, author: { login: author, type: 'User' } }),
+    });
+    const run = async (event: string, payload: WebhookPayload) => {
+      await pr.send(event, payload);
+      await runDurableObjectAlarm(pr.stub);
+    };
+    await run('issue_comment', by('alice', 'NONE', '@manki explain'));
+    await run('issue_comment', by('alice', 'NONE', '@manki help'));
+    await run('pull_request_review_comment', reviewCommentEvent('Fixed', { in_reply_to_id: 1, author_association: 'NONE' }, 'created', { number: pr.number }));
+    await run('issue_comment', by('mallory', 'COLLABORATOR', '@manki explain more', 'edited', 'carol'));
+    expect(github.dispatches).toEqual([]);
+    expect(github.comments).toEqual([]);
+    expect((await workRows(pr.stub)).map((row) => [row.kind, row.status, row.note])).toEqual([
+      ['comment', 'skipped', 'commenter has no write access'],
+      ['help', 'skipped', 'commenter has no write access'],
+      ['thread', 'skipped', 'commenter has no write access'],
+      ['comment', 'skipped', 'commenter has no write access'],
+    ]);
+
+    // An org member GitHub shows as a contributor has write access by the lookup. A collaborator needs no lookup.
+    await run('issue_comment', by('bob', 'CONTRIBUTOR', '@manki explain'));
+    await pr.stub.runCompleted(key('d-bob'), 9000, 'success');
+    await run('issue_comment', by('dave', 'COLLABORATOR', '@manki explain again'));
+    expect(github.dispatches).toHaveLength(2);
+    expect(github.permissionReads).toEqual(['alice', 'alice', 'alice', 'mallory', 'bob']);
+  });
+
   it('polls a run every two minutes as a safety net and ends it once completed', async () => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
@@ -1228,7 +1321,7 @@ describe('PrCoordinator dispatch', () => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
     await pr.send('issue_comment', pr.comment('@manki explain'), 'd-explain');
-    await pr.send('issue_comment', pr.comment('@manki help'));
+    await pr.send('issue_comment', pr.comment('@manki explain'));
     await runDurableObjectAlarm(pr.stub);
     advanceClock(QUEUED_RUN_TIMEOUT_MS + 1);
     await runDurableObjectAlarm(pr.stub);
@@ -1304,7 +1397,7 @@ describe('PrCoordinator dispatch', () => {
     github.refuseActionsWrite = true;
     await pr.send('issue_comment', pr.comment('@manki explain'));
     await runDurableObjectAlarm(pr.stub);
-    await pr.send('issue_comment', pr.comment('@manki help'));
+    await pr.send('issue_comment', pr.comment('@manki explain'));
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches).toEqual([]);
     expect(logged(log, 'coordinator_lacks_actions_write')).toHaveLength(1);
@@ -1346,7 +1439,7 @@ describe('PrCoordinator dispatch', () => {
     await pr.send('issue_comment', pr.comment('@manki explain'));
     await runDurableObjectAlarm(pr.stub);
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'failed', note: 'dispatch refused with 422: {"message":"no"}' }]);
-    await pr.send('issue_comment', pr.comment('@manki help'));
+    await pr.send('issue_comment', pr.comment('@manki explain'));
     await runDurableObjectAlarm(pr.stub);
     expect(github.graphqlCalls).toBe(2);
   });
@@ -1391,7 +1484,7 @@ describe('PrCoordinator dispatch', () => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
     for (let i = 0; i <= UNTRUSTED_DISPATCHES_PER_HOUR; i++) {
-      await pr.send('issue_comment', pr.outsiderComment(`@manki explain ${i}`));
+      await pr.send('pull_request_review', pr.outsiderReview(3000 + i));
       await runDurableObjectAlarm(pr.stub);
       await pr.stub.runCompleted(key(`d-end-${i}`), 9000 + i, 'success');
     }
@@ -1399,7 +1492,7 @@ describe('PrCoordinator dispatch', () => {
     expect((await workRows(pr.stub)).at(-1)).toMatchObject({ status: 'dropped', note: `over ${UNTRUSTED_DISPATCHES_PER_HOUR} dispatches in the last hour` });
 
     for (let i = 0; i < DISPATCHES_PER_HOUR; i++) {
-      await pr.send('issue_comment', pr.comment(`@manki explain ${i}`));
+      await pr.send('pull_request_review', pr.review());
       await runDurableObjectAlarm(pr.stub);
       await pr.stub.runCompleted(key(`d-user-end-${i}`), 9000 + UNTRUSTED_DISPATCHES_PER_HOUR + i, 'success');
     }
@@ -1444,7 +1537,7 @@ describe('PrCoordinator dispatch', () => {
     await pr.send('issue_comment', pr.comment('@manki explain'));
     await runDurableObjectAlarm(pr.stub);
     await pr.stub.runCompleted(key('d-end-1'), 9000, 'success');
-    await pr.send('issue_comment', pr.comment('@manki help'));
+    await pr.send('issue_comment', pr.comment('@manki explain'));
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches).toHaveLength(2);
     expect(actionsWrites()).toBe(1);
@@ -1559,7 +1652,7 @@ describe('PrCoordinator dispatch', () => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
     await pr.send('issue_comment', pr.comment('@manki explain'));
-    await pr.send('issue_comment', pr.comment('@manki help'));
+    await pr.send('issue_comment', pr.comment('@manki explain'));
     await runDurableObjectAlarm(pr.stub);
     github.runReadStatus = 500;
     github.cancelStatuses = [500];
@@ -1606,7 +1699,7 @@ describe('PrCoordinator dispatch', () => {
     const github = fakeGitHub(pr.number);
     github.cancelStatuses = [500];
     await pr.send('issue_comment', pr.comment('@manki explain'));
-    await pr.send('issue_comment', pr.comment('@manki help'));
+    await pr.send('issue_comment', pr.comment('@manki explain'));
     await runDurableObjectAlarm(pr.stub);
     advanceClock(QUEUED_RUN_TIMEOUT_MS + 1);
     await runDurableObjectAlarm(pr.stub);
@@ -1720,7 +1813,7 @@ describe('PrCoordinator dispatch', () => {
     await runDurableObjectAlarm(pr.stub);
     await pr.stub.runCompleted(key('d-end'), 9000, 'success');
     advanceClock(OPT_IN_TTL_MS + 1);
-    await pr.send('issue_comment', pr.comment('@manki help'));
+    await pr.send('issue_comment', pr.comment('@manki explain'));
     await runDurableObjectAlarm(pr.stub);
     expect(github.repositoryReads).toBe(2);
     expect(github.dispatches).toHaveLength(2);
@@ -1769,7 +1862,7 @@ describe('PrCoordinator dispatch', () => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
     await pr.send('issue_comment', pr.comment('@manki explain'));
-    await pr.send('issue_comment', pr.comment('@manki help'));
+    await pr.send('issue_comment', pr.comment('@manki explain'));
     await runDurableObjectAlarm(pr.stub);
     github.repositoryStatus = 404;
     advanceClock(OPT_IN_TTL_MS + 1);
