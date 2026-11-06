@@ -875,7 +875,7 @@ export class PrCoordinator extends DurableObject<Env> {
     if (!item.sender) return false;
     const target = await this.verifiedTarget();
     if (!target) throw new Error('the repository could not be read');
-    const token = await this.token({ contents: 'read', metadata: 'read' });
+    const token = await this.token({ metadata: 'read' });
     if (token === null) return false;
     const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/collaborators/${encodeURIComponent(item.sender)}/permission`);
     if (response.status === 404) return false;

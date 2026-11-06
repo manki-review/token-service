@@ -1286,6 +1286,7 @@ describe('PrCoordinator dispatch', () => {
     await run('issue_comment', by('dave', 'COLLABORATOR', '@manki explain again'));
     expect(github.dispatches).toHaveLength(2);
     expect(github.permissionReads).toEqual(['alice', 'alice', 'alice', 'mallory', 'bob']);
+    expect(github.mints).toContainEqual({ permissions: { metadata: 'read' }, repository_ids: [REPOSITORY_ID] });
   });
 
   it('polls a run every two minutes as a safety net and ends it once completed', async () => {
