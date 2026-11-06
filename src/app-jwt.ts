@@ -1,4 +1,5 @@
 import { importPKCS8, SignJWT } from 'jose';
+import type { Env } from './env';
 
 // DER `AlgorithmIdentifier` for rsaEncryption (OID 1.2.840.113549.1.1.1) with NULL parameters.
 const RSA_ALGORITHM_IDENTIFIER = [0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00];
@@ -44,14 +45,19 @@ export function toPkcs8Pem(privateKeyPem: string): string {
 /** How long a signed App JWT is reused. It is valid for 10 minutes, so a reused one has a minute left at least. */
 export const APP_JWT_REUSE_MS = 9 * 60_000;
 
-let cachedJwt: { appId: string; privateKeyPem: string; jwt: string; signedAt: number } | null = null;
+let cachedJwt: { issuer: string; privateKeyPem: string; jwt: string; signedAt: number } | null = null;
 
-/** Returns an App JWT, signing a new one only when the last one for this App and key is 9 minutes old. */
-export async function createAppJWT(appId: string, privateKeyPem: string): Promise<string> {
+/**
+ * Returns an App JWT, signing a new one only when the last one for this issuer and key is 9 minutes old. The issuer is
+ * `APP_CLIENT_ID`, as GitHub recommends, or `APP_ID` while no client ID is set.
+ */
+export async function createAppJWT(env: Pick<Env, 'APP_ID' | 'APP_CLIENT_ID' | 'APP_PRIVATE_KEY'>): Promise<string> {
+  const issuer = env.APP_CLIENT_ID || env.APP_ID;
+  const privateKeyPem = env.APP_PRIVATE_KEY;
   const now = Date.now();
   const cached = cachedJwt;
   if (
-    cached && cached.appId === appId && cached.privateKeyPem === privateKeyPem
+    cached && cached.issuer === issuer && cached.privateKeyPem === privateKeyPem
     && now >= cached.signedAt && now - cached.signedAt < APP_JWT_REUSE_MS
   ) {
     return cached.jwt;
@@ -62,8 +68,8 @@ export async function createAppJWT(appId: string, privateKeyPem: string): Promis
     .setProtectedHeader({ alg: 'RS256', typ: 'JWT' })
     .setIssuedAt(seconds - 60)
     .setExpirationTime(seconds + 600)
-    .setIssuer(appId)
+    .setIssuer(issuer)
     .sign(key);
-  cachedJwt = { appId, privateKeyPem, jwt, signedAt: now };
+  cachedJwt = { issuer, privateKeyPem, jwt, signedAt: now };
   return jwt;
 }

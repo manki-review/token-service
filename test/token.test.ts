@@ -30,6 +30,8 @@ function paths(requests: Request[]): string[] {
   return apiRequests(requests).map((request) => `${request.method} ${new URL(request.url).pathname}`);
 }
 
+const APP_CLIENT_ID = 'Iv23liTestClientId';
+
 const LOOKUP = `GET /repos/${OWNER}/${REPO}/installation`;
 const MINT = `POST /app/installations/${INSTALLATION_ID}/access_tokens`;
 
@@ -120,17 +122,34 @@ describe('/token', () => {
     }
   });
 
-  it('reuses the App JWT for 9 minutes for the same App and key', async () => {
+  it.each([
+    ['the client ID when one is set', APP_CLIENT_ID, APP_CLIENT_ID],
+    ['the App ID when the client ID is empty', '', APP_ID],
+    ['the App ID when no client ID is set', undefined, APP_ID],
+  ])('signs the App JWT with %s as the issuer', async (_case, clientId, issuer) => {
+    const requests = stubGitHub();
+    const response = await postToken({ env: { ...TEST_ENV, APP_CLIENT_ID: clientId } });
+    expect(response.status).toBe(200);
+    for (const request of apiRequests(requests)) {
+      const jwt = request.headers.get('Authorization')!.replace('Bearer ', '');
+      expect((await jwtVerify(jwt, appKeys.publicKey)).payload.iss).toBe(issuer);
+    }
+  });
+
+  it('reuses the App JWT for 9 minutes for the same issuer and key', async () => {
     const advance = freezeClock(Date.now() + 2 * APP_JWT_REUSE_MS);
-    const first = await createAppJWT(APP_ID, appPrivateKeyPkcs1);
+    const pkcs1 = { APP_ID, APP_PRIVATE_KEY: appPrivateKeyPkcs1 };
+    const pkcs8 = { APP_ID, APP_PRIVATE_KEY: appPrivateKeyPkcs8 };
+    const first = await createAppJWT(pkcs1);
     advance(APP_JWT_REUSE_MS - 1);
-    expect(await createAppJWT(APP_ID, appPrivateKeyPkcs1)).toBe(first);
-    expect(await createAppJWT('654321', appPrivateKeyPkcs1)).not.toBe(first);
-    const other = await createAppJWT(APP_ID, appPrivateKeyPkcs8);
+    expect(await createAppJWT(pkcs1)).toBe(first);
+    expect(await createAppJWT({ ...pkcs1, APP_ID: '654321' })).not.toBe(first);
+    expect(await createAppJWT({ ...pkcs1, APP_CLIENT_ID })).not.toBe(first);
+    const other = await createAppJWT(pkcs8);
     expect(other).not.toBe(first);
-    expect(await createAppJWT(APP_ID, appPrivateKeyPkcs8)).toBe(other);
+    expect(await createAppJWT(pkcs8)).toBe(other);
     advance(APP_JWT_REUSE_MS);
-    const renewed = await createAppJWT(APP_ID, appPrivateKeyPkcs8);
+    const renewed = await createAppJWT(pkcs8);
     expect(renewed).not.toBe(other);
     const { payload } = await jwtVerify(renewed, appKeys.publicKey, { issuer: APP_ID });
     expect(payload.iat).toBe(Math.floor(Date.now() / 1000) - 60);

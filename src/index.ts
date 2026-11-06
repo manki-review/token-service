@@ -108,7 +108,7 @@ export default {
     };
 
     try {
-      const appJwt = await createAppJWT(env.APP_ID, env.APP_PRIVATE_KEY);
+      const appJwt = await createAppJWT(env);
 
       const installation = await getInstallation(appJwt, body.owner, body.repo);
       if (!installation) {

@@ -83,16 +83,20 @@ The following secrets must be set in the Cloudflare Worker environment:
 
 | Secret | Description |
 |---|---|
-| `APP_ID` | GitHub App ID for the manki-review app |
+| `APP_ID` | GitHub App ID for the manki-review app. `/webhook` checks deliveries against it |
+| `APP_CLIENT_ID` | Optional. The App's client ID (`Iv…`, on the App's settings page). When set, it is the `iss` of the App JWT, as [GitHub recommends](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app). Otherwise `APP_ID` is |
 | `APP_PRIVATE_KEY` | PEM private key for the GitHub App |
 | `WEBHOOK_SECRET` | The App's webhook secret. `/webhook` answers `500` until it is set |
 | `WEBHOOK_SECRET_PREVIOUS` | Optional. The secret before a rotation, accepted as well until it is deleted |
 
 ```sh
 wrangler secret put APP_ID
+wrangler secret put APP_CLIENT_ID  # optional
 wrangler secret put APP_PRIVATE_KEY
 wrangler secret put WEBHOOK_SECRET
 ```
+
+The client ID is not secret, so `APP_CLIENT_ID` can also go into `[vars]` in `wrangler.toml` instead of a secret.
 
 To rotate the webhook secret, put the current one into `WEBHOOK_SECRET_PREVIOUS`, then the new one into `WEBHOOK_SECRET` and the App's settings, and delete `WEBHOOK_SECRET_PREVIOUS` once deliveries verify under the new one.
 

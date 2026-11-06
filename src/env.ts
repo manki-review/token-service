@@ -3,6 +3,8 @@ import type { Reconciler } from './reconciler';
 
 export interface Env {
   APP_ID: string;
+  /** The App's client ID. When set, it is the `iss` of the App JWT in place of `APP_ID`. */
+  APP_CLIENT_ID?: string;
   APP_PRIVATE_KEY: string;
   WEBHOOK_SECRET?: string;
   /** The webhook secret before the last rotation, also accepted while it is set. */

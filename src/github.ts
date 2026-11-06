@@ -95,7 +95,7 @@ export async function mintRepositoryToken(
   permissions: Permissions,
   audit: Pick<TokenAudit, 'purpose' | 'repository'>,
 ): Promise<MintResult> {
-  const jwt = await createAppJWT(env.APP_ID, env.APP_PRIVATE_KEY);
+  const jwt = await createAppJWT(env);
   const response = await createInstallationToken(jwt, installationId, permissions, { repository_ids: [repositoryId] });
   if (!response.ok) {
     const message = await response.text();

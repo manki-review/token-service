@@ -204,7 +204,7 @@ export class Reconciler extends DurableObject<Env> {
   private async redeliver(budget: Budget): Promise<void> {
     const since = Date.now() - REDELIVERY_WINDOW_MS;
     this.sql.exec('DELETE FROM failed_deliveries WHERE first_at < ?', since);
-    const jwt = await createAppJWT(this.env.APP_ID, this.env.APP_PRIVATE_KEY);
+    const jwt = await createAppJWT(this.env);
     try {
       await this.scanDeliveries(jwt, budget, since);
     } catch (error) {
