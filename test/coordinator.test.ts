@@ -579,6 +579,17 @@ describe('PrCoordinator.alarm', () => {
     expect(await alarm(reopened.stub)).toBe(Date.now());
     await runDurableObjectAlarm(reopened.stub);
     expect(await alarm(reopened.stub)).toBe(Date.now() + IDLE_RETENTION_MS);
+
+    // So does a reopen alone, which queues no work.
+    const quiet = pullRequest();
+    await quiet.send('pull_request', quiet.push(SHA_1), 'd-quiet');
+    await quiet.send('pull_request', quiet.close(false));
+    await runDurableObjectAlarm(quiet.stub);
+    advanceClock(DAY);
+    expect((await postWebhook({ event: 'pull_request', payload: pullRequestEvent('reopened', { number: quiet.number }) })).status).toBe(202);
+    expect(await workRows(quiet.stub)).toMatchObject([{ status: 'dropped' }]);
+    expect(logged(log, 'coordinator_reopened')).toHaveLength(1);
+    expect(await alarm(quiet.stub)).toBe(Date.now() - DAY + IDLE_RETENTION_MS);
   });
 });
 

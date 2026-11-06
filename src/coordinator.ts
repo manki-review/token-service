@@ -568,6 +568,15 @@ export class PrCoordinator extends DurableObject<Env> {
     }
   }
 
+  /** Clears the PR's recorded close, so its state is kept as for an open PR. Writes nothing when none is recorded. */
+  async reopen(): Promise<void> {
+    if (!this.hasState()) return;
+    this.ensureSchema();
+    if (this.sql.exec(`DELETE FROM meta WHERE key = 'closed_at' RETURNING key`).toArray().length === 0) return;
+    log('coordinator_reopened', this.logFields());
+    await this.scheduleNext();
+  }
+
   /** Whether an item is queued, dispatching or running. */
   private hasUnfinishedWork(): boolean {
     return this.sql.exec(`SELECT 1 FROM work WHERE status = 'queued' OR ${ACTIVE}`).toArray().length > 0;
@@ -582,7 +591,7 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /**
    * Returns when the storage may go: a week after the PR closed, or `IDLE_RETENTION_MS` after the last delivery of a PR
-   * still open. Work queued after the close, as on a reopened PR, clears the close. Null when there is neither.
+   * still open. A reopen or work queued after the close clears the close. Null when there is neither.
    */
   private retainUntil(): number | null {
     const closedAt = this.getMeta<number>('closed_at');
