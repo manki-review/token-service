@@ -905,6 +905,9 @@ export class PrCoordinator extends DurableObject<Env> {
       await this.reportOptIn(repository === null ? target : { ...target, ...repository }, optIn.optedIn);
     }
     log('coordinator_opt_in', { ...this.logFields(), opted_in: optIn.optedIn, reason: optIn.reason });
+    if (optIn.optedIn && optIn.others) {
+      log('coordinator_opt_in_warning', { ...this.logFields(), workflow: optIn.workflow, ignored: optIn.others, reason: 'several dispatch workflows qualify' });
+    }
     this.setMeta('opt_in', { ...optIn, expires: Date.now() + OPT_IN_TTL_MS, repository } satisfies CachedOptIn);
     return optIn;
   }

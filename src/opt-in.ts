@@ -3,8 +3,11 @@ import { DISPATCH_INPUT_NAMES } from './dispatch';
 import { githubGraphql } from './github';
 import type { Target } from './routing';
 
-/** Whether a repository opted in to webhook mode, and the file name of the workflow the Worker dispatches when it did. */
-export type OptIn = { optedIn: true; workflow: string; reason: string } | { optedIn: false; reason: string };
+/**
+ * Whether a repository opted in to webhook mode, and the file name of the workflow the Worker dispatches when it did.
+ * `others` names the other files that qualified, which are never dispatched.
+ */
+export type OptIn = { optedIn: true; workflow: string; others?: string[]; reason: string } | { optedIn: false; reason: string };
 
 /** A repository as GitHub names it, read by its id. */
 export type Repository = Pick<Target, 'owner' | 'ownerId' | 'repo' | 'defaultBranch'>;
@@ -145,7 +148,13 @@ export function classifyWorkflows(files: WorkflowFile[]): OptIn {
       return { optedIn: false, reason: `event-driven Manki workflow ${file.name} is next to ${dispatch.name}` };
     }
   }
-  return { optedIn: true, workflow: dispatch.name, reason: `${dispatch.name} and no event-driven Manki workflow` };
+  const others = candidates.filter((candidate) => candidate.problem === null && candidate.file !== dispatch).map((candidate) => candidate.file.name);
+  return {
+    optedIn: true,
+    workflow: dispatch.name,
+    ...(others.length > 0 && { others }),
+    reason: `${dispatch.name} and no event-driven Manki workflow`,
+  };
 }
 
 const WORKFLOWS_QUERY = `query($owner: String!, $name: String!, $expression: String!) {
