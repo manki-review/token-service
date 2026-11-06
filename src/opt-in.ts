@@ -124,9 +124,11 @@ export function classifyWorkflows(files: WorkflowFile[]): OptIn {
 
   const manki = mankiWorkflows(files);
   const rank = (file: WorkflowFile) => (file.name === DISPATCH_WORKFLOW ? 0 : 1);
-  // A file that names Manki is a candidate whatever its problem, so the reason can name what it lacks.
+  // A file that names Manki is a candidate whatever its problem, so the reason can name what it lacks. Any other file is
+  // parsed only when its text could declare the dispatch inputs, so plain CI workflows cost no parse.
   const candidates = files
-    .filter((file): file is WorkflowText => isWorkflowFile(file.name) && file.text !== null)
+    .filter((file): file is WorkflowText => isWorkflowFile(file.name) && file.text !== null
+      && (manki.has(file.name) || (file.text.includes('workflow_dispatch') && file.text.includes('delivery_id'))))
     .map((file) => ({ file, problem: dispatchProblem(file) }))
     .filter((candidate) => candidate.problem === null || manki.has(candidate.file.name))
     .sort((a, b) => rank(a.file) - rank(b.file) || a.file.name.localeCompare(b.file.name));
