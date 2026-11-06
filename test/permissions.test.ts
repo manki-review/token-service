@@ -36,7 +36,7 @@ describe('/token permissions', () => {
 
     expect((await postToken()).status).toBe(200);
     expect(await mintRequestBody(requests)).toEqual({
-      permissions: { contents: 'read', issues: 'write', metadata: 'read', pull_requests: 'write' },
+      permissions: { contents: 'write', issues: 'write', metadata: 'read', pull_requests: 'write' },
       ...SCOPE,
     });
   });
@@ -79,7 +79,7 @@ describe('/token permissions', () => {
 
     expect((await postToken()).status).toBe(200);
     expect(await mintRequestBody(requests)).toEqual({
-      permissions: { contents: 'read', metadata: 'read', pull_requests: 'write' },
+      permissions: { contents: 'write', metadata: 'read', pull_requests: 'write' },
       ...SCOPE,
     });
   });
@@ -93,7 +93,7 @@ describe('/token permissions', () => {
     expect((await postToken({ body: { owner: OWNER, repo: REPO, ...extra } })).status).toBe(200);
     const [review, ...memory] = await mintRequestBodies(requests);
     expect(review).toEqual({
-      permissions: { contents: 'read', issues: 'write', metadata: 'read', pull_requests: 'write' },
+      permissions: { contents: 'write', issues: 'write', metadata: 'read', pull_requests: 'write' },
       ...SCOPE,
     });
     expect(memory).toEqual('memory' in extra ? [MEMORY_MINT] : []);
