@@ -110,7 +110,7 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
   if (limiter && route.type !== 'ignore') {
     const limit = eventsPerHour(env);
     try {
-      if (!await limiter.take(limit)) {
+      if (!await limiter.hasRoom(limit)) {
         route = { type: 'ignore', reason: `installation ${route.target.installationId} is over ${limit} events this hour` };
       }
     } catch (error) {
@@ -124,22 +124,23 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
     // A thread event names no time, so resolving, reopening and resolving again send the same body. A replay of one
     // only adds a review state check, which merges with the queued one, so its id alone is checked.
     const key = { id: delivery, bodyHash: event === 'pull_request_review_thread' ? null : await sha256Hex(body) };
-    // Only stored work counts, so a replay the coordinator refused or a failed call gives its count back.
-    const release = async () => {
-      try {
-        await limiter?.release();
-      } catch (error) {
-        log('webhook_limiter_error', { delivery, error: String(error) });
-      }
-    };
+    let stored = false;
     try {
       if (route.type === 'run_completed') await coordinator.runCompleted(key, route.runId, route.conclusion);
       else if (route.type === 'seen') await coordinator.markSeen(key, route.target, route.headSha);
-      else if (!(await coordinator.receive(key, route)).accepted) await release();
+      else stored = (await coordinator.receive(key, route)).accepted;
     } catch (error) {
       log('webhook_coordinator_error', { delivery, error: String(error) });
-      await release();
       return Response.json({ error: 'Could not queue the delivery' }, { status: 500 });
+    }
+    // Only stored work counts, so a replay the coordinator refused writes nothing here either. The delivery is stored,
+    // so a failure to count it is only logged.
+    if (limiter && stored) {
+      try {
+        await limiter.add();
+      } catch (error) {
+        log('webhook_limiter_error', { delivery, error: String(error) });
+      }
     }
   }
   return new Response(null, { status: 202 });

@@ -19,24 +19,21 @@ interface Counter {
 
 /**
  * Counts the deliveries of one installation that a coordinator stored, per clock hour. It is named by the installation
- * id. Only a delivery under the cap writes storage, so a flood above it costs reads alone.
+ * id. Only a stored delivery writes the count, so a flood above the cap or of refused replays costs reads alone.
  */
 export class InstallationLimiter extends DurableObject<Env> {
   /** The stored counter, read once per hour per instance. Eviction drops it, and the next call reads it again. */
   private counter: Counter | null = null;
 
-  /** Counts one delivery and returns true, or returns false when `limit` deliveries already counted this hour. */
-  take(limit: number): boolean {
-    const { hour, count } = this.current();
-    if (count >= limit) return false;
-    this.save({ hour, count: count + 1 });
-    return true;
+  /** Whether fewer than `limit` deliveries were counted this hour. Writes nothing. */
+  hasRoom(limit: number): boolean {
+    return this.current().count < limit;
   }
 
-  /** Takes back one delivery `take` counted, for a delivery the coordinator did not store. */
-  release(): void {
+  /** Counts one delivery a coordinator stored. */
+  add(): void {
     const { hour, count } = this.current();
-    if (count > 0) this.save({ hour, count: count - 1 });
+    this.save({ hour, count: count + 1 });
   }
 
   private current(): Counter {

@@ -181,7 +181,7 @@ describe('/webhook', () => {
     expect(await workRows(coordinator(REPOSITORY_ID, 64))).toHaveLength(1);
     // The count is stored, so an instance that starts after an eviction keeps refusing.
     const limiter = TEST_ENV.INSTALLATION_LIMITER.getByName(String(installation));
-    expect(await runInDurableObject(limiter, (_instance, state) => new InstallationLimiter(state, TEST_ENV).take(2))).toBe(false);
+    expect(await runInDurableObject(limiter, (_instance, state) => new InstallationLimiter(state, TEST_ENV).hasRoom(2))).toBe(false);
 
     advanceClock(60 * 60_000);
     expect((await send(65)).status).toBe(202);
