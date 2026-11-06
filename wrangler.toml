@@ -29,8 +29,8 @@ crons = ["*/5 * * * *"]
 
 [vars]
 DISPATCH_ENABLED = "true"
-# manki-review/manki, manki-review/token-service and manki-review/review-memory.
-WEBHOOK_REPOS = "1190216666,1202459902,1202454534"
+# manki-review/manki, manki-review/token-service, manki-review/review-memory and xdustinface/rust-dashcore.
+WEBHOOK_REPOS = "1190216666,1202459902,1202454534,1093229150"
 
 [observability]
 enabled = true
