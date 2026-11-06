@@ -204,10 +204,11 @@ describe('PrCoordinator.receive', () => {
     expect(await pr.send('issue_comment', comment(1003, FORCE_REVIEW_COMMENT, 'edited', MANKI_AUTHOR))).toEqual({ accepted: true, effect: 'queued work 2' });
     expect(await pr.send('issue_comment', comment(1004, '@manki review now', 'edited'))).toEqual({ accepted: true, effect: 'queued work 3' });
     // A command after the tick still joins the queued command.
-    expect(await pr.send('issue_comment', comment(1005, '@manki review'))).toEqual({ accepted: true, effect: 'merged into work 1' });
+    expect(await pr.send('issue_comment', comment(1005, '@manki review'), 'd-newest')).toEqual({ accepted: true, effect: 'merged into work 1' });
     await pr.send('pull_request', pr.push(SHA_2));
+    // The merged item names the newest command, whose comment the run then reads.
     expect(await workRows(pr.stub)).toMatchObject([
-      { id: 1, event: 'issue_comment.created', object_id: 1001, head_sha: SHA_1, delivery: 'd-request' },
+      { id: 1, event: 'issue_comment.created', object_id: 1005, sender: 'alice', head_sha: SHA_1, delivery: 'd-newest' },
       { id: 2, event: 'issue_comment.edited', object_id: 1003 },
       { id: 3, event: 'issue_comment.edited', object_id: 1004, head_sha: SHA_2 },
     ]);
@@ -804,15 +805,15 @@ describe('PrCoordinator dispatch', () => {
   it('dispatches one review for two review commands in a row, and queues a command made while it runs', async () => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
-    await pr.send('issue_comment', pr.comment('@manki review'), 'd-first');
-    await pr.send('issue_comment', { ...pr.comment('@manki review'), comment: { id: 1002, body: '@manki review', user: { login: 'bob', type: 'User' }, author_association: 'MEMBER' } });
+    await pr.send('issue_comment', pr.comment('@manki review'));
+    await pr.send('issue_comment', { ...pr.comment('@manki review'), comment: { id: 1002, body: '@manki review', user: { login: 'bob', type: 'User' }, author_association: 'MEMBER' } }, 'd-second');
     await runDurableObjectAlarm(pr.stub);
-    expect(github.dispatches.map((dispatch) => dispatch.inputs)).toMatchObject([{ event: 'issue_comment', comment_id: '1001', delivery_id: 'd-first' }]);
+    expect(github.dispatches.map((dispatch) => dispatch.inputs)).toMatchObject([{ event: 'issue_comment', comment_id: '1002', delivery_id: 'd-second' }]);
 
     // The head can move before the next run starts, so a command during the run gets its own.
     expect(await pr.send('issue_comment', { ...pr.comment('@manki review'), comment: { id: 1003, body: '@manki review', user: { login: 'bob', type: 'User' }, author_association: 'MEMBER' } }))
       .toEqual({ accepted: true, effect: 'queued work 2' });
-    expect((await workRows(pr.stub)).map((row) => [row.object_id, row.status])).toEqual([[1001, 'running'], [1003, 'queued']]);
+    expect((await workRows(pr.stub)).map((row) => [row.object_id, row.status])).toEqual([[1002, 'running'], [1003, 'queued']]);
   });
 
   it('reviews the head the PR has when the review starts', async () => {
