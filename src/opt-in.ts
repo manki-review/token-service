@@ -93,9 +93,7 @@ function mankiWorkflows(files: WorkflowFile[]): Set<string> {
   return manki;
 }
 
-/** The dispatch workflow's file name before v7. For one minor release it counts even when it does not name Manki. */
-export const LEGACY_DISPATCH_WORKFLOW = 'manki-dispatch.yml';
-/** The dispatch workflow's file name from v7 on. It is picked first when several files qualify. */
+/** The dispatch workflow's file name. It is picked first when several files qualify. */
 const DISPATCH_WORKFLOW = 'manki.yml';
 
 type WorkflowText = WorkflowFile & { text: string };
@@ -114,8 +112,8 @@ function dispatchProblem(file: WorkflowText): { reason: string; dispatched: bool
 /**
  * Decides whether a repository opted in to webhook mode from the workflow files on its default branch, and which file
  * the Worker dispatches. A file qualifies when it runs Manki, runs only on `workflow_dispatch` and declares the dispatch
- * inputs. `manki-dispatch.yml` qualifies without naming Manki. With several, one that names Manki goes first, then
- * `manki.yml`, then the first by name. No other file may be an event-driven Manki workflow.
+ * inputs. With several, `manki.yml` goes first, then the first by name. No other file may be an event-driven Manki
+ * workflow.
  */
 export function classifyWorkflows(files: WorkflowFile[]): OptIn {
   // A file that is not parsed cannot be ruled out, whether or not it looks like Manki.
@@ -125,15 +123,11 @@ export function classifyWorkflows(files: WorkflowFile[]): OptIn {
   }
 
   const manki = mankiWorkflows(files);
-  const rank = (file: WorkflowFile) => [manki.has(file.name) ? 0 : 1, file.name === DISPATCH_WORKFLOW ? 0 : 1] as const;
+  const rank = (file: WorkflowFile) => (file.name === DISPATCH_WORKFLOW ? 0 : 1);
   const candidates = files
-    .filter((file): file is WorkflowText => isWorkflowFile(file.name) && file.text !== null
-      && (manki.has(file.name) || file.name === LEGACY_DISPATCH_WORKFLOW))
+    .filter((file): file is WorkflowText => isWorkflowFile(file.name) && file.text !== null && manki.has(file.name))
     .map((file) => ({ file, problem: dispatchProblem(file) }))
-    .sort((a, b) => {
-      const [x, y] = [rank(a.file), rank(b.file)];
-      return x[0] - y[0] || x[1] - y[1] || a.file.name.localeCompare(b.file.name);
-    });
+    .sort((a, b) => rank(a.file) - rank(b.file) || a.file.name.localeCompare(b.file.name));
   const dispatch = candidates.find((candidate) => candidate.problem === null)?.file;
   if (!dispatch) {
     const near = candidates.find((candidate) => candidate.problem?.dispatched)?.problem;

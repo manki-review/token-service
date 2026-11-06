@@ -52,15 +52,15 @@ describe('classifyWorkflows', () => {
     ['a dispatch file with a duplicate key', { 'manki-dispatch.yml': `${DISPATCH_WORKFLOW_YAML}name: again\n` }, 'manki-dispatch.yml', 'manki-dispatch.yml and no event-driven Manki workflow'],
     ['the dispatch workflow as manki.yml', { 'manki.yml': DISPATCH_WORKFLOW_YAML }, 'manki.yml', 'manki.yml and no event-driven Manki workflow'],
     ['the dispatch workflow under any name', { 'review.yaml': DISPATCH_WORKFLOW_YAML }, 'review.yaml', 'review.yaml and no event-driven Manki workflow'],
-    ['the legacy name calling a reusable workflow in another repository', { 'manki-dispatch.yml': FOREIGN_DISPATCH_YAML }, 'manki-dispatch.yml', 'manki-dispatch.yml and no event-driven Manki workflow'],
+    ['the old name calling a reusable workflow in another repository', { 'manki-dispatch.yml': FOREIGN_DISPATCH_YAML }, null, 'no Manki workflow runs on workflow_dispatch'],
+    ['a file that names Manki next to the old name that does not', { 'manki-dispatch.yml': FOREIGN_DISPATCH_YAML, 'review.yml': DISPATCH_WORKFLOW_YAML }, 'review.yml', 'review.yml and no event-driven Manki workflow'],
     ['a dispatch workflow that does not name Manki', { 'deploy.yml': FOREIGN_DISPATCH_YAML }, null, 'no Manki workflow runs on workflow_dispatch'],
   ])('classifies %s', (_case, entries, workflow, reason) => {
     expect(classifyWorkflows(files(entries))).toEqual(workflow === null ? { optedIn: false, reason } : { optedIn: true, workflow, reason });
   });
 
   it.each<[string, Record<string, string>, string, string[]]>([
-    ['both names during the move', { 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML, 'manki.yml': DISPATCH_WORKFLOW_YAML }, 'manki.yml', ['manki-dispatch.yml']],
-    ['a file that names Manki next to the legacy name alone', { 'manki-dispatch.yml': FOREIGN_DISPATCH_YAML, 'review.yml': DISPATCH_WORKFLOW_YAML }, 'review.yml', ['manki-dispatch.yml']],
+    ['manki.yml next to another name', { 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML, 'manki.yml': DISPATCH_WORKFLOW_YAML }, 'manki.yml', ['manki-dispatch.yml']],
     ['two files that name Manki, neither manki.yml', { 'b.yml': DISPATCH_WORKFLOW_YAML, 'a.yml': DISPATCH_WORKFLOW_YAML }, 'a.yml', ['b.yml']],
   ])('picks one file and names the others for %s', (_case, entries, workflow, others) => {
     expect(classifyWorkflows(files(entries))).toEqual({ optedIn: true, workflow, others, reason: `${workflow} and no event-driven Manki workflow` });
