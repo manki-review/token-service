@@ -635,6 +635,7 @@ function fakeGitHub(number: number) {
     const dispatched = route.match(new RegExp(`^POST ${repo}/actions/workflows/([^/]+)/dispatches$`));
     if (dispatched) {
       state.dispatchedWorkflows.push(dispatched[1]);
+      if (!Object.hasOwn(state.workflows, dispatched[1])) return Response.json({ message: 'Not Found' }, { status: 404 });
       state.dispatches.push(await request.json() as (typeof state.dispatches)[number]);
       const next = state.dispatchStatuses.shift() ?? 200;
       const { status, headers, body: text } = replyParts(next);
@@ -644,7 +645,7 @@ function fakeGitHub(number: number) {
       state.runs.set(id, { status: 'queued' });
       return Response.json({ workflow_run_id: id, run_url: `https://api.github.com${repo}/actions/runs/${id}`, html_url: 'https://github.com' });
     }
-    if (route === `GET ${repo}/actions/runs`) {
+    if (route === `GET ${repo}/actions/workflows/manki-dispatch.yml/runs`) {
       if (state.listRunsStatus !== 200) return Response.json({ message: 'no' }, { status: state.listRunsStatus });
       return Response.json({ total_count: state.listedRuns.length, workflow_runs: state.listedRuns });
     }
@@ -1036,6 +1037,31 @@ describe('PrCoordinator dispatch', () => {
       { status: 'skipped', note: 'installation lacks actions: write' },
       { status: 'skipped', note: 'not opted in: installation lacks actions: write' },
     ]);
+  });
+
+  it('reads the opt-in again and dispatches once more when the cached workflow file is gone', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    await runDurableObjectAlarm(pr.stub);
+    github.workflows = { 'manki.yml': DISPATCH_WORKFLOW_YAML };
+    await pr.send('pull_request', pr.push(SHA_1));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatchedWorkflows).toEqual(['manki-dispatch.yml', 'manki-dispatch.yml']);
+    expect((await workRows(pr.stub)).at(-1)).toMatchObject({ status: 'queued', note: 'manki-dispatch.yml not found, queued again' });
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatchedWorkflows).toEqual(['manki-dispatch.yml', 'manki-dispatch.yml', 'manki.yml']);
+    expect((await workRows(pr.stub)).at(-1)).toMatchObject({ status: 'running', workflow: 'manki.yml' });
+
+    // A file that is still gone after the fresh read fails the item.
+    const other = pullRequest();
+    const otherGitHub = fakeGitHub(other.number);
+    otherGitHub.workflows = { 'manki.yml': DISPATCH_WORKFLOW_YAML };
+    otherGitHub.dispatchStatuses = [404, 404];
+    await other.send('pull_request', other.push(SHA_1));
+    await runDurableObjectAlarm(other.stub);
+    await runDurableObjectAlarm(other.stub);
+    expect(await workRows(other.stub)).toMatchObject([{ status: 'failed', note: 'dispatch refused with 404: {"message":"no"}' }]);
   });
 
   it('fails a refused dispatch and reads the opt-in again', async () => {

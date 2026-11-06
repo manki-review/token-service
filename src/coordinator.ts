@@ -4,7 +4,7 @@ import type { Env } from './env';
 import { githubApi, isRateLimited, type MintResult, mintRepositoryToken } from './github';
 import { log } from './log';
 import { BOT_LOGIN } from './manki';
-import { type OptIn, readOptIn, type Repository } from './opt-in';
+import { LEGACY_DISPATCH_WORKFLOW, type OptIn, readOptIn, type Repository } from './opt-in';
 import type { Permissions } from './permissions';
 import { RECONCILER_NAME } from './reconciler';
 import { type Lane, type Route, type Target, type Work } from './routing';
@@ -73,8 +73,10 @@ export interface WorkRow extends Record<string, string | number | null> {
   errors: number;
   /** 1 when a repository user caused the work, 0 for a comment by anyone else. */
   trusted: number;
-  /** How often the item was queued again after its run never started. */
+  /** How often the item was queued again after its run never started or its workflow file was gone. */
   requeues: number;
+  /** The workflow file the last dispatch attempt named. Null before the first attempt. */
+  workflow: string | null;
 }
 
 /** The opt-in result as cached, with the repository as GitHub names it when it was read. */
@@ -127,6 +129,7 @@ export const MIGRATIONS = [
    CREATE INDEX work_by_run ON work (run_id);`,
   `ALTER TABLE work ADD COLUMN trusted INTEGER NOT NULL DEFAULT 1;`,
   `ALTER TABLE work ADD COLUMN requeues INTEGER NOT NULL DEFAULT 0;`,
+  `ALTER TABLE work ADD COLUMN workflow TEXT;`,
 ];
 
 const ACTIVE = `status IN ('dispatching', 'running')`;
@@ -649,8 +652,8 @@ export class PrCoordinator extends DurableObject<Env> {
 
     const now = Date.now();
     this.sql.exec(
-      'UPDATE work SET attempts = attempts + 1, first_attempt_at = COALESCE(first_attempt_at, ?) WHERE id = ?',
-      now, item.id,
+      'UPDATE work SET attempts = attempts + 1, first_attempt_at = COALESCE(first_attempt_at, ?), workflow = ? WHERE id = ?',
+      now, workflow, item.id,
     );
     const attempts = current.attempts + 1;
     let response: Response | null = null;
@@ -680,6 +683,10 @@ export class PrCoordinator extends DurableObject<Env> {
         this.sql.exec('UPDATE work SET lease_until = ? WHERE id = ?', Date.now() + DISPATCH_BACKOFF_MS[attempts - 1], item.id);
         log('coordinator_dispatch_retry', { ...this.logFields(), work_id: item.id, attempts, status: response?.status ?? null });
       }
+    } else if (response.status === 404 && latest.requeues === 0) {
+      // The cached opt-in can name a file renamed since, so the item waits for a fresh read once.
+      this.sql.exec(`DELETE FROM meta WHERE key = 'opt_in'`);
+      this.requeue(item.id, `${workflow} not found`, `${workflow} not found, queued again`);
     } else {
       // 403, 404 and 422 mean the permission, the file or its `workflow_dispatch` trigger is missing.
       this.sql.exec(`DELETE FROM meta WHERE key = 'opt_in'`);
@@ -728,7 +735,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const since = new Date((item.first_attempt_at ?? Date.now()) - MINUTE).toISOString();
     const response = await githubApi(
       token,
-      `/repos/${target.owner}/${target.repo}/actions/runs?event=workflow_dispatch&created=${encodeURIComponent(`>=${since}`)}&per_page=50`,
+      `/repos/${target.owner}/${target.repo}/actions/workflows/${encodeURIComponent(item.workflow ?? LEGACY_DISPATCH_WORKFLOW)}/runs?event=workflow_dispatch&created=${encodeURIComponent(`>=${since}`)}&per_page=50`,
     );
     if (!response.ok) throw new Error(`listing dispatch runs failed with ${response.status}`);
     const { workflow_runs: runs } = await response.json() as {
@@ -821,16 +828,21 @@ export class PrCoordinator extends DurableObject<Env> {
     if (!response.ok) {
       log('coordinator_cancel_failed', { ...this.logFields(), work_id: item.id, run_id: item.run_id, reason, status: response.status });
     } else if (requeue) {
-      // The fresh attempt count keeps the next dispatch from adopting the cancelled run as its own.
-      this.sql.exec(
-        `UPDATE work SET status = 'queued', run_id = NULL, check_at = NULL, lease_until = NULL, attempts = 0,
-         first_attempt_at = NULL, errors = 0, requeues = requeues + 1, note = ? WHERE id = ?`,
-        `${reason}, cancel requested, queued again`, item.id,
-      );
-      log('coordinator_requeued', { ...this.logFields(), work_id: item.id, run_id: item.run_id, reason });
+      this.requeue(item.id, reason, `${reason}, cancel requested, queued again`);
     } else {
       this.finish(item.id, 'timed_out', `${reason}, cancel requested`);
     }
+  }
+
+  /** Queues an item that started no run again. The fresh attempt count keeps its next dispatch from adopting an old run. */
+  private requeue(id: number, reason: string, note: string): void {
+    const runId = this.row(id)?.run_id ?? null;
+    this.sql.exec(
+      `UPDATE work SET status = 'queued', run_id = NULL, check_at = NULL, lease_until = NULL, attempts = 0,
+       first_attempt_at = NULL, errors = 0, requeues = requeues + 1, workflow = NULL, note = ? WHERE id = ?`,
+      note, id,
+    );
+    log('coordinator_requeued', { ...this.logFields(), work_id: id, run_id: runId, reason });
   }
 
   /** Ends the item whose run finished, from the `workflow_run` webhook, and frees its lane. */

@@ -91,7 +91,7 @@ function mankiWorkflows(files: WorkflowFile[]): Set<string> {
 }
 
 /** The dispatch workflow's file name before v7. For one minor release it counts even when it does not name Manki. */
-const LEGACY_DISPATCH_WORKFLOW = 'manki-dispatch.yml';
+export const LEGACY_DISPATCH_WORKFLOW = 'manki-dispatch.yml';
 /** The dispatch workflow's file name from v7 on. It is picked first when several files qualify. */
 const DISPATCH_WORKFLOW = 'manki.yml';
 
