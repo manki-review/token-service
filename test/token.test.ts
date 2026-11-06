@@ -1,5 +1,5 @@
 import { decodeProtectedHeader, generateKeyPair, jwtVerify } from 'jose';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { APP_JWT_REUSE_MS, createAppJWT, toPkcs8Pem } from '../src/app-jwt';
 import worker from '../src/index';
 import {
@@ -8,14 +8,17 @@ import {
   appKeys,
   appPrivateKeyPkcs1,
   appPrivateKeyPkcs8,
+  DEFAULT_INSTALLATION_PERMISSIONS,
   freezeClock,
   INSTALLATION_ID,
   JWKS_URL,
+  logged,
   OIDC_AUDIENCE,
   oidcToken,
   OWNER,
   postToken,
   REPO,
+  REPOSITORY_ID,
   stubGitHub,
   TEST_ENV,
   type StubReply,
@@ -27,8 +30,28 @@ function paths(requests: Request[]): string[] {
   return apiRequests(requests).map((request) => `${request.method} ${new URL(request.url).pathname}`);
 }
 
+const APP_CLIENT_ID = 'Iv23liTestClientId';
+
 const LOOKUP = `GET /repos/${OWNER}/${REPO}/installation`;
 const MINT = `POST /app/installations/${INSTALLATION_ID}/access_tokens`;
+
+const REVIEW_AUDIT = {
+  msg: 'token_minted',
+  purpose: 'review',
+  repository_id: REPOSITORY_ID,
+  repository: `${OWNER}/${REPO}`,
+  installation_id: INSTALLATION_ID,
+};
+
+let log: ReturnType<typeof vi.spyOn>;
+
+beforeEach(() => {
+  log = vi.spyOn(console, 'log').mockImplementation(() => {});
+});
+
+afterEach(() => {
+  expect(log.mock.calls.flat().join('\n')).not.toContain('ghs_');
+});
 
 const MEMORY_TOKEN = { token: 'ghs_memory', expires_at: '2026-11-05T13:30:00Z', permissions: { contents: 'write', metadata: 'read' } };
 
@@ -59,6 +82,8 @@ describe('/token', () => {
     expect(await response.json()).toMatchObject({ token: 'ghs_test', expires_at: '2026-11-05T13:00:00Z' });
     expect(paths(requests)).toEqual([LOOKUP, MINT]);
     expect(apiRequests(requests).map((request) => request.redirect)).toEqual(['manual', 'manual']);
+    // The test token carries no `run_id` or `check_run_id`, so the line has neither.
+    expect(logged(log, 'token_minted')).toEqual([{ ...REVIEW_AUDIT, permissions: DEFAULT_INSTALLATION_PERMISSIONS }]);
   });
 
   it('encodes the owner and repo into the installation lookup path', async () => {
@@ -97,17 +122,34 @@ describe('/token', () => {
     }
   });
 
-  it('reuses the App JWT for 9 minutes for the same App and key', async () => {
+  it.each([
+    ['the client ID when one is set', APP_CLIENT_ID, APP_CLIENT_ID],
+    ['the App ID when the client ID is empty', '', APP_ID],
+    ['the App ID when no client ID is set', undefined, APP_ID],
+  ])('signs the App JWT with %s as the issuer', async (_case, clientId, issuer) => {
+    const requests = stubGitHub();
+    const response = await postToken({ env: { ...TEST_ENV, APP_CLIENT_ID: clientId } });
+    expect(response.status).toBe(200);
+    for (const request of apiRequests(requests)) {
+      const jwt = request.headers.get('Authorization')!.replace('Bearer ', '');
+      expect((await jwtVerify(jwt, appKeys.publicKey)).payload.iss).toBe(issuer);
+    }
+  });
+
+  it('reuses the App JWT for 9 minutes for the same issuer and key', async () => {
     const advance = freezeClock(Date.now() + 2 * APP_JWT_REUSE_MS);
-    const first = await createAppJWT(APP_ID, appPrivateKeyPkcs1);
+    const pkcs1 = { APP_ID, APP_PRIVATE_KEY: appPrivateKeyPkcs1 };
+    const pkcs8 = { APP_ID, APP_PRIVATE_KEY: appPrivateKeyPkcs8 };
+    const first = await createAppJWT(pkcs1);
     advance(APP_JWT_REUSE_MS - 1);
-    expect(await createAppJWT(APP_ID, appPrivateKeyPkcs1)).toBe(first);
-    expect(await createAppJWT('654321', appPrivateKeyPkcs1)).not.toBe(first);
-    const other = await createAppJWT(APP_ID, appPrivateKeyPkcs8);
+    expect(await createAppJWT(pkcs1)).toBe(first);
+    expect(await createAppJWT({ ...pkcs1, APP_ID: '654321' })).not.toBe(first);
+    expect(await createAppJWT({ ...pkcs1, APP_CLIENT_ID })).not.toBe(first);
+    const other = await createAppJWT(pkcs8);
     expect(other).not.toBe(first);
-    expect(await createAppJWT(APP_ID, appPrivateKeyPkcs8)).toBe(other);
+    expect(await createAppJWT(pkcs8)).toBe(other);
     advance(APP_JWT_REUSE_MS);
-    const renewed = await createAppJWT(APP_ID, appPrivateKeyPkcs8);
+    const renewed = await createAppJWT(pkcs8);
     expect(renewed).not.toBe(other);
     const { payload } = await jwtVerify(renewed, appKeys.publicKey, { issuer: APP_ID });
     expect(payload.iat).toBe(Math.floor(Date.now() / 1000) - 60);
@@ -205,6 +247,7 @@ describe('/token', () => {
     const response = await postToken();
     expect(response.status).toBe(status);
     expect(await response.json()).toEqual({ error: `GitHub API error: ${status}`, details: '{"message":"GitHub said no"}' });
+    expect(logged(log, 'token_minted')).toEqual([]);
   });
 
   it('returns 500 when the App key cannot be read', async () => {
@@ -229,7 +272,8 @@ describe('/token memory token', () => {
 
   it('returns a memory token next to the review token', async () => {
     const requests = stubMemoryMint();
-    const response = await postToken({ body: { owner: OWNER, repo: REPO, memory: true } });
+    const token = await oidcToken({ claims: { run_id: '9001', check_run_id: '9002' } });
+    const response = await postToken({ token, body: { owner: OWNER, repo: REPO, memory: true } });
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
       token: 'ghs_test',
@@ -239,12 +283,18 @@ describe('/token memory token', () => {
       memory_expires_at: '2026-11-05T13:30:00Z',
     });
     expect(paths(requests)).toEqual([LOOKUP, MINT, MINT]);
+    const run = { run_id: '9001', check_run_id: '9002' };
+    expect(logged(log, 'token_minted')).toEqual([
+      { ...REVIEW_AUDIT, ...run, permissions: {} },
+      { ...REVIEW_AUDIT, ...run, purpose: 'memory', permissions: MEMORY_TOKEN.permissions },
+    ]);
   });
 
   it.each([403, 404, 422, 500])('returns the review token without a memory token when GitHub answers the memory mint with %i', async (status) => {
     stubMemoryMint({ status, body: { message: 'There is at least one repository that does not exist or is not accessible' } });
     const response = await postToken({ body: { owner: OWNER, repo: REPO, memory: true } });
     expect(response.status).toBe(200);
+    expect(logged(log, 'token_minted').map((line) => line.purpose)).toEqual(['review']);
     const body = await response.json() as Record<string, unknown>;
     expect(body.token).toBe('ghs_test');
     expect(body).not.toHaveProperty('memory_token');

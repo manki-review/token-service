@@ -1,8 +1,8 @@
 import { createAppJWT } from './app-jwt';
 import type { Env } from './env';
-import { createInstallationToken, getInstallation, type Installation } from './github';
+import { createInstallationToken, getInstallation, type Installation, logMintedToken, type TokenAudit } from './github';
 import { log } from './log';
-import { verifyGitHubOIDC } from './oidc';
+import { type OIDCClaims, verifyGitHubOIDC } from './oidc';
 import { cappedPermissions, MANKI_PERMISSION_CAPS, MEMORY_PERMISSION_CAPS, type Permissions } from './permissions';
 import { RECONCILER_NAME } from './reconciler';
 import { handleWebhook } from './webhook';
@@ -18,11 +18,14 @@ interface MintedToken {
   expires_at: string;
 }
 
+/** The audit fields of the workflow a `/token` response goes to. */
+type WorkflowAudit = Omit<TokenAudit, 'purpose' | 'installation_id' | 'permissions'>;
+
 /**
  * Mints a token that writes only the installation account's `review-memory`. Returns `null` when the installation
  * grants no `contents` or GitHub refuses the mint, such as when `review-memory` is not part of the installation.
  */
-async function mintMemoryToken(jwt: string, installation: Installation): Promise<MintedToken | null> {
+async function mintMemoryToken(jwt: string, installation: Installation, workflow: WorkflowAudit): Promise<MintedToken | null> {
   const permissions = cappedPermissions(installation.permissions, MEMORY_PERMISSION_CAPS);
   if (Object.keys(permissions).length === 0) return null;
   try {
@@ -31,7 +34,8 @@ async function mintMemoryToken(jwt: string, installation: Installation): Promise
       log('memory token mint refused', { installation_id: installation.id, status: response.status });
       return null;
     }
-    const data = await response.json() as MintedToken;
+    const data = await response.json() as MintedToken & { permissions: Permissions };
+    logMintedToken({ purpose: 'memory', ...workflow, installation_id: installation.id, permissions: data.permissions });
     return { token: data.token, expires_at: data.expires_at };
   } catch (error) {
     log('memory token mint failed', { installation_id: installation.id, error: String(error) });
@@ -86,18 +90,25 @@ export default {
     const expectedRepo = `${body.owner}/${body.repo}`;
 
     // Verify the OIDC token is from a GitHub Actions workflow in the requested repo
-    let repositoryId: number;
+    let claims: OIDCClaims;
     try {
-      repositoryId = Number((await verifyGitHubOIDC(oidcToken, expectedRepo)).repository_id);
+      claims = await verifyGitHubOIDC(oidcToken, expectedRepo);
     } catch (error) {
       return Response.json(
         { error: `OIDC verification failed: ${error}` },
         { status: 403 },
       );
     }
+    const repositoryId = Number(claims.repository_id);
+    const workflow: WorkflowAudit = {
+      repository_id: repositoryId,
+      repository: claims.repository,
+      run_id: claims.run_id,
+      check_run_id: claims.check_run_id,
+    };
 
     try {
-      const appJwt = await createAppJWT(env.APP_ID, env.APP_PRIVATE_KEY);
+      const appJwt = await createAppJWT(env);
 
       const installation = await getInstallation(appJwt, body.owner, body.repo);
       if (!installation) {
@@ -127,7 +138,8 @@ export default {
       }
 
       const tokenData = await tokenResponse.json() as MintedToken & { permissions: Permissions };
-      const memory = body.memory ? await mintMemoryToken(appJwt, installation) : null;
+      logMintedToken({ purpose: 'review', ...workflow, installation_id: installation.id, permissions: tokenData.permissions });
+      const memory = body.memory ? await mintMemoryToken(appJwt, installation, workflow) : null;
 
       return Response.json({
         token: tokenData.token,

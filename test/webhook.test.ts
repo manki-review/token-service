@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { verifyWebhookSignature } from '../src/signature';
 import worker from '../src/index';
-import { coordinator, DELIVERY_ID, freezeClock, OIDC_AUDIENCE, postWebhook, signWebhook, stubGitHub, TEST_ENV, workRows } from './helpers';
+import { coordinator, DELIVERY_ID, freezeClock, logged, OIDC_AUDIENCE, postWebhook, signWebhook, stubGitHub, TEST_ENV, workRows } from './helpers';
 import { HEAD_SHA, issueCommentEvent, PR_NUMBER, pullRequestEvent, REPOSITORY_ID, reviewThreadEvent, workflowRunEvent } from './payloads';
 
 const encoder = new TextEncoder();
@@ -36,10 +36,6 @@ describe('verifyWebhookSignature', () => {
     expect(await verifyWebhookSignature('', body, signature)).toBe(false);
   });
 });
-
-function logged(spy: { mock: { calls: unknown[][] } }): Record<string, unknown>[] {
-  return spy.mock.calls.map((call) => JSON.parse(String(call[0])));
-}
 
 describe('/webhook', () => {
   beforeEach(() => {
@@ -87,7 +83,7 @@ describe('/webhook', () => {
     const delivery = { event: 'issue_comment', payload: issueCommentEvent('@manki explain', { number: 31 }), delivery: crypto.randomUUID() };
     expect((await postWebhook(delivery)).status).toBe(202);
     expect((await postWebhook(delivery)).status).toBe(202);
-    expect(logged(log).filter((line) => line.msg === 'coordinator_receive')).toMatchObject([
+    expect(logged(log, 'coordinator_receive')).toMatchObject([
       { accepted: true },
       { accepted: false, reason: 'duplicate delivery' },
     ]);
@@ -99,7 +95,7 @@ describe('/webhook', () => {
     const payload = issueCommentEvent('@manki explain', { number: 34 });
     expect((await postWebhook({ event: 'issue_comment', payload })).status).toBe(202);
     expect((await postWebhook({ event: 'issue_comment', payload })).status).toBe(202);
-    expect(logged(log).filter((line) => line.msg === 'coordinator_receive')).toMatchObject([
+    expect(logged(log, 'coordinator_receive')).toMatchObject([
       { accepted: true },
       { accepted: false, reason: 'duplicate delivery' },
     ]);
@@ -112,7 +108,7 @@ describe('/webhook', () => {
     for (const payload of [resolved, reviewThreadEvent('unresolved', { number: 35 }), resolved]) {
       expect((await postWebhook({ event: 'pull_request_review_thread', payload })).status).toBe(202);
     }
-    expect(logged(log).filter((line) => line.msg === 'coordinator_receive').map((line) => line.accepted)).toEqual([true, true, true]);
+    expect(logged(log, 'coordinator_receive').map((line) => line.accepted)).toEqual([true, true, true]);
   });
 
   it('answers 500 when the coordinator cannot store the delivery, so GitHub records a failure', async () => {

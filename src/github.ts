@@ -1,5 +1,6 @@
 import { createAppJWT } from './app-jwt';
 import type { Env } from './env';
+import { log } from './log';
 import type { Permissions } from './permissions';
 
 function githubHeaders(token: string): Record<string, string> {
@@ -70,21 +71,39 @@ export type MintResult =
   | { ok: true; token: string; expiresAt: number }
   | { ok: false; status: number; message: string; refused: boolean };
 
+/** The `token_minted` audit line of a minted token. `run_id` and `check_run_id` come from the requesting workflow's OIDC token. */
+export interface TokenAudit {
+  purpose: 'review' | 'memory' | 'coordinator' | 'reconciler';
+  repository_id: number;
+  repository: string;
+  installation_id: number;
+  permissions: Permissions;
+  run_id?: string;
+  check_run_id?: string;
+}
+
+/** Logs the audit line of a minted token. The token itself is never logged. */
+export function logMintedToken(audit: TokenAudit): void {
+  log('token_minted', { ...audit });
+}
+
 /** Mints a token for one repository of an installation, holding only `permissions`. */
 export async function mintRepositoryToken(
   env: Env,
   installationId: number,
   repositoryId: number,
   permissions: Permissions,
+  audit: Pick<TokenAudit, 'purpose' | 'repository'>,
 ): Promise<MintResult> {
-  const jwt = await createAppJWT(env.APP_ID, env.APP_PRIVATE_KEY);
+  const jwt = await createAppJWT(env);
   const response = await createInstallationToken(jwt, installationId, permissions, { repository_ids: [repositoryId] });
   if (!response.ok) {
     const message = await response.text();
     return { ok: false, status: response.status, message, refused: isRefusal(response, message) };
   }
-  const { token, expires_at } = await response.json() as { token: string; expires_at: string };
-  return { ok: true, token, expiresAt: Date.parse(expires_at) };
+  const data = await response.json() as { token: string; expires_at: string; permissions: Permissions };
+  logMintedToken({ ...audit, repository_id: repositoryId, installation_id: installationId, permissions: data.permissions });
+  return { ok: true, token: data.token, expiresAt: Date.parse(data.expires_at) };
 }
 
 /** Calls the GitHub REST API at `path` with `token`. */

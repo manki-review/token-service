@@ -149,6 +149,12 @@ export function stubGitHub(stub: GitHubStub = {}): Request[] {
   return requests;
 }
 
+/** Returns the JSON lines logged to `spy`, only those whose `msg` is `msg` when one is given. */
+export function logged(spy: { mock: { calls: unknown[][] } }, msg?: string): Record<string, unknown>[] {
+  const lines = spy.mock.calls.map((call) => JSON.parse(String(call[0])) as Record<string, unknown>);
+  return msg === undefined ? lines : lines.filter((line) => line.msg === msg);
+}
+
 /** Returns the requests `stubGitHub` saw for the GitHub REST API, leaving out the JWKS fetch. */
 export function apiRequests(requests: Request[]): Request[] {
   return requests.filter((request) => request.url.startsWith('https://api.github.com/'));

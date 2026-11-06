@@ -18,6 +18,20 @@ With `memory: true`, the service mints a second token that holds only `contents:
 
 The repository name is fixed. A memory repo with any other name (`memory.repo` in `.manki.yml`) cannot get a token from this service and needs Manki's `memory_repo_token` input.
 
+### Audit log
+
+Every minted token logs one JSON line with `msg: token_minted`, never the token itself:
+
+| Field | Value |
+|---|---|
+| `purpose` | `review` or `memory` for `/token`, `coordinator` or `reconciler` for the Worker's own calls |
+| `repository_id`, `repository` | The repository the token is for. For a `memory` token, the requesting workflow's repository, while the token covers `review-memory` |
+| `installation_id` | The App installation the token comes from |
+| `permissions` | The permissions GitHub reports for the token |
+| `run_id`, `check_run_id` | The requesting workflow's OIDC claims, where present. `/token` mints only |
+
+Filter Workers Logs on `msg = token_minted` to see who got which token.
+
 ## Webhook
 
 `POST /webhook` receives the GitHub App's webhook deliveries for Manki's webhook mode. It checks the `X-Hub-Signature-256` HMAC against `WEBHOOK_SECRET`, checks that `X-GitHub-Hook-Installation-Target-ID` is `APP_ID`, and works out where the delivery would go: ignored, the PR's state lane (reviews, thread replies, `check`, `dismiss`, review state checks from reviews and from resolved or reopened threads) or its chat lane (explain, questions, help, remember, forget). Work and closes go to the PR's `PrCoordinator` Durable Object before the `202` leaves.
@@ -69,16 +83,20 @@ The following secrets must be set in the Cloudflare Worker environment:
 
 | Secret | Description |
 |---|---|
-| `APP_ID` | GitHub App ID for the manki-review app |
+| `APP_ID` | GitHub App ID for the manki-review app. `/webhook` checks deliveries against it |
+| `APP_CLIENT_ID` | Optional. The App's client ID (`Iv…`, on the App's settings page). When set, it is the `iss` of the App JWT, as [GitHub recommends](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app). Otherwise `APP_ID` is |
 | `APP_PRIVATE_KEY` | PEM private key for the GitHub App |
 | `WEBHOOK_SECRET` | The App's webhook secret. `/webhook` answers `500` until it is set |
 | `WEBHOOK_SECRET_PREVIOUS` | Optional. The secret before a rotation, accepted as well until it is deleted |
 
 ```sh
 wrangler secret put APP_ID
+wrangler secret put APP_CLIENT_ID  # optional
 wrangler secret put APP_PRIVATE_KEY
 wrangler secret put WEBHOOK_SECRET
 ```
+
+The client ID is not secret, so `APP_CLIENT_ID` can also go into `[vars]` in `wrangler.toml` instead of a secret.
 
 To rotate the webhook secret, put the current one into `WEBHOOK_SECRET_PREVIOUS`, then the new one into `WEBHOOK_SECRET` and the App's settings, and delete `WEBHOOK_SECRET_PREVIOUS` once deliveries verify under the new one.
 

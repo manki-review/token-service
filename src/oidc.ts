@@ -5,11 +5,13 @@ const GITHUB_OIDC_ISSUER = 'https://token.actions.githubusercontent.com';
 // Created once per isolate so GitHub's keys are cached across requests instead of fetched on every one.
 const GITHUB_JWKS = createRemoteJWKSet(new URL(`${GITHUB_OIDC_ISSUER}/.well-known/jwks`));
 
-interface OIDCClaims {
+export interface OIDCClaims {
   repository: string;
   repository_owner: string;
   repository_id: string;
   repository_owner_id: string;
+  run_id?: string;
+  check_run_id?: string;
   [key: string]: unknown;
 }
 
