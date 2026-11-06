@@ -7,7 +7,7 @@ import {
   type BaseConfig, BOT_LOGIN, type BoxChange, HELP_REPLY, matchSkipRule, parseConfig, REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes,
   skipRulesOf,
 } from './manki';
-import { LEGACY_DISPATCH_WORKFLOW, type OptIn, readOptIn, type Repository } from './opt-in';
+import { type OptIn, readOptIn, type Repository } from './opt-in';
 import type { Permissions } from './permissions';
 import { RECONCILER_NAME } from './reconciler';
 import { type Lane, type Route, type Target, type Work } from './routing';
@@ -1157,12 +1157,13 @@ export class PrCoordinator extends DurableObject<Env> {
    * delivery id, so only that item's run matches. It must also come from the App and belong to no other item.
    */
   private async findRun(item: WorkRow, target: Target): Promise<number | null> {
+    if (item.workflow === null) return null;
     const token = await this.token({ actions: 'read' });
     if (token === null) return null;
     const since = new Date((item.first_attempt_at ?? Date.now()) - MINUTE).toISOString();
     const response = await githubApi(
       token,
-      `/repos/${target.owner}/${target.repo}/actions/workflows/${encodeURIComponent(item.workflow ?? LEGACY_DISPATCH_WORKFLOW)}/runs?event=workflow_dispatch&created=${encodeURIComponent(`>=${since}`)}&per_page=50`,
+      `/repos/${target.owner}/${target.repo}/actions/workflows/${encodeURIComponent(item.workflow)}/runs?event=workflow_dispatch&created=${encodeURIComponent(`>=${since}`)}&per_page=50`,
     );
     if (!response.ok) throw new Error(`listing dispatch runs failed with ${response.status}`);
     const { workflow_runs: runs } = await response.json() as {
