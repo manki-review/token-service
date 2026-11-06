@@ -1055,15 +1055,16 @@ export class PrCoordinator extends DurableObject<Env> {
       return false;
     }
     if (item.event.startsWith('pull_request.')) {
-      // A retry after a dispatch attempt may find that attempt's run, so only the first attempt can skip.
-      const config = pr.draft || item.attempts === 0 ? await this.baseConfig(pr, target) : null;
+      // A retry after a dispatch attempt may find that attempt's run, so only the first attempt can drop or skip.
+      const first = item.attempts === 0;
+      const config = first ? await this.baseConfig(pr, target) : null;
       if (!this.isDispatching(item.id)) return false;
       // A draft is reviewed on request, such as by its settings box, unless the base config reviews drafts.
-      if (pr.draft && !reviewsDrafts(config)) {
+      if (first && pr.draft && !reviewsDrafts(config)) {
         this.finish(item.id, 'dropped', 'pull request is a draft');
         return false;
       }
-      const rule = item.attempts === 0 ? this.skipRule(config, pr, item.head_sha, item.sender, target) : null;
+      const rule = first ? this.skipRule(config, pr, item.head_sha, item.sender, target) : null;
       if (rule !== null) {
         await this.reportSkipped(pr.head.sha, rule, target);
         if (!this.isDispatching(item.id)) return false;

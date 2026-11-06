@@ -1174,6 +1174,19 @@ describe('PrCoordinator dispatch', () => {
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches.at(-1)?.inputs).toMatchObject({ event: 'pull_request', head_sha: SHA_2 });
     expect(github.configReads).toEqual(['develop', 'develop']);
+    await pr.stub.runCompleted(key('d-draft'), 9001, 'success');
+
+    // A retry after a dispatch attempt keeps the first attempt's decision, since that attempt's run may have started.
+    github.dispatchStatuses = [502];
+    await pr.send('pull_request', pr.push(SHA_3));
+    github.head = SHA_3;
+    await runDurableObjectAlarm(pr.stub);
+    github.config = null;
+    advanceClock(DISPATCH_BACKOFF_MS[0]);
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.configReads).toHaveLength(3);
+    expect(github.dispatches.at(-1)?.inputs).toMatchObject({ event: 'pull_request', head_sha: SHA_3 });
+    expect((await workRows(pr.stub)).at(-1)).toMatchObject({ status: 'running' });
   });
 
   it.each([
