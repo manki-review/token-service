@@ -25,7 +25,6 @@ async function mintRequestBody(requests: Request[]): Promise<unknown> {
 }
 
 const SCOPE = { repository_ids: [REPOSITORY_ID] };
-const MEMORY_MINT = { permissions: { contents: 'write' }, repositories: ['review-memory'] };
 
 describe('/token permissions', () => {
   it('requests only the permissions Manki uses', async () => {
@@ -102,16 +101,14 @@ describe('/token permissions', () => {
   it.each([
     ['wider repositories', { repository_ids: [1, 2], repositories: ['other'], repository: 'other' }],
     ['wider permissions', { permissions: { administration: 'write', contents: 'write' }, contents: 'write' }],
-    ['another memory repo', { memory: true, memory_repo: 'manki', memory_repository: `${OWNER}/manki`, repositories: ['manki'] }],
+    ['a memory token', { memory: true, memory_repo: 'manki', repositories: ['review-memory'] }],
   ])('ignores a body that asks for %s', async (_case, extra) => {
     const requests = stubGitHub();
     expect((await post({ body: { owner: OWNER, repo: REPO, ...extra } })).status).toBe(200);
-    const [review, ...memory] = await mintRequestBodies(requests);
-    expect(review).toEqual({
+    expect(await mintRequestBodies(requests)).toEqual([{
       permissions: { contents: 'write', issues: 'write', metadata: 'read', pull_requests: 'write' },
       ...SCOPE,
-    });
-    expect(memory).toEqual('memory' in extra ? [MEMORY_MINT] : []);
+    }]);
   });
 
   it('scopes the review token to the repository_id claim, not the request', async () => {
@@ -119,26 +116,6 @@ describe('/token permissions', () => {
     const token = await oidcToken({ claims: { repository_id: '7', other_repository_id: '8' } });
     expect((await post({ token, body: { owner: OWNER, repo: REPO, repository_id: 8 } })).status).toBe(200);
     expect(await mintRequestBody(requests)).toMatchObject({ repository_ids: [7] });
-  });
-
-  it('requests only `contents: write` on `review-memory` for the memory token', async () => {
-    const requests = stubGitHub({
-      installation: {
-        body: { id: INSTALLATION_ID, permissions: { administration: 'write', contents: 'admin', issues: 'write', metadata: 'read', workflows: 'write' } },
-      },
-    });
-
-    expect((await post({ body: { owner: OWNER, repo: REPO, memory: true } })).status).toBe(200);
-    expect((await mintRequestBodies(requests))[1]).toEqual(MEMORY_MINT);
-  });
-
-  it('keeps the memory token at read when the installation only reads contents', async () => {
-    const requests = stubGitHub({
-      installation: { body: { id: INSTALLATION_ID, permissions: { contents: 'read', metadata: 'read', pull_requests: 'write' } } },
-    });
-
-    expect((await post({ body: { owner: OWNER, repo: REPO, memory: true } })).status).toBe(200);
-    expect((await mintRequestBodies(requests))[1]).toEqual({ permissions: { contents: 'read' }, repositories: ['review-memory'] });
   });
 
   it('refuses to mint when the installation response has no permissions', async () => {
