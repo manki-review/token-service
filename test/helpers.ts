@@ -4,6 +4,7 @@ import { env } from 'cloudflare:workers';
 import { vi } from 'vitest';
 import type { PrCoordinator, WorkRow } from '../src/coordinator';
 import type { Env } from '../src/env';
+import { INSTALLATION_CACHE_MS } from '../src/github';
 import worker from '../src/index';
 
 export const OIDC_ISSUER = 'https://token.actions.githubusercontent.com';
@@ -61,6 +62,17 @@ export function freezeClock(start = Date.UTC(2030, 0, 1)): (ms: number) => numbe
     vi.setSystemTime(now);
     return now;
   };
+}
+
+let uncachedClock = Date.now();
+
+/**
+ * Freezes the clock past every installation lookup an earlier test cached, so the next request looks up the installation
+ * its test stubs.
+ */
+export function passInstallationCache(): void {
+  uncachedClock += INSTALLATION_CACHE_MS;
+  freezeClock(uncachedClock);
 }
 
 function derLengthSize(der: Uint8Array, offset: number): number {

@@ -1,7 +1,7 @@
 import { createAppJWT } from './app-jwt';
 import type { Env } from './env';
 import { parseRunTitle } from './dispatch';
-import { createInstallationToken, getInstallation, githubApi, type Installation, isRefusal, logMintedToken, mintRepositoryToken, type TokenAudit } from './github';
+import { createInstallationToken, githubApi, type Installation, isRefusal, logMintedToken, mintRepositoryToken, type TokenAudit } from './github';
 import { failure, log } from './log';
 import { BOT_LOGIN } from './manki';
 import { type OIDCClaims, verifyWorkflowRequest } from './oidc';
@@ -102,9 +102,9 @@ export default {
       return Response.json({ error: 'Not found' }, { status: 404 });
     }
 
-    const verified = await verifyWorkflowRequest(request);
+    const verified = await verifyWorkflowRequest(request, env);
     if (verified instanceof Response) return verified;
-    const { claims, body: parsed } = verified;
+    const { claims, body: parsed, installation } = verified;
     if (parsed.memory !== undefined && typeof parsed.memory !== 'boolean') {
       return Response.json({ error: 'memory must be a boolean' }, { status: 400 });
     }
@@ -120,14 +120,6 @@ export default {
 
     try {
       const appJwt = await createAppJWT(env);
-
-      const installation = await getInstallation(appJwt, body.owner, body.repo);
-      if (!installation) {
-        return Response.json(
-          { error: 'App not installed on this repository' },
-          { status: 404 },
-        );
-      }
 
       // An empty `permissions` object would not narrow the token, so refuse instead of minting a full one.
       const permissions = cappedPermissions(installation.permissions, MANKI_PERMISSION_CAPS);

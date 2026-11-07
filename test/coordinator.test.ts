@@ -799,6 +799,7 @@ function fakeGitHub(number: number) {
       const found = state.runs.get(Number(run[1]));
       return found ? Response.json(found) : Response.json({ message: 'Not Found' }, { status: 404 });
     }
+    if (route === `GET ${repo}/installation`) return Response.json({ id: INSTALLATION_ID, permissions: { metadata: 'read' } });
     if (request.url === JWKS_URL) return Response.json(OIDC_JWKS);
     throw new Error(`Unexpected fetch: ${route}`);
   });

@@ -17,18 +17,32 @@ export interface Installation {
   permissions: Permissions;
 }
 
-export async function getInstallation(jwt: string, owner: string, repo: string): Promise<Installation | null> {
+/** How long a lookup of a repository's installation is reused, found or not. */
+export const INSTALLATION_CACHE_MS = 60_000;
+const MAX_CACHED_INSTALLATIONS = 10_000;
+const installations = new Map<string, { installation: Installation | null; until: number }>();
+
+/**
+ * Returns the App's installation on `owner/repo`, or `null` when there is none. A lookup is reused for
+ * `INSTALLATION_CACHE_MS` within one isolate, so repeated calls for a repository cost no GitHub request. A failure
+ * other than a 404 throws and is not reused.
+ */
+export async function getInstallation(env: Env, owner: string, repo: string): Promise<Installation | null> {
+  const key = `${owner}/${repo}`.toLowerCase();
+  const cached = installations.get(key);
+  if (cached && cached.until > Date.now()) return cached.installation;
+
   const response = await fetch(
     `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/installation`,
-    { headers: githubHeaders(jwt), redirect: 'manual' },
+    { headers: githubHeaders(await createAppJWT(env)), redirect: 'manual' },
   );
+  if (!response.ok && response.status !== 404) throw new Error(`installation lookup failed with ${response.status}`);
+  const data = response.ok ? await response.json() as { id: number; permissions?: Permissions } : null;
+  const installation = data && { id: data.id, permissions: data.permissions ?? {} };
 
-  if (!response.ok) {
-    return null;
-  }
-
-  const data = await response.json() as { id: number; permissions?: Permissions };
-  return { id: data.id, permissions: data.permissions ?? {} };
+  if (installations.size >= MAX_CACHED_INSTALLATIONS) installations.clear();
+  installations.set(key, { installation, until: Date.now() + INSTALLATION_CACHE_MS });
+  return installation;
 }
 
 /** The repositories a token is limited to, by id or by name under the installation's account. */

@@ -41,7 +41,7 @@ function parseReport(body: Record<string, unknown>): StateReport | string {
  * `repository_id` claim, so a workflow only reaches the PRs of its own repository.
  */
 export async function handleState(request: Request, env: Env, isReport: boolean): Promise<Response> {
-  const verified = await verifyWorkflowRequest(request);
+  const verified = await verifyWorkflowRequest(request, env);
   if (verified instanceof Response) return verified;
   const { claims, body } = verified;
   if (typeof body.pr !== 'number' || !Number.isSafeInteger(body.pr) || body.pr <= 0) {
