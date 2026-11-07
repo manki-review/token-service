@@ -11,7 +11,7 @@ describe('dispatchInputs', () => {
     ['a review', { event: 'pull_request_review.submitted', head_sha: SHA, object_id: 5 }, { event: 'pull_request_review', action: 'submitted', review_id: '5' }],
     ['a thread reply', { event: 'pull_request_review_comment.created', head_sha: SHA, object_id: 6 }, { event: 'pull_request_review_comment', action: 'created', comment_id: '6' }],
     ['a review request', { event: 'issue_comment.created', head_sha: SHA, object_id: 7 }, { event: 'issue_comment', action: 'created', comment_id: '7' }],
-    ['a Force review tick', { event: 'issue_comment.edited', head_sha: null, object_id: 8 }, { event: 'issue_comment', action: 'edited', comment_id: '8' }],
+    ['a settings box review', { event: 'issue_comment.edited', head_sha: null, object_id: 8 }, { event: 'issue_comment', action: 'edited', comment_id: '8' }],
     ['a resolved thread', { event: 'pull_request_review_thread.resolved', head_sha: SHA, object_id: null }, { event: 'pull_request_review_thread', action: 'resolved' }],
   ])('builds the inputs for %s', (_case, item, expected) => {
     expect(dispatchInputs({ ...item, delivery: DELIVERY }, 12)).toEqual({ ...expected, pr: '12', delivery_id: DELIVERY });

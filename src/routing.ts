@@ -3,7 +3,6 @@ import {
   BOT_LOGIN,
   type BoxChange,
   changedBoxes,
-  detectTickedMarker,
   hasBotMention,
   isBotMentionNonReview,
   isReviewRequest,
@@ -75,8 +74,7 @@ export interface Work {
   acknowledge: boolean;
   /**
    * Whether someone with write access caused the work: a push to a branch of the repository, a thread resolved on a
-   * same-repository PR, a dismissed review, a Force review tick, or a comment or review by an `OWNER`, `MEMBER` or
-   * `COLLABORATOR`.
+   * same-repository PR, a dismissed review, or a comment or review by an `OWNER`, `MEMBER` or `COLLABORATOR`.
    */
   writer: boolean;
   /** For a review, what the settings boxes asked of it. */
@@ -247,7 +245,7 @@ export function routeDelivery(event: string, payload: WebhookPayload, now = Date
     const pushed = event === 'pull_request' && ['opened', 'synchronize', 'ready_for_review'].includes(payload.action ?? '');
     return pushed && headSha && !isForkHead(payload) ? { type: 'seen', target, headSha } : ignore('sender is a bot');
   }
-  // An answer that late helps nobody. The time is the comment's last edit, which is what a Force review tick changes.
+  // An answer that late helps nobody. The time is the comment's last edit, which is what a settings box tick changes.
   const commentAt = Date.parse(payload.comment?.updated_at ?? payload.comment?.created_at ?? '');
   if ((event === 'issue_comment' || event === 'pull_request_review_comment') && now - commentAt > STALE_COMMENT_MS) {
     return ignore('comment is over 6 hours old');
@@ -326,16 +324,6 @@ function routeIssueComment(target: Target, payload: WebhookPayload): Route {
       ...work('settings', 'settings', payload, 'issue_comment', objectId),
       acknowledge: false, writer: false, boxes, editedAt: Date.parse(comment?.updated_at ?? '') || 0,
     } };
-  }
-
-  // Manki decides whether the comment's author is one of its identities. Only a tick on a comment by its default
-  // logins becomes a review trigger. Any other tick queues on its own, so it cannot replace a queued push review.
-  if (onPullRequest && action === 'edited' && detectTickedMarker(body) !== null) {
-    if (!MANKI_LOGINS.includes(comment?.user?.login ?? '')) {
-      return { type: 'work', target, work: work('state', 'comment', payload, 'issue_comment', objectId) };
-    }
-    // The association is that of Manki's comment. Editing someone else's comment takes write access, so the tick is trusted.
-    return { type: 'work', target, work: { ...work('state', 'review', payload, 'issue_comment', objectId), trusted: true, acknowledge: true, writer: true } };
   }
 
   // An edit that keeps an earlier mention is forwarded too. Manki skips one it already answered.

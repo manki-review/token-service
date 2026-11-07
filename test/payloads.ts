@@ -84,8 +84,6 @@ export const MANKI_AUTHOR = MANKI;
 export const ACTIONS_AUTHOR = { login: 'github-actions[bot]', type: 'Bot' };
 export const BOT_SENDER = { login: 'dependabot[bot]', type: 'Bot' };
 
-export const FORCE_REVIEW_COMMENT = '<!-- manki-bot --><!-- manki-force-review -->**Review skipped**\n\n- [x] Force review';
-export const FORCE_CAP_COMMENT = '<!-- manki-bot --><!-- manki-force-cap -->Round cap reached\n\n- [x] Force review';
 
 export function workflowRunEvent(run: Record<string, unknown> = {}, action = 'completed'): WebhookPayload {
   return {

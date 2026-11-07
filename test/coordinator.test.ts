@@ -43,7 +43,6 @@ import {
 import {
   DISPATCH_WORKFLOW_YAML,
   EVENT_WORKFLOW_YAML,
-  FORCE_REVIEW_COMMENT,
   issueCommentEvent,
   MANKI_AUTHOR,
   pullRequestEvent,
@@ -199,23 +198,21 @@ describe('PrCoordinator.receive', () => {
     ]);
   });
 
-  it('merges a review command into the queued one, and queues a tick or an edited request on its own', async () => {
+  it('merges a review command into the queued one, and queues an edited request on its own', async () => {
     const pr = pullRequest();
     const comment = (id: number, body: string, action = 'created', user = { login: 'alice', type: 'User' }) =>
       ({ ...pr.comment(body, action), comment: { id, body, user, author_association: 'MEMBER' } });
     await pr.send('pull_request', pr.push(SHA_1));
     await pr.send('issue_comment', pr.comment('@manki review'), 'd-request');
     expect(await pr.send('issue_comment', comment(1002, '@manki review again'))).toEqual({ accepted: true, effect: 'merged into work 1' });
-    expect(await pr.send('issue_comment', comment(1003, FORCE_REVIEW_COMMENT, 'edited', MANKI_AUTHOR))).toEqual({ accepted: true, effect: 'queued work 2' });
-    expect(await pr.send('issue_comment', comment(1004, '@manki review now', 'edited'))).toEqual({ accepted: true, effect: 'queued work 3' });
-    // A command after the tick still joins the queued command.
+    expect(await pr.send('issue_comment', comment(1004, '@manki review now', 'edited'))).toEqual({ accepted: true, effect: 'queued work 2' });
+    // A command after the edit still joins the queued command.
     expect(await pr.send('issue_comment', comment(1005, '@manki review'), 'd-newest')).toEqual({ accepted: true, effect: 'merged into work 1' });
     await pr.send('pull_request', pr.push(SHA_2));
     // The merged item names the newest command, whose comment the run then reads.
     expect(await workRows(pr.stub)).toMatchObject([
       { id: 1, event: 'issue_comment.created', object_id: 1005, sender: 'alice', head_sha: SHA_1, delivery: 'd-newest' },
-      { id: 2, event: 'issue_comment.edited', object_id: 1003 },
-      { id: 3, event: 'issue_comment.edited', object_id: 1004, head_sha: SHA_2 },
+      { id: 2, event: 'issue_comment.edited', object_id: 1004, head_sha: SHA_2 },
     ]);
   });
 
@@ -967,8 +964,8 @@ describe('PrCoordinator dispatch', () => {
     };
     expect(await state()).toMatchObject(afterReview);
 
-    // While paused, a push starts nothing. A Force review tick, a thread reply and a review request still run, and a
-    // failed or cancelled run leaves the reported state as it was.
+    // While paused, a push starts nothing. A question, a thread reply and a review request still run, and a failed or
+    // cancelled run leaves the reported state as it was.
     expect(await pr.stub.runCompleted(key('d-1'), 9000, 'success')).toMatchObject({ accepted: true });
     expect(await call('/state/report', { pause: null })).toEqual({ status: 403, body: { error: 'run 9000 is not active on this PR' } });
     await runDurableObjectAlarm(pr.stub);
@@ -978,8 +975,8 @@ describe('PrCoordinator dispatch', () => {
       await pr.send(event, payload);
       await runDurableObjectAlarm(pr.stub);
     };
-    await request('issue_comment', { ...pr.comment(FORCE_REVIEW_COMMENT, 'edited'), comment: { id: 1002, body: FORCE_REVIEW_COMMENT, user: MANKI_AUTHOR } });
-    expect(await state()).toMatchObject({ active: [{ run_id: 9001, event: 'issue_comment.edited' }], queue: [], ...afterReview });
+    await request('issue_comment', pr.comment('@manki explain the pause'));
+    expect(await state()).toMatchObject({ active: [{ run_id: 9001, lane: 'chat', event: 'issue_comment.created' }], queue: [], ...afterReview });
     expect(await pr.stub.runCompleted(key('d-2'), 9001, 'failure')).toMatchObject({ accepted: true });
     await request('pull_request_review_comment', pr.reply('Fixed'));
     expect(await state()).toMatchObject({ active: [{ run_id: 9002, event: 'pull_request_review_comment.created' }] });

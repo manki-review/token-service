@@ -17,7 +17,7 @@ export const MANKI_COMMENT_MARKER = '<!-- manki';
 export const HELP_REPLY = [
   '| Command | What it does |',
   '|---|---|',
-  '| `/manki review` | Reviews the head commit unless Manki already has a complete review of it. Tick Force review on the reply to review it again |',
+  '| `/manki review` | Reviews the head commit unless Manki already has a complete review of it. Tick Full review in the settings block to review it again |',
   '| `/manki explain [topic]` | Explains something about this PR |',
   '| `/manki check` | Checks for open blocking threads and approves when there are none |',
   '| `/manki dismiss [finding]` | Dismisses a finding |',
@@ -29,10 +29,6 @@ export const HELP_REPLY = [
   '',
   '<!-- manki -->',
 ].join('\n');
-
-const FORCE_REVIEW_MARKER = '<!-- manki-force-review -->';
-const FORCE_CAP_MARKER = '<!-- manki-force-cap -->';
-const TICKED_FORCE_REVIEW = '- [x] Force review';
 
 const BOT_MENTION_PATTERN = /(?:@manki-review|@manki|\/manki)\b/;
 const BOT_PREFIX_PATTERN = /(?:@manki-review|@manki|\/manki)\s+(explain|dismiss|help|remember|forget|check)(?:\s+(.*))?/;
@@ -64,13 +60,6 @@ export function parseCommandType(body: string): CommandType {
   const lower = body.replace(/```[\s\S]*?(?:```|$)|`[^`\n]*`/g, ' ').toLowerCase();
   const match = lower.match(BOT_PREFIX_PATTERN);
   return match ? (match[1] as CommandType) : 'generic';
-}
-
-export function detectTickedMarker(body: string): 'FORCE_REVIEW_MARKER' | 'FORCE_CAP_MARKER' | null {
-  if (!body.includes(TICKED_FORCE_REVIEW)) return null;
-  if (body.includes(FORCE_CAP_MARKER)) return 'FORCE_CAP_MARKER';
-  if (body.includes(FORCE_REVIEW_MARKER)) return 'FORCE_REVIEW_MARKER';
-  return null;
 }
 
 /** The skip rules of a base branch's `.manki.yml`. */
