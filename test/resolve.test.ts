@@ -140,16 +140,19 @@ describe('/resolve', () => {
     expect(logged(log, 'request_failed')).toMatchObject([{ request_id: body.request_id, detail: expect.stringContaining('Resource not accessible') }]);
   });
 
-  it('answers 403 without the reason when the installation grants no `contents: write`', async () => {
+  it.each([
+    ['403 when the installation grants no `contents: write`', 422, 403],
+    ['500 when GitHub fails the mint', 502, 500],
+  ])('answers %s, without GitHub\'s message', async (_case, mintStatus, status) => {
     const { calls } = stubThread(MANKI_THREAD, undefined, {
       [MINT]: async (request) => {
         const { permissions } = await request.json() as { permissions: Record<string, string> };
-        if (permissions.contents) return Response.json({ message: 'The permissions requested are not granted to this installation.' }, { status: 422 });
+        if (permissions.contents) return Response.json({ message: 'The permissions requested are not granted to this installation.' }, { status: mintStatus });
         return Response.json({ token: 'ghs_check', expires_at: '2030-01-01T01:00:00Z', permissions }, { status: 201 });
       },
     });
     const response = await post({ thread_id: THREAD, resolved: true });
-    expect(response.status).toBe(403);
+    expect(response.status).toBe(status);
     expect(await response.json()).toEqual({ error: 'Token mint failed', request_id: expect.any(String) });
     expect(calls).toEqual([]);
   });

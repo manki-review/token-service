@@ -78,7 +78,7 @@ export async function handleResolve(request: Request, env: Env): Promise<Respons
       return Response.json({ error: `Only the run Manki dispatched may resolve threads: ${run.refused}` }, { status: 403 });
     }
     const mint = await mintRepositoryToken(env, installation.id, repositoryId, RESOLVE_PERMISSIONS, { purpose: 'resolve', repository: claims.repository });
-    if (!mint.ok) return failure(mint.refused ? 403 : 502, 'Token mint failed', { ...audit, detail: mint.message });
+    if (!mint.ok) return failure(mint.refused ? 403 : 500, 'Token mint failed', { ...audit, detail: mint.message });
 
     const thread = await readThread(mint.token, threadId);
     const pr = thread?.pullRequest;
