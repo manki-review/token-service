@@ -12,6 +12,23 @@ const DELIVERY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 const WRITER_CACHE_MS = 5 * 60_000;
 const MAX_CACHED_WRITERS = 10_000;
 const writers = new Map<string, { writer: boolean; until: number }>();
+/** The `metadata: read` tokens of the lookups, by installation and repository. Kept in memory only, never logged. */
+const lookupTokens = new Map<string, { token: string; expiresAt: number }>();
+/** A token is minted again this long before it expires, so a lookup never uses one that runs out midway. */
+const TOKEN_MARGIN_MS = 5 * 60_000;
+
+/** Returns a `metadata: read` token for the target's repository, minting one only when none is held or it nears expiry. */
+async function lookupToken(env: Env, target: Target): Promise<string> {
+  const key = `${target.installationId}:${target.repositoryId}`;
+  const held = lookupTokens.get(key);
+  if (held && held.expiresAt - TOKEN_MARGIN_MS > Date.now()) return held.token;
+  const repository = `${target.owner}/${target.repo}`;
+  const mint = await mintRepositoryToken(env, target.installationId, target.repositoryId, { metadata: 'read' }, { purpose: 'writer_check', repository });
+  if (!mint.ok) throw new Error(`the token mint failed with ${mint.status}`);
+  if (lookupTokens.size >= MAX_CACHED_WRITERS) lookupTokens.clear();
+  lookupTokens.set(key, { token: mint.token, expiresAt: mint.expiresAt });
+  return mint.token;
+}
 
 /**
  * Whether `login` has write access to the target's repository, reused for `WRITER_CACHE_MS` per installation,
@@ -23,10 +40,7 @@ async function isWriter(env: Env, target: Target, login: string): Promise<boolea
   const cached = writers.get(key);
   if (cached && cached.until > Date.now()) return cached.writer;
   try {
-    const repository = `${target.owner}/${target.repo}`;
-    const mint = await mintRepositoryToken(env, target.installationId, target.repositoryId, { metadata: 'read' }, { purpose: 'writer_check', repository });
-    if (!mint.ok) throw new Error(`the token mint failed with ${mint.status}`);
-    const writer = await hasWriteAccess(mint.token, target.owner, target.repo, login);
+    const writer = await hasWriteAccess(await lookupToken(env, target), target.owner, target.repo, login);
     if (writers.size >= MAX_CACHED_WRITERS) writers.clear();
     writers.set(key, { writer, until: Date.now() + WRITER_CACHE_MS });
     return writer;

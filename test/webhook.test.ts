@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { verifyWebhookSignature } from '../src/signature';
 import worker from '../src/index';
 import { DEFAULT_EVENTS_PER_HOUR, eventsPerHour, InstallationLimiter } from '../src/limiter';
-import { coordinator, DELIVERY_ID, freezeClock, logged, OIDC_AUDIENCE, OWNER, OWNER_ID, postWebhook, REPO, signWebhook, stubGitHub, TEST_ENV, workRows } from './helpers';
+import { coordinator, DELIVERY_ID, freezeClock, INSTALLATION_ID, logged, OIDC_AUDIENCE, OWNER, OWNER_ID, postWebhook, REPO, signWebhook, stubGitHub, TEST_ENV, workRows } from './helpers';
 import { HEAD_SHA, issueCommentEvent, MANKI_AUTHOR, PR_NUMBER, pullRequestEvent, REPOSITORY_ID, reviewEvent, reviewThreadEvent, workflowRunEvent } from './payloads';
 
 const encoder = new TextEncoder();
@@ -179,13 +179,17 @@ describe('/webhook', () => {
     expect(await workRows(coordinator(REPOSITORY_ID, number))).toMatchObject([{ sender: login, writer, trusted }]);
   });
 
-  it('looks up no owner, reuses an answer, and reads a failed lookup as no write access', async () => {
+  it('looks up no owner, reuses an answer and its token, and reads a failed lookup as no write access', async () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const login = newLogin();
     const failing = newLogin();
+    const mint = { status: 201, body: { token: 'ghs_lookup', expires_at: '2030-01-01T01:00:00Z', permissions: { metadata: 'read' } } };
     const requests = stubGitHub({
       permissions: { [login]: 'write' },
-      api: { [`GET /repos/${OWNER}/${REPO}/collaborators/${failing}/permission`]: { status: 502, body: { message: 'Bad gateway' } } },
+      api: {
+        [`POST /app/installations/${INSTALLATION_ID}/access_tokens`]: mint,
+        [`GET /repos/${OWNER}/${REPO}/collaborators/${failing}/permission`]: { status: 502, body: { message: 'Bad gateway' } },
+      },
     });
     const send = async (number: number, association: string, sender = login) => {
       const user = { login: sender, type: 'User' };
@@ -200,6 +204,11 @@ describe('/webhook', () => {
     expect([await send(96, 'MEMBER', failing), await send(97, 'MEMBER', failing)]).toEqual([0, 0]);
     expect(permissionReads(requests)).toEqual([login, failing, failing]);
     expect(logged(log, 'webhook_writer_check_failed')).toHaveLength(2);
+    // One token serves every lookup of the repository until shortly before it expires.
+    expect(logged(log, 'token_minted')).toMatchObject([{ purpose: 'writer_check', permissions: { metadata: 'read' } }]);
+    advanceClock(56 * 60_000);
+    await send(98, 'NONE', newLogin());
+    expect(logged(log, 'token_minted')).toHaveLength(2);
   });
 
   it('ignores outsiders\' comments over the installation cap until the next hour, without touching their coordinators', async () => {
