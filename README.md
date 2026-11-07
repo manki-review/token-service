@@ -123,9 +123,9 @@ Each file is its raw text with its blob sha, or `null` when it does not exist. `
 - `file`: `metrics/fix-rate.jsonl`. Anything else gets `400`.
 - `lines`: 1 to 10 strings, each one JSON object of at most 16 KB with no line break. The Worker writes each on its own line. Anything else gets `400`.
 - `message`: as for a write.
-- The Worker reads the file and writes it back itself, trying 3 times when another run appended meanwhile. Returns `200` with `{ sha }`, `409` when all 3 tries met a conflict, and `413` when the file would grow over 5 MB, with a `memory_append_full` log line.
+- The Worker reads the file and writes it back itself, trying 3 times when another run appended meanwhile. Returns `200` with `{ sha }`, `409` when all 3 tries met a conflict, and `413` when the file would grow over 1,000,000 bytes, with a `memory_append_full` log line. Each append reads and writes the whole file, which has to fit the Free plan's CPU time, so a full file is moved aside by hand.
 
-Every endpoint answers `400` for a body without a positive integer `pr`, `413` for a body over 1 MB, `503` when no memory repository is configured or the App is not installed on it, and `502` when GitHub fails. Redacting secrets is the caller's job: the Worker stores what it gets. Each write and append logs `memory_write` or `memory_append` with the repository, PR, run id and file.
+Every endpoint answers `400` for a body without a positive integer `pr`, `413` for a body over 1 MiB (also without `Content-Length`, and for `/token` and `/state` too), `503` when no memory repository is configured or the App is not installed on it, and `502` when GitHub fails, including a write GitHub refuses for another reason than the sha. Redacting secrets is the caller's job: the Worker stores what it gets. Each write and append logs `memory_write` or `memory_append` with the repository, PR, run id and file.
 
 ## Reconciler
 

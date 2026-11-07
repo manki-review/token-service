@@ -12,9 +12,12 @@ const GLOBAL_FILES = ['learnings.yml', 'conventions.md'] as const;
 /** The files of a repository's own memory folder a run appends lines to. */
 const APPEND_FILES = ['metrics/fix-rate.jsonl'] as const;
 
-const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_FILE_BYTES = 512 * 1024;
-const MAX_APPEND_FILE_BYTES = 5 * 1024 * 1024;
+/**
+ * The largest an appended file grows. Each append reads and writes the whole file, which has to fit the Free plan's CPU
+ * time, and the contents API returns a file of up to 1 MB in one call.
+ */
+const MAX_APPEND_FILE_BYTES = 1_000_000;
 const MAX_LINE_BYTES = 16 * 1024;
 const MAX_LINES = 10;
 const MAX_MESSAGE_LENGTH = 200;
@@ -28,15 +31,16 @@ type StoredFile = { text: string; sha: string } | null;
 
 const encoder = new TextEncoder();
 
+// workerd has the native base64 methods, which the TypeScript lib does not declare yet.
+type Base64Bytes = Uint8Array & { toBase64(): string };
+const fromBase64 = (Uint8Array as unknown as { fromBase64(text: string): Uint8Array }).fromBase64;
+
 function base64(text: string): string {
-  const bytes = encoder.encode(text);
-  let binary = '';
-  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  return btoa(binary);
+  return (encoder.encode(text) as Base64Bytes).toBase64();
 }
 
 function decode(content: string): string {
-  return new TextDecoder().decode(Uint8Array.from(atob(content.replace(/\s/g, '')), (c) => c.charCodeAt(0)));
+  return new TextDecoder().decode(fromBase64(content.replace(/\s/g, '')));
 }
 
 /** Returns `message` without control characters, cut to its limit, with the repository and run it comes from. */
@@ -82,9 +86,14 @@ async function putFile(token: string, repository: string, path: string, text: st
     method: 'PUT',
     body: { message, content: base64(text), ...(sha && { sha }) },
   });
-  // A stale sha gives 409, and a missing sha for a file that exists gives 422.
-  if (response.status === 409 || response.status === 422) return null;
-  if (!response.ok) throw new Error(`writing ${path} failed with ${response.status}`);
+  // A stale sha gives 409, and a missing sha for a file that exists gives a 422 that names the sha. Any other 422 is an
+  // error the run cannot fix by reading again.
+  if (response.status === 409) return null;
+  if (!response.ok) {
+    const text = await response.text();
+    if (response.status === 422 && /\bsha\b/i.test(text)) return null;
+    throw new Error(`writing ${path} failed with ${response.status}: ${text.slice(0, 200)}`);
+  }
   return (await response.json() as { content: { sha: string } }).content.sha;
 }
 
@@ -114,7 +123,6 @@ const bad = (error: string, status = 400) => Response.json({ error }, { status }
  * No memory token leaves the Worker.
  */
 export async function handleMemory(request: Request, env: Env, operation: MemoryOperation): Promise<Response> {
-  if (Number(request.headers.get('Content-Length') ?? 0) > MAX_BODY_BYTES) return bad(`the body is over ${MAX_BODY_BYTES} bytes`, 413);
   const verified = await verifyWorkflowRequest(request, env);
   if (verified instanceof Response) return verified;
   const { claims, body } = verified;
