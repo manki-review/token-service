@@ -87,7 +87,7 @@ export type MintResult =
 
 /** The `token_minted` audit line of a minted token. `run_id` and `check_run_id` come from the requesting workflow's OIDC token. */
 export interface TokenAudit {
-  purpose: 'review' | 'memory' | 'coordinator' | 'reconciler' | 'run_check' | 'resolve';
+  purpose: 'review' | 'memory' | 'coordinator' | 'reconciler' | 'run_check' | 'resolve' | 'writer_check';
   repository_id: number;
   repository: string;
   installation_id: number;
@@ -130,6 +130,17 @@ export async function githubApi(token: string, path: string, init: { method?: st
     body: init.body === undefined ? undefined : JSON.stringify(init.body),
     redirect: 'manual',
   });
+}
+
+/**
+ * Whether `login` has write access to `owner/repo`, as Manki's `hasWriteAccess` decides it. GitHub reports `maintain`
+ * as `write` here. A 404 means no access, and any other failure throws.
+ */
+export async function hasWriteAccess(token: string, owner: string, repo: string, login: string): Promise<boolean> {
+  const response = await githubApi(token, `/repos/${owner}/${repo}/collaborators/${encodeURIComponent(login)}/permission`);
+  if (!response.ok && response.status !== 404) throw new Error(`reading the permission of ${login} failed with ${response.status}`);
+  const { permission } = response.ok ? await response.json() as { permission?: string } : {};
+  return permission === 'admin' || permission === 'write';
 }
 
 /** Runs a GraphQL query and returns its `data`. Throws on an HTTP or GraphQL error. */
