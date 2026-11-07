@@ -1124,12 +1124,12 @@ describe('PrCoordinator dispatch', () => {
     ['an approval without held', { pr: 7, approval: { commit: SHA_1 } }, undefined, 400, 'approval must be { commit, held } with a full commit SHA'],
     ['an empty pause reason', { pr: 7, pause: { reason: '' } }, undefined, 400, 'pause must be null or { reason } with a reason of 1 to 1024 characters'],
     ['a pause reason over 1024 characters', { pr: 7, pause: { reason: 'x'.repeat(1025) } }, undefined, 400, 'pause must be null or { reason } with a reason of 1 to 1024 characters'],
-    ['a token without a run_id claim', { pr: 7 }, null, 403, 'OIDC verification failed: JWTClaimValidationFailed: missing required "run_id" claim'],
+    ['a token without a run_id claim', { pr: 7 }, null, 403, 'OIDC verification failed'],
   ])('refuses a report with %s', async (_case, body, runId, status, error) => {
     fakeGitHub(7);
     const token = await oidcToken({ claims: { repository_id: String(REPOSITORY_ID), run_id: runId === null ? undefined : '9000' } });
     const response = await postToken({ path: '/state/report', token, body: { owner: OWNER, repo: REPO, ...body } });
-    expect({ status: response.status, body: await response.json() }).toEqual({ status, body: { error } });
+    expect({ status: response.status, error: ((await response.json()) as { error: string }).error }).toEqual({ status, error });
   });
 
   it('refuses a state request without a valid OIDC token for the repository', async () => {

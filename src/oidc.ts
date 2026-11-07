@@ -1,4 +1,5 @@
 import { jwtVerify, createRemoteJWKSet } from 'jose';
+import { failure } from './log';
 
 const GITHUB_OIDC_ISSUER = 'https://token.actions.githubusercontent.com';
 
@@ -74,6 +75,6 @@ export async function verifyWorkflowRequest(request: Request): Promise<WorkflowR
   try {
     return { claims: await verifyGitHubOIDC(authHeader.slice(7), `${body.owner}/${body.repo}`), body };
   } catch (error) {
-    return Response.json({ error: `OIDC verification failed: ${error}` }, { status: 403 });
+    return failure(403, 'OIDC verification failed', { detail: String(error) });
   }
 }
