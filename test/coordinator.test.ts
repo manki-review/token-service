@@ -943,8 +943,9 @@ describe('PrCoordinator dispatch', () => {
     await pr.send('pull_request', pr.push(SHA_1));
     await pr.send('pull_request_review_comment', pr.reply('Fixed'));
     await runDurableObjectAlarm(pr.stub);
-    // The reply runs long, and another one is queued meanwhile.
+    // The reply runs long, a push lands on the queued review, and another reply is queued meanwhile.
     advanceClock(REPLY_FIRST_MS);
+    await pr.send('pull_request', pr.push(SHA_2));
     await pr.send('pull_request_review_comment', { ...pr.reply('Also fixed'), comment: { id: 1002, body: 'Also fixed', in_reply_to_id: 2, user: { login: 'alice', type: 'User' }, author_association: 'COLLABORATOR' } });
     await pr.stub.runCompleted(key('d-reply'), 9000, 'success');
     await runDurableObjectAlarm(pr.stub);

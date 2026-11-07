@@ -97,6 +97,8 @@ export interface WorkRow extends Record<string, string | number | null> {
   requeues: number;
   /** The workflow file the last dispatch attempt named. Null before the first attempt. */
   workflow: string | null;
+  /** When the item was first queued. Unlike `enqueued_at`, a push merged into it does not move this. */
+  first_queued_at: number | null;
 }
 
 /** The fields of `GET /repos/{owner}/{repo}/pulls/{number}` a review start reads. */
@@ -213,6 +215,7 @@ export const MIGRATIONS = [
   `ALTER TABLE work ADD COLUMN writer INTEGER NOT NULL DEFAULT 0;`,
   `ALTER TABLE work ADD COLUMN modes TEXT;
    ALTER TABLE work ADD COLUMN boxes TEXT;`,
+  `ALTER TABLE work ADD COLUMN first_queued_at INTEGER;`,
 ];
 
 const ACTIVE = `status IN ('dispatching', 'running')`;
@@ -482,9 +485,9 @@ export class PrCoordinator extends DurableObject<Env> {
 
   private insert(work: Work, delivery: string, now: number): string {
     const id = this.sql.exec<{ id: number }>(
-      `INSERT INTO work (lane, kind, event, head_sha, object_id, sender, delivery, enqueued_at, status, trusted, writer, modes, boxes)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?) RETURNING id`,
-      work.lane, work.kind, work.event, work.headSha, work.objectId, work.sender, delivery, now, Number(work.trusted), Number(work.writer),
+      `INSERT INTO work (lane, kind, event, head_sha, object_id, sender, delivery, enqueued_at, first_queued_at, status, trusted, writer, modes, boxes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?) RETURNING id`,
+      work.lane, work.kind, work.event, work.headSha, work.objectId, work.sender, delivery, now, now, Number(work.trusted), Number(work.writer),
       work.modes?.length ? JSON.stringify(work.modes) : null,
       work.boxes ? JSON.stringify({ at: work.editedAt ?? 0, changes: work.boxes } satisfies SettingsEdit) : null,
     ).one().id;
@@ -706,11 +709,12 @@ export class PrCoordinator extends DurableObject<Env> {
   /**
    * Returns the item a lane starts next: the oldest queued one, except that a queued thread reply goes before a review.
    * The review then sees each thread as the reply leaves it, instead of requesting changes the reply withdraws a minute
-   * later. A review queued for `REPLY_FIRST_MS` goes first again, so a stream of replies cannot hold it back.
+   * later. A review first queued `REPLY_FIRST_MS` ago goes first again, so a stream of pushes and replies cannot hold
+   * it back.
    */
   private nextQueued(lane: Lane): WorkRow | undefined {
     const next = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'queued' ORDER BY id LIMIT 1`, lane).toArray()[0];
-    if (next?.kind !== 'review' || Date.now() - next.enqueued_at >= REPLY_FIRST_MS) return next;
+    if (next?.kind !== 'review' || Date.now() - (next.first_queued_at ?? next.enqueued_at) >= REPLY_FIRST_MS) return next;
     return this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'queued' AND kind = 'thread' ORDER BY id LIMIT 1`, lane).toArray()[0] ?? next;
   }
 
