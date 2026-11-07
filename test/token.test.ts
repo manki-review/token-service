@@ -9,6 +9,8 @@ import {
   appPrivateKeyPkcs1,
   appPrivateKeyPkcs8,
   DEFAULT_INSTALLATION_PERMISSIONS,
+  DISPATCHED_RUN,
+  DISPATCHED_RUN_ID,
   freezeClock,
   INSTALLATION_ID,
   JWKS_URL,
@@ -16,6 +18,7 @@ import {
   OIDC_AUDIENCE,
   oidcToken,
   OWNER,
+  dispatchedEnv,
   postToken,
   REPO,
   REPOSITORY_ID,
@@ -23,6 +26,10 @@ import {
   TEST_ENV,
   type StubReply,
 } from './helpers';
+
+/** The env whose coordinators hold the run each request's OIDC token names. */
+const { env } = dispatchedEnv();
+const post = (options: Parameters<typeof postToken>[0] = {}) => postToken({ env, ...options });
 
 const otherKeys = await generateKeyPair('RS256', { extractable: true });
 
@@ -34,6 +41,27 @@ const APP_CLIENT_ID = 'Iv23liTestClientId';
 
 const LOOKUP = `GET /repos/${OWNER}/${REPO}/installation`;
 const MINT = `POST /app/installations/${INSTALLATION_ID}/access_tokens`;
+const RUN = `GET /repos/${OWNER}/${REPO}/actions/runs/${DISPATCHED_RUN_ID}`;
+/** The requests of a `/token` that checks its run and mints the review token. */
+const CHECKED = [LOOKUP, MINT, RUN, MINT];
+
+/** The `token_minted` lines of the tokens `/token` hands out, leaving out the one it reads the run with. */
+const handedOut = () => logged(log, 'token_minted').filter((line) => line.purpose !== 'run_check');
+
+/** Stubs GitHub so the mint of each token `/token` hands out answers with `status`, while the run check's mint works. */
+function failMints(status: number): Request[] {
+  return stubGitHub({
+    api: {
+      [MINT]: async (request) => {
+        const body = await request.json() as { permissions: Record<string, string> };
+        if (body.permissions.actions === 'read' && Object.keys(body.permissions).length === 1) {
+          return Response.json({ token: 'ghs_check', expires_at: '2026-11-05T13:00:00Z', permissions: body.permissions }, { status: 201 });
+        }
+        return Response.json({ message: 'GitHub said no' }, { status });
+      },
+    },
+  });
+}
 
 const REVIEW_AUDIT = {
   msg: 'token_minted',
@@ -77,20 +105,22 @@ describe('/token', () => {
 
   it('returns an installation token for a verified workflow', async () => {
     const requests = stubGitHub();
-    const response = await postToken();
+    const response = await post();
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ token: 'ghs_test', expires_at: '2026-11-05T13:00:00Z' });
-    expect(paths(requests)).toEqual([LOOKUP, MINT]);
-    expect(apiRequests(requests).map((request) => request.redirect)).toEqual(['manual', 'manual']);
-    // The test token carries no `run_id` or `check_run_id`, so the line has neither.
-    expect(logged(log, 'token_minted')).toEqual([{ ...REVIEW_AUDIT, permissions: DEFAULT_INSTALLATION_PERMISSIONS }]);
+    expect(paths(requests)).toEqual(CHECKED);
+    expect(apiRequests(requests).map((request) => request.redirect)).toEqual(['manual', 'manual', 'manual', 'manual']);
+    expect(logged(log, 'token_minted')).toEqual([
+      { ...REVIEW_AUDIT, purpose: 'run_check', run_id: undefined, permissions: DEFAULT_INSTALLATION_PERMISSIONS },
+      { ...REVIEW_AUDIT, run_id: String(DISPATCHED_RUN_ID), permissions: DEFAULT_INSTALLATION_PERMISSIONS },
+    ].map((line) => JSON.parse(JSON.stringify(line))));
   });
 
   it('encodes the owner and repo into the installation lookup path', async () => {
     const repo = 'x/../../app';
     const lookup = `GET /repos/${OWNER}/${encodeURIComponent(repo)}/installation`;
     const requests = stubGitHub({ api: { [lookup]: { status: 404 } } });
-    const response = await postToken({
+    const response = await post({
       token: await oidcToken({ claims: { repository: `${OWNER}/${repo}` } }),
       body: { owner: OWNER, repo },
     });
@@ -107,11 +137,12 @@ describe('/token', () => {
     freezeClock(Date.now() + APP_JWT_REUSE_MS);
     const requests = stubGitHub();
     const before = Math.floor(Date.now() / 1000);
-    const response = await postToken({ env: { ...TEST_ENV, APP_PRIVATE_KEY: privateKey } });
+    const response = await post({ env: { ...env, APP_PRIVATE_KEY: privateKey } });
     expect(response.status).toBe(200);
 
-    const github = apiRequests(requests);
-    expect(github).toHaveLength(2);
+    // The run is read with an installation token, every other call goes with the App JWT.
+    const github = apiRequests(requests).filter((request) => !request.url.includes('/actions/runs/'));
+    expect(github).toHaveLength(3);
     for (const request of github) {
       const jwt = request.headers.get('Authorization')!.replace('Bearer ', '');
       expect(decodeProtectedHeader(jwt)).toEqual({ alg: 'RS256', typ: 'JWT' });
@@ -128,9 +159,9 @@ describe('/token', () => {
     ['the App ID when no client ID is set', undefined, APP_ID],
   ])('signs the App JWT with %s as the issuer', async (_case, clientId, issuer) => {
     const requests = stubGitHub();
-    const response = await postToken({ env: { ...TEST_ENV, APP_CLIENT_ID: clientId } });
+    const response = await post({ env: { ...env, APP_CLIENT_ID: clientId } });
     expect(response.status).toBe(200);
-    for (const request of apiRequests(requests)) {
+    for (const request of apiRequests(requests).filter((request) => !request.url.includes('/actions/runs/'))) {
       const jwt = request.headers.get('Authorization')!.replace('Bearer ', '');
       expect((await jwtVerify(jwt, appKeys.publicKey)).payload.iss).toBe(issuer);
     }
@@ -164,9 +195,9 @@ describe('/token', () => {
 
   it('reuses the cached OIDC key set on later requests', async () => {
     const requests = stubGitHub();
-    expect((await postToken()).status).toBe(200);
+    expect((await post()).status).toBe(200);
     const seen = requests.length;
-    expect((await postToken()).status).toBe(200);
+    expect((await post()).status).toBe(200);
     expect(requests.slice(seen).map((request) => request.url)).not.toContain(JWKS_URL);
   });
 
@@ -181,7 +212,7 @@ describe('/token', () => {
 
   it('requires a bearer token', async () => {
     const requests = stubGitHub();
-    const response = await postToken({ token: null });
+    const response = await post({ token: null });
     expect(response.status).toBe(401);
     expect(requests).toEqual([]);
   });
@@ -197,7 +228,7 @@ describe('/token', () => {
     ['a body with a string memory flag', { owner: OWNER, repo: REPO, memory: 'true' }],
   ])('rejects %s', async (_case, body) => {
     const requests = stubGitHub();
-    const response = await postToken({ body });
+    const response = await post({ body });
     expect(response.status).toBe(400);
     expect(apiRequests(requests)).toEqual([]);
   });
@@ -220,7 +251,7 @@ describe('/token', () => {
     ['a token issued more than 10 minutes ago', { issuedAt: Math.floor(Date.now() / 1000) - 11 * 60 }],
   ])('refuses %s', async (_case, options) => {
     const requests = stubGitHub();
-    const response = await postToken({ token: await oidcToken(options) });
+    const response = await post({ token: await oidcToken(options) });
     expect(response.status).toBe(403);
     expect(((await response.json()) as { error: string }).error).toMatch(/^OIDC verification failed/);
     expect(apiRequests(requests)).toEqual([]);
@@ -228,31 +259,81 @@ describe('/token', () => {
 
   it('refuses a token for the repository when the body names another', async () => {
     const requests = stubGitHub();
-    const response = await postToken({ body: { owner: OWNER, repo: 'other' } });
+    const response = await post({ body: { owner: OWNER, repo: 'other' } });
     expect(response.status).toBe(403);
     expect(((await response.json()) as { error: string }).error).toContain(`token is for ${OWNER}/${REPO}, requested ${OWNER}/other`);
     expect(apiRequests(requests)).toEqual([]);
   });
 
+  it.each([
+    ['a pull_request workflow', { event_name: 'pull_request', ref: 'refs/pull/7/merge', workflow_ref: `${OWNER}/${REPO}/.github/workflows/manki.yml@refs/pull/7/merge` }, 'event pull_request is not workflow_dispatch'],
+    ['a workflow of another repository', { workflow_ref: `${OWNER}/other/.github/workflows/manki.yml@refs/heads/main` }, `workflow ${OWNER}/other/.github/workflows/manki.yml@refs/heads/main is not a branch workflow of ${OWNER}/${REPO}`],
+    ['a workflow_ref on another ref than the run', { workflow_ref: `${OWNER}/${REPO}/.github/workflows/manki.yml@refs/heads/feature` }, `workflow ${OWNER}/${REPO}/.github/workflows/manki.yml@refs/heads/feature is not a branch workflow of ${OWNER}/${REPO}`],
+    ['a tag workflow', { ref: 'refs/tags/v1', workflow_ref: `${OWNER}/${REPO}/.github/workflows/manki.yml@refs/tags/v1` }, `workflow ${OWNER}/${REPO}/.github/workflows/manki.yml@refs/tags/v1 is not a branch workflow of ${OWNER}/${REPO}`],
+  ])('refuses %s before reading the run', async (_case, claims, reason) => {
+    const requests = stubGitHub();
+    const response = await post({ token: await oidcToken({ claims }) });
+    expect({ status: response.status, body: await response.json() }).toEqual({ status: 403, body: { error: `Only the run Manki dispatched gets a token: ${reason}` } });
+    expect(paths(requests)).toEqual([LOOKUP]);
+    expect(logged(log, 'token_refused')).toMatchObject([{ repository: `${OWNER}/${REPO}`, run_id: String(DISPATCHED_RUN_ID), reason }]);
+    expect(handedOut()).toEqual([]);
+  });
+
+  it.each([
+    ['an unknown run id', { status: 404, body: { message: 'Not Found' } }, `run ${DISPATCHED_RUN_ID} could not be read: 404`],
+    ['a run a person dispatched', { body: { ...DISPATCHED_RUN, actor: { login: 'alice' } } }, `run ${DISPATCHED_RUN_ID} is not a run Manki dispatched`],
+    ['a run of another event', { body: { ...DISPATCHED_RUN, event: 'push' } }, `run ${DISPATCHED_RUN_ID} is not a run Manki dispatched`],
+    ['a run without a Manki run title', { body: { ...DISPATCHED_RUN, display_title: 'Deploy' } }, `run ${DISPATCHED_RUN_ID} is not a run Manki dispatched`],
+  ])('refuses %s', async (_case, run, reason) => {
+    stubGitHub({ run });
+    const response = await post();
+    expect(response.status).toBe(403);
+    expect(logged(log, 'token_refused')).toMatchObject([{ reason }]);
+    expect(handedOut()).toEqual([]);
+  });
+
+  it.each([
+    ['a 502', { status: 502, body: { message: 'Bad gateway' } }],
+    ['a rate limit', { status: 403, body: { message: 'API rate limit exceeded for installation' } }],
+  ])('answers 500, not a refusal, when reading the run fails with %s', async (_case, run) => {
+    stubGitHub({ run });
+    const response = await post();
+    expect(response.status).toBe(500);
+    expect(logged(log, 'token_refused')).toEqual([]);
+    expect(handedOut()).toEqual([]);
+  });
+
+  it('asks the coordinator its run title names, and refuses when it does not hold the run', async () => {
+    stubGitHub();
+    const { env: refusing, checks } = dispatchedEnv('run 9000 is not of manki.yml');
+    const token = await oidcToken({ claims: { workflow_ref: `${OWNER}/${REPO}/.github/workflows/deploy.yml@refs/heads/main` } });
+    const response = await postToken({ env: refusing, token, body: { owner: OWNER, repo: REPO, memory: true } });
+    expect({ status: response.status, body: await response.json() }).toEqual({
+      status: 403, body: { error: 'Only the run Manki dispatched gets a token: run 9000 is not of manki.yml' },
+    });
+    expect(checks).toEqual([[`${REPOSITORY_ID}:7`, DISPATCHED_RUN_ID, 'd-7', 'deploy.yml', 'refs/heads/main']]);
+    expect(handedOut()).toEqual([]);
+  });
+
   it('returns 404 when the App is not installed on the repository', async () => {
     const requests = stubGitHub({ installation: { status: 404, body: { message: 'Not Found' } } });
-    const response = await postToken();
+    const response = await post();
     expect(response.status).toBe(404);
     expect(await response.json()).toEqual({ error: 'App not installed on this repository' });
     expect(paths(requests)).toEqual([LOOKUP]);
   });
 
   it.each([403, 422, 500, 502])('passes a %i from the token mint through', async (status) => {
-    stubGitHub({ accessToken: { status, body: { message: 'GitHub said no' } } });
-    const response = await postToken();
+    failMints(status);
+    const response = await post();
     expect(response.status).toBe(status);
     expect(await response.json()).toEqual({ error: `GitHub API error: ${status}`, details: '{"message":"GitHub said no"}' });
-    expect(logged(log, 'token_minted')).toEqual([]);
+    expect(handedOut()).toEqual([]);
   });
 
   it('returns 500 when the App key cannot be read', async () => {
     const requests = stubGitHub();
-    const response = await postToken({ env: { ...TEST_ENV, APP_PRIVATE_KEY: 'not a key' } });
+    const response = await post({ env: { ...env, APP_PRIVATE_KEY: 'not a key' } });
     expect(response.status).toBe(500);
     expect(((await response.json()) as { error: string }).error).toMatch(/^Token generation failed/);
     expect(apiRequests(requests)).toEqual([]);
@@ -262,18 +343,18 @@ describe('/token', () => {
 describe('/token memory token', () => {
   it('mints no memory token unless the request asks for one', async () => {
     const requests = stubMemoryMint();
-    const response = await postToken();
+    const response = await post();
     expect(response.status).toBe(200);
     const body = await response.json() as Record<string, unknown>;
     expect(body).not.toHaveProperty('memory_token');
     expect(body).not.toHaveProperty('memory_expires_at');
-    expect(paths(requests)).toEqual([LOOKUP, MINT]);
+    expect(paths(requests)).toEqual(CHECKED);
   });
 
   it('returns a memory token next to the review token', async () => {
     const requests = stubMemoryMint();
-    const token = await oidcToken({ claims: { run_id: '9001', check_run_id: '9002' } });
-    const response = await postToken({ token, body: { owner: OWNER, repo: REPO, memory: true } });
+    const token = await oidcToken({ claims: { check_run_id: '9002' } });
+    const response = await post({ token, body: { owner: OWNER, repo: REPO, memory: true } });
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
       token: 'ghs_test',
@@ -282,9 +363,9 @@ describe('/token memory token', () => {
       memory_token: 'ghs_memory',
       memory_expires_at: '2026-11-05T13:30:00Z',
     });
-    expect(paths(requests)).toEqual([LOOKUP, MINT, MINT]);
-    const run = { run_id: '9001', check_run_id: '9002' };
-    expect(logged(log, 'token_minted')).toEqual([
+    expect(paths(requests)).toEqual([...CHECKED, MINT]);
+    const run = { run_id: String(DISPATCHED_RUN_ID), check_run_id: '9002' };
+    expect(handedOut()).toEqual([
       { ...REVIEW_AUDIT, ...run, permissions: {} },
       { ...REVIEW_AUDIT, ...run, purpose: 'memory', permissions: MEMORY_TOKEN.permissions },
     ]);
@@ -292,9 +373,9 @@ describe('/token memory token', () => {
 
   it.each([403, 404, 422, 500])('returns the review token without a memory token when GitHub answers the memory mint with %i', async (status) => {
     stubMemoryMint({ status, body: { message: 'There is at least one repository that does not exist or is not accessible' } });
-    const response = await postToken({ body: { owner: OWNER, repo: REPO, memory: true } });
+    const response = await post({ body: { owner: OWNER, repo: REPO, memory: true } });
     expect(response.status).toBe(200);
-    expect(logged(log, 'token_minted').map((line) => line.purpose)).toEqual(['review']);
+    expect(handedOut().map((line) => line.purpose)).toEqual(['review']);
     const body = await response.json() as Record<string, unknown>;
     expect(body.token).toBe('ghs_test');
     expect(body).not.toHaveProperty('memory_token');
@@ -305,16 +386,16 @@ describe('/token memory token', () => {
     const requests = stubGitHub({
       installation: { body: { id: INSTALLATION_ID, permissions: { issues: 'write', metadata: 'read', pull_requests: 'write' } } },
     });
-    const response = await postToken({ body: { owner: OWNER, repo: REPO, memory: true } });
+    const response = await post({ body: { owner: OWNER, repo: REPO, memory: true } });
     expect(response.status).toBe(200);
     expect(await response.json()).not.toHaveProperty('memory_token');
-    expect(paths(requests)).toEqual([LOOKUP, MINT]);
+    expect(paths(requests)).toEqual(CHECKED);
   });
 
   it('mints no memory token when the review mint fails', async () => {
-    const requests = stubGitHub({ accessToken: { status: 422, body: { message: 'GitHub said no' } } });
-    const response = await postToken({ body: { owner: OWNER, repo: REPO, memory: true } });
+    const requests = failMints(422);
+    const response = await post({ body: { owner: OWNER, repo: REPO, memory: true } });
     expect(response.status).toBe(422);
-    expect(paths(requests)).toEqual([LOOKUP, MINT]);
+    expect(paths(requests)).toEqual(CHECKED);
   });
 });

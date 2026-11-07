@@ -1,4 +1,4 @@
-import { numberFromRunTitle } from './dispatch';
+import { parseRunTitle } from './dispatch';
 import {
   BOT_LOGIN,
   type BoxChange,
@@ -366,7 +366,7 @@ function routeWorkflowRun(payload: WebhookPayload): Route {
   if (run?.id === undefined || run.event !== 'workflow_dispatch' || !WORKFLOW_PATH.test(run.path ?? '')) {
     return ignore('not a Manki dispatch run');
   }
-  const target = targetOf(payload, numberFromRunTitle(run.display_title));
+  const target = targetOf(payload, parseRunTitle(run.display_title)?.number);
   if (!target) return ignore('run name or payload lacks the PR');
   return { type: 'run_completed', target, runId: run.id, conclusion: run.conclusion ?? null };
 }

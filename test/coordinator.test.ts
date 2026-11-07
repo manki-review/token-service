@@ -637,6 +637,9 @@ interface FakeRun {
   status: string;
   conclusion?: string | null;
   run_started_at?: string;
+  event?: string;
+  display_title?: string;
+  actor?: { login: string };
 }
 
 /** A GitHub that the dispatch path talks to, with state a test can change between alarms. */
@@ -713,6 +716,9 @@ function fakeGitHub(number: number) {
       }
       return Response.json({ token: 'ghs_repo', expires_at: '2030-01-01T01:00:00Z', permissions: body.permissions }, { status: 201 });
     }
+    if (route === `GET ${repo}/installation`) {
+      return Response.json({ id: INSTALLATION_ID, permissions: { actions: 'write', contents: 'write', issues: 'write', metadata: 'read', pull_requests: 'write' } });
+    }
     if (route === `GET /repositories/${REPOSITORY_ID}`) {
       state.repositoryReads++;
       return Response.json(state.repository, { status: state.repositoryStatus });
@@ -753,7 +759,9 @@ function fakeGitHub(number: number) {
       if (status === 204) return new Response(null, { status });
       if (status !== 200) return new Response(text, { status, headers });
       const id = state.nextRunId++;
-      state.runs.set(id, { status: 'queued' });
+      const { inputs } = state.dispatches.at(-1)!;
+      const display_title = `Manki ${inputs.event}.${inputs.action} on #${inputs.pr} (${inputs.delivery_id})`;
+      state.runs.set(id, { status: 'queued', event: 'workflow_dispatch', display_title, actor: { login: 'manki-review[bot]' } });
       return Response.json({ workflow_run_id: id, run_url: `https://api.github.com${repo}/actions/runs/${id}`, html_url: 'https://github.com' });
     }
     if (route === `GET ${repo}/actions/workflows/manki-dispatch.yml/runs`) {
@@ -966,6 +974,35 @@ describe('PrCoordinator dispatch', () => {
     expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request', 'pull_request_review_comment']);
   });
 
+  it('gives a token only to the run it dispatched, from its workflow on the default branch, while that run is active', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    await pr.send('pull_request', pr.push(SHA_1));
+    await runDurableObjectAlarm(pr.stub);
+    const workflowRef = (file: string, branch = 'main') => `${OWNER}/${REPO}/.github/workflows/${file}@refs/heads/${branch}`;
+    const ask = async (claims: Record<string, string> = {}) => {
+      const token = await oidcToken({ claims: { repository_id: String(REPOSITORY_ID), workflow_ref: workflowRef('manki-dispatch.yml'), ...claims } });
+      const response = await postToken({ token, body: { owner: OWNER, repo: REPO } });
+      return response.status === 200 ? 200 : ((await response.json()) as { error: string }).error;
+    };
+    expect(await ask()).toBe(200);
+    expect(await ask({ workflow_ref: workflowRef('ci.yml') })).toBe('Only the run Manki dispatched gets a token: run 9000 is not of manki-dispatch.yml');
+    expect(await ask({ workflow_ref: workflowRef('manki-dispatch.yml', 'feature'), ref: 'refs/heads/feature' }))
+      .toBe('Only the run Manki dispatched gets a token: run 9000 is not on main');
+    expect(await ask({ run_id: '9999' })).toBe('Only the run Manki dispatched gets a token: run 9999 could not be read: 404');
+    await pr.stub.runCompleted(key('d-end'), 9000, 'success');
+    expect(await ask()).toBe('Only the run Manki dispatched gets a token: run 9000 is not active on this PR');
+
+    // A dispatch answered without run details is matched by the delivery id in its run title, which then names the run.
+    github.dispatchStatuses = [204];
+    await pr.send('pull_request', pr.push(SHA_2), 'd-quiet');
+    github.head = SHA_2;
+    await runDurableObjectAlarm(pr.stub);
+    github.runs.set(9500, { status: 'in_progress', event: 'workflow_dispatch', display_title: `Manki pull_request.synchronize on #${pr.number} (d-quiet)`, actor: { login: 'manki-review[bot]' } });
+    expect(await ask({ run_id: '9500' })).toBe(200);
+    expect((await workRows(pr.stub)).at(-1)).toMatchObject({ status: 'running', run_id: 9500 });
+  });
+
   it('creates no state for the end of a run on a PR it never saw', async () => {
     fakeGitHub(999);
     const stub = coordinator(REPOSITORY_ID, 999);
@@ -1087,10 +1124,10 @@ describe('PrCoordinator dispatch', () => {
     ['an approval without held', { pr: 7, approval: { commit: SHA_1 } }, undefined, 400, 'approval must be { commit, held } with a full commit SHA'],
     ['an empty pause reason', { pr: 7, pause: { reason: '' } }, undefined, 400, 'pause must be null or { reason } with a reason of 1 to 1024 characters'],
     ['a pause reason over 1024 characters', { pr: 7, pause: { reason: 'x'.repeat(1025) } }, undefined, 400, 'pause must be null or { reason } with a reason of 1 to 1024 characters'],
-    ['a token without a run_id claim', { pr: 7 }, null, 403, 'OIDC token has no run_id claim'],
+    ['a token without a run_id claim', { pr: 7 }, null, 403, 'OIDC verification failed: JWTClaimValidationFailed: missing required "run_id" claim'],
   ])('refuses a report with %s', async (_case, body, runId, status, error) => {
     fakeGitHub(7);
-    const token = await oidcToken({ claims: { repository_id: String(REPOSITORY_ID), ...(runId === null ? {} : { run_id: '9000' }) } });
+    const token = await oidcToken({ claims: { repository_id: String(REPOSITORY_ID), run_id: runId === null ? undefined : '9000' } });
     const response = await postToken({ path: '/state/report', token, body: { owner: OWNER, repo: REPO, ...body } });
     expect({ status: response.status, body: await response.json() }).toEqual({ status, body: { error } });
   });

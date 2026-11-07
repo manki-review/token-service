@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { dispatchInputs, numberFromRunTitle, runTitle } from '../src/dispatch';
+import { dispatchInputs, parseRunTitle, runTitle } from '../src/dispatch';
 
 const SHA = 'a'.repeat(40);
 const DELIVERY = '72d3162e-cc78-11e3-81ab-4c9367dc0958';
@@ -21,18 +21,18 @@ describe('dispatchInputs', () => {
 describe('runTitle', () => {
   it('matches the run-name of the documented dispatch workflow and reads back', () => {
     expect(runTitle({ event: 'issue_comment.created', delivery: DELIVERY }, 12)).toBe(`Manki issue_comment.created on #12 (${DELIVERY})`);
-    expect(numberFromRunTitle(`Manki issue_comment.created on #12 (${DELIVERY})`)).toBe(12);
-    expect(numberFromRunTitle('Manki pull_request.synchronize on #7 (catch-up-111111111111)')).toBe(7);
+    expect(parseRunTitle(`Manki issue_comment.created on #12 (${DELIVERY})`)).toEqual({ number: 12, delivery: DELIVERY });
+    expect(parseRunTitle('Manki pull_request.synchronize on #7 (catch-up-111111111111)')).toEqual({ number: 7, delivery: 'catch-up-111111111111' });
   });
 
   it('reads the number from a run name without the delivery id', () => {
-    expect(numberFromRunTitle('Manki issue_comment.created on #12')).toBe(12);
+    expect(parseRunTitle('Manki issue_comment.created on #12')).toEqual({ number: 12, delivery: null });
   });
 
   it.each(['Manki dispatch', 'Manki issue_comment.created on #12 extra', 'Manki issue_comment.created on #12 (bad id!)', 'CI on #12', 'Manki x.y on #012', undefined])(
     'reads no number from %s',
     (title) => {
-      expect(numberFromRunTitle(title)).toBeUndefined();
+      expect(parseRunTitle(title)).toBeUndefined();
     },
   );
 });

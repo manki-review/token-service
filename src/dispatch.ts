@@ -31,10 +31,10 @@ export function runTitle(item: Pick<DispatchItem, 'event' | 'delivery'>, number:
 }
 
 /**
- * Reads the PR or issue number back out of a dispatch run's `display_title`. A title without the delivery id, from a
- * workflow that predates it, still names the PR.
+ * Reads the PR or issue number and the delivery id back out of a dispatch run's `display_title`. A title without the
+ * delivery id, from a workflow that predates it, still names the PR.
  */
-export function numberFromRunTitle(title: string | undefined): number | undefined {
-  const match = title?.match(/^Manki [a-z_]+\.[a-z_]+ on #([1-9][0-9]*)(?: \([A-Za-z0-9-]{1,64}\))?$/);
-  return match ? Number(match[1]) : undefined;
+export function parseRunTitle(title: string | undefined): { number: number; delivery: string | null } | undefined {
+  const match = title?.match(/^Manki [a-z_]+\.[a-z_]+ on #([1-9][0-9]*)(?: \(([A-Za-z0-9-]{1,64})\))?$/);
+  return match ? { number: Number(match[1]), delivery: match[2] ?? null } : undefined;
 }
