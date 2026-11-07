@@ -70,7 +70,9 @@ function fakeMemory(files: Record<string, string> = {}) {
       const current = store.get(path);
       if (state.conflicts > 0 || current?.sha !== body.sha) {
         state.conflicts = Math.max(0, state.conflicts - 1);
-        return Response.json({ message: 'conflict' }, { status: current && !body.sha ? 422 : 409 });
+        return current && !body.sha
+          ? Response.json({ message: 'Invalid request.\n\n"sha" wasn\'t supplied.' }, { status: 422 })
+          : Response.json({ message: 'conflict' }, { status: 409 });
       }
       const next = { text: new TextDecoder().decode(Uint8Array.from(atob(body.content), (c) => c.charCodeAt(0))), sha: sha(state.next++) };
       store.set(path, next);
@@ -169,18 +171,38 @@ describe('/memory', () => {
     expect(state.writes).toEqual([]);
   });
 
-  it('appends to a file over 1 MB, which it reads as a blob', async () => {
-    const big = `${'{"pr":1}\n'.repeat(150_000)}`;
-    const { state } = fakeMemory({ [`${FOLDER}/metrics/fix-rate.jsonl`]: big });
-    expect((await call('append', { file: 'metrics/fix-rate.jsonl', lines: ['{"pr":7}'], message: 'Record fix rate' })).status).toBe(200);
-    expect(state.store.get(`${FOLDER}/metrics/fix-rate.jsonl`)?.text).toBe(`${big}{"pr":7}\n`);
+  it('reads a file over 1 MB, which the contents API leaves out, as a blob', async () => {
+    const big = `${'- id: l\n'.repeat(150_000)}`;
+    fakeMemory({ [`${FOLDER}/learnings.yml`]: big });
+    const { body } = await call('read');
+    expect((body.repo as Record<string, { text: string }>)['learnings.yml'].text).toBe(big);
   });
 
-  it('refuses an append that would grow the file over 5 MB', async () => {
-    const { state } = fakeMemory({ [`${FOLDER}/metrics/fix-rate.jsonl`]: `${'x'.repeat(5 * 1024 * 1024 - 5)}\n` });
+  it('refuses an append that would grow the file over 1 MB', async () => {
+    const { state } = fakeMemory({ [`${FOLDER}/metrics/fix-rate.jsonl`]: `${'x'.repeat(1_000_000 - 5)}\n` });
     expect(await call('append', { file: 'metrics/fix-rate.jsonl', lines: ['{"pr":7}'], message: 'Record fix rate' }))
-      .toEqual({ status: 413, body: { error: `metrics/fix-rate.jsonl would grow over ${5 * 1024 * 1024} bytes` } });
+      .toEqual({ status: 413, body: { error: 'metrics/fix-rate.jsonl would grow over 1000000 bytes' } });
     expect(state.writes).toEqual([]);
+  });
+
+  it('reports a write GitHub refuses for another reason than the sha as an error, not a conflict', async () => {
+    fakeMemory();
+    stubGitHub({
+      api: {
+        [`GET /repos/${MEMORY}/installation`]: { body: { id: MEMORY_INSTALLATION, permissions: {} } },
+        [`POST /app/installations/${MEMORY_INSTALLATION}/access_tokens`]: { status: 201, body: { token: 'ghs_memory', permissions: {} } },
+        [`PUT /repos/${MEMORY}/contents/${FOLDER}/learnings.yml`]: { status: 422, body: { message: 'path is too long' } },
+      },
+    });
+    expect((await call('write', { file: 'learnings.yml', content: '[]\n', sha: null, message: 'Add learning' })).status).toBe(502);
+    expect(logged(log, 'memory_error')).toHaveLength(1);
+  });
+
+  it('refuses a body over 1 MB before it reads the token', async () => {
+    const requests = stubGitHub();
+    const response = await call('write', { file: 'learnings.yml', content: 'x'.repeat(1024 * 1024), sha: null, message: 'Add learning' });
+    expect(response).toEqual({ status: 413, body: { error: 'The body is over 1048576 bytes' } });
+    expect(apiRequests(requests)).toEqual([]);
   });
 
   it.each([
@@ -200,6 +222,8 @@ describe('/memory', () => {
     expect(await call('read', {}, { env: { ...env, MEMORY_REPO: '' } })).toEqual({ status: 503, body: { error: 'no memory repository is configured' } });
     stubGitHub({ api: { [`GET /repos/${MEMORY}/installation`]: { status: 404 } } });
     expect(await call('read')).toEqual({ status: 503, body: { error: `the App is not installed on ${MEMORY}` } });
+    stubGitHub({ api: { [`GET /repos/${MEMORY}/installation`]: { status: 502 } } });
+    expect((await call('read')).status).toBe(502);
     stubGitHub({
       api: {
         [`GET /repos/${MEMORY}/installation`]: { body: { id: MEMORY_INSTALLATION, permissions: {} } },
@@ -207,6 +231,6 @@ describe('/memory', () => {
       },
     });
     expect((await call('read')).status).toBe(502);
-    expect(logged(log, 'memory_error')).toHaveLength(1);
+    expect(logged(log, 'memory_error')).toHaveLength(2);
   });
 });
