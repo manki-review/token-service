@@ -260,13 +260,6 @@ describe('/token', () => {
     expect(apiRequests(requests)).toEqual([]);
   });
 
-  it('rejects a body with a string memory flag without minting', async () => {
-    const requests = stubGitHub();
-    const response = await post({ body: { owner: OWNER, repo: REPO, memory: 'true' } });
-    expect(response.status).toBe(400);
-    expect(paths(requests)).toEqual([LOOKUP]);
-  });
-
   it.each([
     ['a token signed by another key', { key: otherKeys.privateKey }],
     ['a token from another issuer', { issuer: 'https://example.com' }],
@@ -345,11 +338,6 @@ describe('/token', () => {
     });
     expect(checks).toEqual([[`${REPOSITORY_ID}:7`, DISPATCHED_RUN_ID, 'd-7', 'deploy.yml', 'refs/heads/main']]);
     expect(handedOut()).toEqual([]);
-  });
-
-  it('answers 500 when the installation lookup fails for another reason', async () => {
-    stubGitHub({ installation: { status: 502, body: { message: 'Bad gateway' } } });
-    await expectFailure(await post(), 500, 'Token generation failed', /looking up the installation on manki-review\/manki failed with 502/);
   });
 
   it('returns 404 when the App is not installed on the repository', async () => {

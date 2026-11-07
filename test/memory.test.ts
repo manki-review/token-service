@@ -6,6 +6,7 @@ import {
   logged,
   oidcToken,
   OWNER,
+  passInstallationCache,
   postToken,
   REPO,
   REPOSITORY_ID,
@@ -28,10 +29,12 @@ function base64(text: string): string {
 let log: ReturnType<typeof vi.spyOn>;
 
 beforeEach(() => {
+  passInstallationCache();
   log = vi.spyOn(console, 'log').mockImplementation(() => {});
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   expect(log.mock.calls.flat().join('\n')).not.toContain('ghs_');
 });
 
@@ -213,7 +216,8 @@ describe('/memory', () => {
     const { requests } = fakeMemory();
     const { env: refusing, checks } = dispatchedEnv(refusal);
     expect(await call('read', {}, { env: refusing, claims })).toEqual({ status: 403, body: { error: `Only the run Manki dispatched may use memory: ${reason}` } });
-    expect(apiRequests(requests)).toEqual([]);
+    // Only the requesting repository's installation is looked up, as for every OIDC endpoint.
+    expect(apiRequests(requests).map((request) => new URL(request.url).pathname)).toEqual([`/repos/${OWNER}/${REPO}/installation`]);
     expect(checks).toEqual(refusal === null ? [] : [[`${REPOSITORY_ID}:7`, DISPATCHED_RUN_ID, null, 'manki.yml', 'refs/heads/main']]);
     expect(logged(log, 'memory_refused')).toMatchObject([{ repository: FOLDER, pr: 7, operation: 'read', reason }]);
   });
@@ -221,10 +225,13 @@ describe('/memory', () => {
   it('answers 503 without a memory repository, and 502 when GitHub fails', async () => {
     fakeMemory();
     expect(await call('read', {}, { env: { ...env, MEMORY_REPO: '' } })).toEqual({ status: 503, body: { error: 'no memory repository is configured' } });
+    passInstallationCache();
     stubGitHub({ api: { [`GET /repos/${MEMORY}/installation`]: { status: 404 } } });
     expect(await call('read')).toEqual({ status: 503, body: { error: `the App is not installed on ${MEMORY}` } });
+    passInstallationCache();
     stubGitHub({ api: { [`GET /repos/${MEMORY}/installation`]: { status: 502 } } });
     expect((await call('read')).status).toBe(502);
+    passInstallationCache();
     stubGitHub({
       api: {
         [`GET /repos/${MEMORY}/installation`]: { body: { id: MEMORY_INSTALLATION, permissions: {} } },
