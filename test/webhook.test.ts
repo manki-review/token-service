@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { verifyWebhookSignature } from '../src/signature';
 import worker from '../src/index';
 import { DEFAULT_EVENTS_PER_HOUR, eventsPerHour, InstallationLimiter } from '../src/limiter';
-import { coordinator, DELIVERY_ID, freezeClock, logged, OIDC_AUDIENCE, OWNER_ID, postWebhook, signWebhook, stubGitHub, TEST_ENV, workRows } from './helpers';
+import { coordinator, DELIVERY_ID, freezeClock, logged, OIDC_AUDIENCE, OWNER, OWNER_ID, postWebhook, REPO, signWebhook, stubGitHub, TEST_ENV, workRows } from './helpers';
 import { HEAD_SHA, issueCommentEvent, MANKI_AUTHOR, PR_NUMBER, pullRequestEvent, REPOSITORY_ID, reviewEvent, reviewThreadEvent, workflowRunEvent } from './payloads';
 
 const encoder = new TextEncoder();
@@ -44,6 +44,7 @@ describe('/webhook', () => {
 
   beforeEach(() => {
     advanceClock = freezeClock();
+    stubGitHub();
   });
 
   afterEach(() => {
@@ -146,16 +147,75 @@ describe('/webhook', () => {
     expect(await workRows(coordinator(REPOSITORY_ID, 33))).toHaveLength(1);
   });
 
+  /** A login of its own for each test, so no test reuses another's cached lookup. */
+  const newLogin = () => `user-${crypto.randomUUID().slice(0, 8)}`;
+  let lookupPr = 80;
+  const permissionReads = (requests: Request[]) => requests
+    .map((request) => /\/collaborators\/([^/]+)\/permission$/.exec(new URL(request.url).pathname)?.[1])
+    .filter((login) => login !== undefined);
+
+  it.each<[string, string, string, string, number, number]>([
+    ['a read-only member', 'issue_comment', 'MEMBER', 'read', 0, 1],
+    ['a read-only collaborator', 'issue_comment', 'COLLABORATOR', 'read', 0, 1],
+    ['a triage collaborator', 'issue_comment', 'COLLABORATOR', 'triage', 0, 1],
+    ['an outside reviewer', 'pull_request_review', 'NONE', 'read', 0, 0],
+    ['an outsider', 'issue_comment', 'NONE', 'read', 0, 0],
+    ['a private member shown with no association', 'issue_comment', 'NONE', 'write', 1, 1],
+    ['a private member shown as a contributor', 'issue_comment', 'CONTRIBUTOR', 'admin', 1, 1],
+    ['a writing collaborator', 'pull_request_review', 'COLLABORATOR', 'write', 1, 1],
+  ])('looks up the write access of %s before the work is queued', async (_case, event, association, permission, writer, trusted) => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const login = newLogin();
+    const requests = stubGitHub({ permissions: { [login]: permission } });
+    const user = { login, type: 'User' };
+    const number = lookupPr++;
+    const payload = event === 'issue_comment'
+      ? issueCommentEvent('@manki review', { number, association, author: user, sender: user })
+      : { ...reviewEvent('submitted', { author_association: association, user }, { number }), sender: user };
+    expect((await postWebhook({ event, payload })).status).toBe(202);
+    expect(permissionReads(requests)).toEqual([login]);
+    expect(await workRows(coordinator(REPOSITORY_ID, number))).toMatchObject([{ sender: login, writer, trusted }]);
+  });
+
+  it('looks up no owner or first-timer, reuses an answer, and reads a failed lookup as no write access', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const login = newLogin();
+    const failing = newLogin();
+    const requests = stubGitHub({
+      permissions: { [login]: 'write' },
+      api: { [`GET /repos/${OWNER}/${REPO}/collaborators/${failing}/permission`]: { status: 502, body: { message: 'Bad gateway' } } },
+    });
+    const send = async (number: number, association: string, sender = login) => {
+      const user = { login: sender, type: 'User' };
+      expect((await postWebhook({ event: 'issue_comment', payload: issueCommentEvent('@manki review', { number, association, author: user, sender: user }) })).status).toBe(202);
+      return (await workRows(coordinator(REPOSITORY_ID, number)))[0].writer;
+    };
+    expect([await send(91, 'OWNER'), await send(92, 'FIRST_TIMER'), await send(93, 'FIRST_TIME_CONTRIBUTOR')]).toEqual([1, 0, 0]);
+    expect(permissionReads(requests)).toEqual([]);
+    expect([await send(94, 'MEMBER'), await send(95, 'NONE')]).toEqual([1, 1]);
+    expect(permissionReads(requests)).toEqual([login]);
+    // A failed lookup is not reused, so the coordinator looks the sender up again before it starts the work.
+    expect([await send(96, 'MEMBER', failing), await send(97, 'MEMBER', failing)]).toEqual([0, 0]);
+    expect(permissionReads(requests)).toEqual([login, failing, failing]);
+    expect(logged(log, 'webhook_writer_check_failed')).toHaveLength(2);
+  });
+
   it('ignores outsiders\' comments over the installation cap until the next hour, without touching their coordinators', async () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const installation = 5151;
     const env = { ...TEST_ENV, INSTALLATION_EVENTS_PER_HOUR: '2' };
-    const send = (number: number, installationId = installation, body = '@manki explain', delivery?: string, association = 'NONE') => postWebhook({
-      event: 'issue_comment',
-      payload: { ...issueCommentEvent(body, { number, association }), installation: { id: installationId } },
-      env,
-      delivery,
-    });
+    const mint = { body: { token: 'ghs_check', expires_at: '2030-01-01T01:00:00Z', permissions: { metadata: 'read' } }, status: 201 };
+    stubGitHub({ permissions: { alice: 'write' }, api: { [`POST /app/installations/${installation}/access_tokens`]: mint } });
+    const send = (number: number, installationId = installation, body = '@manki explain', delivery?: string, association = 'NONE') => {
+      // An outsider writes as `mallory`, who has read access, and a writer as `alice`.
+      const user = { login: association === 'NONE' ? 'mallory' : 'alice', type: 'User' };
+      return postWebhook({
+        event: 'issue_comment',
+        payload: { ...issueCommentEvent(body, { number, association, author: user, sender: user }), installation: { id: installationId } },
+        env,
+        delivery,
+      });
+    };
     // Only stored work counts: neither a delivery the router ignores nor a replay the coordinator refuses.
     const replayed = crypto.randomUUID();
     for (const delivery of [replayed, replayed]) expect((await send(61, installation, '@manki explain', delivery)).status).toBe(202);

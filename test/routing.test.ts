@@ -224,18 +224,26 @@ describe('routeDelivery', () => {
   ])('reacts to %s when it is queued or not', (_case, event, payload, acknowledge) => {
     const route = routeDelivery(event, payload);
     expect(route.type).toBe('work');
-    expect(route.type === 'work' && route.work.acknowledge).toBe(acknowledge);
+    expect(route.type === 'work' && route.work.acknowledge && route.work.writer).toBe(acknowledge);
   });
 
-  it.each<[string, string, WebhookPayload, boolean]>([
-    ['a collaborator\'s comment', 'issue_comment', issueCommentEvent('@manki explain'), true],
-    ['a collaborator\'s edit of their own comment', 'issue_comment', issueCommentEvent('@manki explain', { action: 'edited' }), true],
-    ['an edit of a collaborator\'s comment by someone else', 'issue_comment', issueCommentEvent('@manki explain', { action: 'edited', sender: { login: 'mallory', type: 'User' } }), false],
-    ['a contributor\'s comment', 'issue_comment', issueCommentEvent('@manki explain', { association: 'CONTRIBUTOR' }), false],
-    ['an outsider\'s thread reply', 'pull_request_review_comment', reviewCommentEvent('ok', { in_reply_to_id: 1, author_association: 'NONE' }), false],
-  ])('marks %s as a writer or not', (_case, event, payload, writer) => {
+  it.each<[string, string, WebhookPayload, boolean, boolean]>([
+    ['an owner\'s comment', 'issue_comment', issueCommentEvent('@manki explain', { association: 'OWNER' }), true, false],
+    ['a collaborator\'s comment', 'issue_comment', issueCommentEvent('@manki explain'), true, true],
+    ['a member\'s comment', 'issue_comment', issueCommentEvent('@manki explain', { association: 'MEMBER' }), true, true],
+    ['a collaborator\'s edit of their own comment', 'issue_comment', issueCommentEvent('@manki explain', { action: 'edited' }), true, true],
+    ['an edit of a collaborator\'s comment by someone else', 'issue_comment', issueCommentEvent('@manki explain', { action: 'edited', sender: { login: 'mallory', type: 'User' } }), false, false],
+    ['a contributor\'s comment, which a private member shows as', 'issue_comment', issueCommentEvent('@manki explain', { association: 'CONTRIBUTOR' }), false, true],
+    ['an outsider\'s thread reply', 'pull_request_review_comment', reviewCommentEvent('ok', { in_reply_to_id: 1, author_association: 'NONE' }), false, true],
+    ['a first-timer\'s comment', 'issue_comment', issueCommentEvent('@manki explain', { association: 'FIRST_TIMER' }), false, false],
+    ['a first-time contributor\'s comment', 'issue_comment', issueCommentEvent('@manki explain', { association: 'FIRST_TIME_CONTRIBUTOR' }), false, false],
+    ['a collaborator\'s review', 'pull_request_review', reviewEvent('submitted'), true, true],
+    ['an outsider\'s review', 'pull_request_review', reviewEvent('submitted', { author_association: 'NONE' }), false, true],
+    ['a dismissed review', 'pull_request_review', reviewEvent('dismissed', { author_association: 'NONE' }), true, false],
+    ['a push', 'pull_request', pullRequestEvent('synchronize'), true, false],
+  ])('marks %s as a writer or not, and whether to look the sender up', (_case, event, payload, writer, checkWriter) => {
     const route = routeDelivery(event, payload);
-    expect(route.type === 'work' && route.work.writer).toBe(writer);
+    expect(route.type === 'work' && { writer: route.work.writer, checkWriter: route.work.checkWriter }).toEqual({ writer, checkWriter });
   });
 
   it('names the boxes a settings edit ticked or unticked, and counts the editor as no writer until looked up', () => {

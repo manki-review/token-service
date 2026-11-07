@@ -1,11 +1,47 @@
 import { allowedAccounts, type Env } from './env';
+import { hasWriteAccess, mintRepositoryToken } from './github';
 import { eventsPerHour } from './limiter';
 import { log } from './log';
-import { routeDelivery, type Route, type WebhookPayload } from './routing';
+import { routeDelivery, type Route, type Target, type Work, type WebhookPayload } from './routing';
 import { sha256Hex, verifyWebhookSignature } from './signature';
 
 const MAX_BODY_BYTES = 25 * 1024 * 1024;
 const DELIVERY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** How long a login's write access to a repository is reused. */
+const WRITER_CACHE_MS = 5 * 60_000;
+const MAX_CACHED_WRITERS = 10_000;
+const writers = new Map<string, { writer: boolean; until: number }>();
+
+/**
+ * Whether `login` has write access to the target's repository, reused for `WRITER_CACHE_MS` per installation,
+ * repository and login within one isolate. Any failure reads as no write access and is not reused, so the
+ * coordinator looks the sender up again before it starts the work.
+ */
+async function isWriter(env: Env, target: Target, login: string): Promise<boolean> {
+  const key = `${target.installationId}:${target.repositoryId}:${login.toLowerCase()}`;
+  const cached = writers.get(key);
+  if (cached && cached.until > Date.now()) return cached.writer;
+  try {
+    const repository = `${target.owner}/${target.repo}`;
+    const mint = await mintRepositoryToken(env, target.installationId, target.repositoryId, { metadata: 'read' }, { purpose: 'writer_check', repository });
+    if (!mint.ok) throw new Error(`the token mint failed with ${mint.status}`);
+    const writer = await hasWriteAccess(mint.token, target.owner, target.repo, login);
+    if (writers.size >= MAX_CACHED_WRITERS) writers.clear();
+    writers.set(key, { writer, until: Date.now() + WRITER_CACHE_MS });
+    return writer;
+  } catch (error) {
+    log('webhook_writer_check_failed', { repository_id: target.repositoryId, sender: login, error: String(error) });
+    return false;
+  }
+}
+
+/** Settles `writer` with a lookup when the payload cannot. A writer is a repository user, so the work is trusted too. */
+async function checkedWork(env: Env, target: Target, work: Work): Promise<Work> {
+  if (!work.checkWriter) return work;
+  const writer = work.sender !== '' && await isWriter(env, target, work.sender);
+  return { ...work, writer, trusted: work.trusted || writer, checkWriter: false };
+}
 
 function summarize(route: Route): Record<string, unknown> {
   switch (route.type) {
@@ -103,6 +139,7 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
   let route: Route = routed.type !== 'ignore' && !allowedAccounts(env).has(routed.target.ownerId)
     ? { type: 'ignore', reason: `account ${routed.target.ownerId} is not in WEBHOOK_ACCOUNTS` }
     : routed;
+  if (route.type === 'work') route = { ...route, work: await checkedWork(env, route.target, route.work) };
   // One installation may store only so many deliveries from people without write access an hour, so a flood from it
   // cannot use up the quota either, and outsiders only use up their own share. A close or a run's end is never capped.
   // Only a writer can edit Manki's settings comment, so its edits are exempt although the editor is looked up later.

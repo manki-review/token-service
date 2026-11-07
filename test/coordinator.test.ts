@@ -179,9 +179,17 @@ describe('PrCoordinator.receive', () => {
 
     const other = pullRequest();
     await other.send('pull_request_review', other.outsiderReview());
-    expect(await workRows(other.stub)).toMatchObject([{ trusted: 0 }]);
+    expect(await workRows(other.stub)).toMatchObject([{ trusted: 0, writer: 0 }]);
     await other.send('pull_request_review_thread', other.resolve());
-    expect(await workRows(other.stub)).toMatchObject([{ event: 'pull_request_review.submitted', trusted: 1 }]);
+    expect(await workRows(other.stub)).toMatchObject([{ event: 'pull_request_review.submitted', trusted: 1, writer: 1 }]);
+
+    // A trusted review whose sender may lack write access never replaces a writer's trigger either, since the lookup
+    // of its sender could drop the check.
+    const third = pullRequest();
+    await third.send('pull_request_review_thread', third.resolve(), 'd-resolve');
+    const contributor = reviewEvent('submitted', { id: 3004, author_association: 'CONTRIBUTOR' }, { number: third.number });
+    expect(await third.send('pull_request_review', contributor)).toEqual({ accepted: true, effect: 'merged into work 1' });
+    expect(await workRows(third.stub)).toMatchObject([{ event: 'pull_request_review_thread.resolved', delivery: 'd-resolve', trusted: 1, writer: 1 }]);
   });
 
   it('queues a thread change as a review state check that merges with the others', async () => {
@@ -1429,6 +1437,7 @@ describe('PrCoordinator dispatch', () => {
     await run('issue_comment', by('alice', 'NONE', '@manki help'));
     await run('pull_request_review_comment', reviewCommentEvent('Fixed', { in_reply_to_id: 1, author_association: 'NONE' }, 'created', { number: pr.number }));
     await run('issue_comment', by('mallory', 'COLLABORATOR', '@manki explain more', 'edited', 'carol'));
+    await run('pull_request_review', reviewEvent('submitted', { author_association: 'NONE' }, { number: pr.number }));
     expect(github.dispatches).toEqual([]);
     expect(github.comments).toEqual([]);
     expect((await workRows(pr.stub)).map((row) => [row.kind, row.status, row.note])).toEqual([
@@ -1436,6 +1445,7 @@ describe('PrCoordinator dispatch', () => {
       ['help', 'skipped', 'commenter has no write access'],
       ['thread', 'skipped', 'commenter has no write access'],
       ['comment', 'skipped', 'commenter has no write access'],
+      ['review_state', 'skipped', 'commenter has no write access'],
     ]);
 
     // An org member GitHub shows as a contributor has write access by the lookup. A collaborator needs no lookup.
@@ -1796,6 +1806,8 @@ describe('PrCoordinator dispatch', () => {
   it(`drops outsiders' work over ${UNTRUSTED_DISPATCHES_PER_HOUR} dispatches an hour without using up the cap of repository users`, async () => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
+    // The reviews show no association, as for a member with private membership whose lookup failed in the webhook.
+    github.permissions = { alice: 'write' };
     for (let i = 0; i <= UNTRUSTED_DISPATCHES_PER_HOUR; i++) {
       await pr.send('pull_request_review', pr.outsiderReview(3000 + i));
       await runDurableObjectAlarm(pr.stub);
