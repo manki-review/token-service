@@ -48,7 +48,7 @@ describe('/token permissions', () => {
 
     expect((await post()).status).toBe(200);
     expect(await mintRequestBody(requests)).toEqual({
-      permissions: { contents: 'write', issues: 'write', metadata: 'read', pull_requests: 'write' },
+      permissions: { contents: 'read', issues: 'write', metadata: 'read', pull_requests: 'write' },
       ...SCOPE,
     });
   });
@@ -87,14 +87,14 @@ describe('/token permissions', () => {
     });
   });
 
-  it('caps an `admin` level at the cap', async () => {
+  it('caps an `admin` level at the cap, and `contents` at read', async () => {
     const requests = stubGitHub({
       installation: { body: { id: INSTALLATION_ID, permissions: { contents: 'admin', metadata: 'read', pull_requests: 'admin' } } },
     });
 
     expect((await post()).status).toBe(200);
     expect(await mintRequestBody(requests)).toEqual({
-      permissions: { contents: 'write', metadata: 'read', pull_requests: 'write' },
+      permissions: { contents: 'read', metadata: 'read', pull_requests: 'write' },
       ...SCOPE,
     });
   });
@@ -108,7 +108,7 @@ describe('/token permissions', () => {
     expect((await post({ body: { owner: OWNER, repo: REPO, ...extra } })).status).toBe(200);
     const [review, ...memory] = await mintRequestBodies(requests);
     expect(review).toEqual({
-      permissions: { contents: 'write', issues: 'write', metadata: 'read', pull_requests: 'write' },
+      permissions: { contents: 'read', issues: 'write', metadata: 'read', pull_requests: 'write' },
       ...SCOPE,
     });
     expect(memory).toEqual('memory' in extra ? [MEMORY_MINT] : []);
