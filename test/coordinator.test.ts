@@ -180,8 +180,11 @@ describe('PrCoordinator.receive', () => {
     const other = pullRequest();
     await other.send('pull_request_review', other.outsiderReview());
     expect(await workRows(other.stub)).toMatchObject([{ trusted: 0, writer: 0 }]);
-    await other.send('pull_request_review_thread', other.resolve());
-    expect(await workRows(other.stub)).toMatchObject([{ event: 'pull_request_review.submitted', trusted: 1, writer: 1 }]);
+    // A writer's thread change takes the trigger over, so the check never runs under the outsider's name.
+    await other.send('pull_request_review_thread', other.resolve(), 'd-writer');
+    expect(await workRows(other.stub)).toMatchObject([
+      { event: 'pull_request_review_thread.resolved', object_id: null, delivery: 'd-writer', trusted: 1, writer: 1 },
+    ]);
 
     // A trusted review whose sender may lack write access never replaces a writer's trigger either, since the lookup
     // of its sender could drop the check.

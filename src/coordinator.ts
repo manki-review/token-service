@@ -580,18 +580,19 @@ export class PrCoordinator extends DurableObject<Env> {
       // The check reads the PR when it runs, so one queued check covers every review and thread change before it.
       const [check] = this.queued('state', ['review_state']);
       if (check) {
-        // A review carries the id the dispatch names, so it replaces the queued trigger. A thread change does not. An
-        // outsider's review never replaces a trusted trigger, and a review whose sender may lack write access never
-        // replaces a writer's, since the sender's lookup can drop the check. Trusted or writer work makes the check so.
-        if (work.event.startsWith('pull_request_review.') && (work.trusted || !check.trusted) && (work.writer || !check.writer)) {
+        // A review carries the id the dispatch names, so it replaces the queued trigger. An outsider's review never
+        // replaces a trusted trigger. The sender of a trigger not known as a writer's is looked up before the check
+        // starts, so a writer's work always takes it over, and a review that may lack write access never replaces a
+        // writer's. Trusted work makes the check trusted.
+        const review = work.event.startsWith('pull_request_review.');
+        if ((review && (work.trusted || !check.trusted) && (work.writer || !check.writer)) || (work.writer && !check.writer)) {
           this.sql.exec(
-            'UPDATE work SET event = ?, head_sha = ?, object_id = ?, sender = ?, delivery = ?, trusted = ?, writer = ? WHERE id = ?',
+            `UPDATE work SET event = ?, head_sha = ?, object_id = ?, sender = ?, delivery = ?, trusted = MAX(trusted, ?), writer = MAX(writer, ?)
+             WHERE id = ?`,
             work.event, work.headSha, work.objectId, work.sender, delivery, Number(work.trusted), Number(work.writer), check.id,
           );
-        } else if ((work.trusted && !check.trusted) || (work.writer && !check.writer)) {
-          this.sql.exec(
-            'UPDATE work SET trusted = MAX(trusted, ?), writer = MAX(writer, ?) WHERE id = ?', Number(work.trusted), Number(work.writer), check.id,
-          );
+        } else if (work.trusted && !check.trusted) {
+          this.sql.exec('UPDATE work SET trusted = 1 WHERE id = ?', check.id);
         }
         return `merged into work ${check.id}`;
       }
