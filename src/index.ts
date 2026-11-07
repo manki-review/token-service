@@ -5,6 +5,7 @@ import { failure, log } from './log';
 import { verifyWorkflowRequest } from './oidc';
 import { cappedPermissions, MANKI_PERMISSION_CAPS, MEMORY_PERMISSION_CAPS, type Permissions } from './permissions';
 import { RECONCILER_NAME } from './reconciler';
+import { handleResolve } from './resolve';
 import { checkDispatchedRun } from './run-check';
 import { handleState } from './state';
 import { handleWebhook } from './webhook';
@@ -67,6 +68,7 @@ export default {
     if (url.pathname === '/state' || url.pathname === '/state/report') {
       return handleState(request, env, url.pathname === '/state/report');
     }
+    if (url.pathname === '/resolve') return handleResolve(request, env);
     if (url.pathname !== '/token') {
       return Response.json({ error: 'Not found' }, { status: 404 });
     }
