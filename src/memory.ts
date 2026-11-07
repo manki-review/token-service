@@ -1,7 +1,7 @@
 import { createAppJWT } from './app-jwt';
 import type { Env } from './env';
 import { createInstallationToken, getInstallation, githubApi, logMintedToken } from './github';
-import { log } from './log';
+import { failure, log } from './log';
 import { dispatchedWorkflow, type OIDCClaims, verifyWorkflowRequest } from './oidc';
 
 /** The files of a repository's own memory folder a run reads and replaces. */
@@ -188,7 +188,6 @@ export async function handleMemory(request: Request, env: Env, operation: Memory
     log('memory_append_conflict', { ...audit, file });
     return bad(`${file} kept changing, try again`, 409);
   } catch (error) {
-    log('memory_error', { ...audit, error: String(error) });
-    return bad(`Memory ${operation} failed: ${error}`, 502);
+    return failure(502, `Memory ${operation} failed`, { ...audit, detail: String(error) });
   }
 }
