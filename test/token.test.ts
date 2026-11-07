@@ -349,9 +349,7 @@ describe('/token', () => {
 
   it('answers 500 when the installation lookup fails for another reason', async () => {
     stubGitHub({ installation: { status: 502, body: { message: 'Bad gateway' } } });
-    const response = await post();
-    expect(response.status).toBe(500);
-    expect(((await response.json()) as { error: string }).error).toContain('looking up the installation');
+    await expectFailure(await post(), 500, 'Token generation failed', /looking up the installation on manki-review\/manki failed with 502/);
   });
 
   it('returns 404 when the App is not installed on the repository', async () => {

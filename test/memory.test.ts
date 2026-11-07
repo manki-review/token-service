@@ -140,7 +140,7 @@ describe('/memory', () => {
     const { state } = fakeMemory();
     const response = await call('write', { repo: 'other', file: 'learnings.yml', content: '[]\n', sha: null, message: 'Add learning' });
     expect(response.status).toBe(403);
-    expect(response.body.error).toContain(`token is for ${OWNER}/${REPO}, requested ${OWNER}/other`);
+    expect(logged(log, 'request_failed')).toMatchObject([{ detail: expect.stringContaining(`token is for ${OWNER}/${REPO}, requested ${OWNER}/other`) }]);
     expect(state.writes).toEqual([]);
   });
 
@@ -194,8 +194,9 @@ describe('/memory', () => {
         [`PUT /repos/${MEMORY}/contents/${FOLDER}/learnings.yml`]: { status: 422, body: { message: 'path is too long' } },
       },
     });
-    expect((await call('write', { file: 'learnings.yml', content: '[]\n', sha: null, message: 'Add learning' })).status).toBe(502);
-    expect(logged(log, 'memory_error')).toHaveLength(1);
+    expect(await call('write', { file: 'learnings.yml', content: '[]\n', sha: null, message: 'Add learning' }))
+      .toEqual({ status: 502, body: { error: 'Memory write failed', request_id: expect.any(String) } });
+    expect(logged(log, 'request_failed')).toMatchObject([{ detail: expect.stringContaining('path is too long'), operation: 'write' }]);
   });
 
   it('refuses a body over 1 MB before it reads the token', async () => {
@@ -231,6 +232,6 @@ describe('/memory', () => {
       },
     });
     expect((await call('read')).status).toBe(502);
-    expect(logged(log, 'memory_error')).toHaveLength(2);
+    expect(logged(log, 'request_failed')).toHaveLength(2);
   });
 });
