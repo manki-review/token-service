@@ -214,7 +214,7 @@ export const MIGRATIONS = [
 ];
 
 const ACTIVE = `status IN ('dispatching', 'running')`;
-/** The event of a review command in a new comment. A Force review tick is always an edit, so it never has this event. */
+/** The event of a review command in a new comment. A settings box review is always an edit, so it never has this event. */
 const REVIEW_COMMAND_EVENT = 'issue_comment.created';
 
 /** The wait before the next try after `errors` failures in a row: 2, 4, 8, then at most 16 minutes. */
@@ -844,7 +844,7 @@ export class PrCoordinator extends DurableObject<Env> {
   private async dispatch(item: WorkRow, workflow: string): Promise<void> {
     const target = await this.verifiedTarget();
     if (!target) throw new Error('the repository could not be read');
-    // Only a review nobody asked for waits out a pause. A request, a reply or a Force review tick still runs.
+    // Only a review nobody asked for waits out a pause. A request, a reply or a settings box review still runs.
     const { pause, settings } = this.reported();
     if (item.kind === 'review' && item.event.startsWith('pull_request.') && (pause !== null || settings.paused)) {
       this.finish(item.id, 'skipped', 'pull request is paused');

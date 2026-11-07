@@ -5,8 +5,6 @@ import {
   ACTIONS_AUTHOR,
   BOT_SENDER,
   COMMENT_ID,
-  FORCE_CAP_COMMENT,
-  FORCE_REVIEW_COMMENT,
   forkPullRequestEvent,
   HEAD_SHA,
   issueCommentEvent,
@@ -114,12 +112,6 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['a mention inside a word', 'issue_comment', issueCommentEvent('ask @mankind'), 'ignore'],
   ['a comment by a bot', 'issue_comment', issueCommentEvent('@manki review', { sender: BOT_SENDER }), 'ignore'],
   ['a deleted comment', 'issue_comment', issueCommentEvent('@manki review', { action: 'deleted' }), 'ignore'],
-  ['a ticked Force review', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { action: 'edited', author: MANKI_AUTHOR }), 'state:review'],
-  ['a ticked round cap override', 'issue_comment', issueCommentEvent(FORCE_CAP_COMMENT, { action: 'edited', author: MANKI_AUTHOR }), 'state:review'],
-  ['a ticked box on a github-actions comment', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { action: 'edited', author: ACTIONS_AUTHOR }), 'state:review'],
-  ['a ticked box on a comment by another identity', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { action: 'edited' }), 'state:comment'],
-  ['a ticked box on a comment by a custom App', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { action: 'edited', author: { login: 'acme-review[bot]', type: 'Bot' } }), 'state:comment'],
-  ['a ticked box in a new comment', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { author: MANKI_AUTHOR }), 'ignore'],
   ['an edit that adds a mention', 'issue_comment', issueCommentEvent('@manki explain', { action: 'edited', previousBody: 'hmm' }), 'chat:comment'],
   ['an edit that adds a review request', 'issue_comment', issueCommentEvent('@manki review', { action: 'edited', previousBody: 'hmm' }), 'state:review'],
   ['an edit that keeps a mention', 'issue_comment', issueCommentEvent('@manki explain this', { action: 'edited', previousBody: '@manki explain' }), 'chat:comment'],
@@ -136,7 +128,6 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['a remember on an issue', 'issue_comment', issueCommentEvent('@manki remember tabs', { onIssue: true }), 'chat:issue'],
   ['a review request on an issue', 'issue_comment', issueCommentEvent('@manki review', { onIssue: true }), 'ignore'],
   ['a Manki comment on an issue', 'issue_comment', issueCommentEvent('<!-- manki-bot --> @manki help', { onIssue: true }), 'ignore'],
-  ['a ticked box on an issue', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { action: 'edited', author: MANKI_AUTHOR, onIssue: true }), 'ignore'],
 
   // workflow_run
   ['a finished dispatch run', 'workflow_run', workflowRunEvent(), 'run_completed'],
@@ -190,7 +181,6 @@ describe('routeDelivery', () => {
     ['a resolved thread', 'pull_request_review_thread', reviewThreadEvent('resolved'), { event: 'pull_request_review_thread.resolved', headSha: HEAD_SHA, objectId: null, sender: 'alice' }],
     ['a thread reply', 'pull_request_review_comment', reviewCommentEvent('ok', { in_reply_to_id: 1 }), { event: 'pull_request_review_comment.created', objectId: COMMENT_ID }],
     ['a review request', 'issue_comment', issueCommentEvent('@manki review'), { event: 'issue_comment.created', headSha: null, objectId: COMMENT_ID }],
-    ['a Force review tick', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { action: 'edited', author: MANKI_AUTHOR }), { event: 'issue_comment.edited', sender: 'alice' }],
   ])('fills the dispatch fields for %s', (_case, event, payload, expected) => {
     const route = routeDelivery(event, payload);
     expect(route.type).toBe('work');
@@ -210,8 +200,6 @@ describe('routeDelivery', () => {
     ['a review request without an association', 'issue_comment', { ...issueCommentEvent('@manki review'), comment: { id: COMMENT_ID, body: '@manki review' } }, false],
     ['a review request by the PR author', 'issue_comment', issueCommentEvent('@manki review', { association: 'NONE', issueAuthor: 'Alice' }), true],
     ['an outsider\'s question', 'issue_comment', issueCommentEvent('@manki explain', { association: 'NONE' }), false],
-    ['a Force review tick', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { action: 'edited', author: MANKI_AUTHOR, association: 'NONE' }), true],
-    ['a tick on an outsider\'s comment', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { action: 'edited', association: 'NONE' }), false],
     ['a thread reply by an outsider', 'pull_request_review_comment', reviewCommentEvent('ok', { in_reply_to_id: 1, author_association: 'NONE' }), false],
     ['a thread reply by the PR author', 'pull_request_review_comment', reviewCommentEvent('ok', { in_reply_to_id: 1, author_association: 'NONE' }, 'created', { user: { login: 'alice', type: 'User' } }), true],
   ])('marks %s as trusted or not', (_case, event, payload, trusted) => {
@@ -224,13 +212,11 @@ describe('routeDelivery', () => {
       [`a review request by a ${association}`, 'issue_comment', issueCommentEvent('@manki review', { association }), true]),
     ['a question on an issue', 'issue_comment', issueCommentEvent('@manki explain this', { onIssue: true }), true],
     ['an edit that keeps the command', 'issue_comment', issueCommentEvent('@manki review please', { action: 'edited' }), true],
-    ['a Force review tick', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { action: 'edited', author: MANKI_AUTHOR, association: 'NONE' }), true],
     ['a mention in a review comment', 'pull_request_review_comment', reviewCommentEvent('@manki is this safe?'), true],
     ['a review request by a contributor', 'issue_comment', issueCommentEvent('@manki review', { association: 'CONTRIBUTOR' }), false],
     ['a review request by the PR author', 'issue_comment', issueCommentEvent('@manki review', { association: 'NONE', issueAuthor: 'Alice' }), false],
     ['a question by an outsider on their issue', 'issue_comment', issueCommentEvent('@manki help', { onIssue: true, association: 'NONE', issueAuthor: 'alice' }), false],
     ['an edit of a collaborator\'s command by someone else', 'issue_comment', issueCommentEvent('@manki review', { action: 'edited', sender: { login: 'mallory', type: 'User' } }), false],
-    ['a tick on an outsider\'s comment', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { action: 'edited', association: 'NONE' }), false],
     ['a thread reply without a mention', 'pull_request_review_comment', reviewCommentEvent('Fixed', { in_reply_to_id: 1 }), false],
     ['a mention in a review comment by an outsider', 'pull_request_review_comment', reviewCommentEvent('@manki is this safe?', { author_association: 'NONE' }), false],
     ['a help, which gets a thumbs-up with its answer instead', 'issue_comment', issueCommentEvent('@manki help'), false],
@@ -247,7 +233,6 @@ describe('routeDelivery', () => {
     ['an edit of a collaborator\'s comment by someone else', 'issue_comment', issueCommentEvent('@manki explain', { action: 'edited', sender: { login: 'mallory', type: 'User' } }), false],
     ['a contributor\'s comment', 'issue_comment', issueCommentEvent('@manki explain', { association: 'CONTRIBUTOR' }), false],
     ['an outsider\'s thread reply', 'pull_request_review_comment', reviewCommentEvent('ok', { in_reply_to_id: 1, author_association: 'NONE' }), false],
-    ['a Force review tick', 'issue_comment', issueCommentEvent(FORCE_REVIEW_COMMENT, { action: 'edited', author: MANKI_AUTHOR, association: 'NONE' }), true],
   ])('marks %s as a writer or not', (_case, event, payload, writer) => {
     const route = routeDelivery(event, payload);
     expect(route.type === 'work' && route.work.writer).toBe(writer);
