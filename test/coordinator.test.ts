@@ -937,7 +937,7 @@ describe('PrCoordinator dispatch', () => {
     expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request']);
   });
 
-  it(`lets a review go before replies once it waited ${REPLY_FIRST_MS / MINUTE} minutes`, async () => {
+  it(`lets a review go before replies once replies went ahead of it for ${REPLY_FIRST_MS / MINUTE} minutes`, async () => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
     await pr.send('pull_request', pr.push(SHA_1));
@@ -950,6 +950,20 @@ describe('PrCoordinator dispatch', () => {
     await pr.stub.runCompleted(key('d-reply'), 9000, 'success');
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request_review_comment', 'pull_request']);
+  });
+
+  it('runs a reply first although its review waited behind a long run', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    await pr.send('pull_request', pr.push(SHA_1));
+    await runDurableObjectAlarm(pr.stub);
+    // A push during the review, then a reply to the blocker the review posts once it ends.
+    await pr.send('pull_request', pr.push(SHA_2));
+    advanceClock(2 * REPLY_FIRST_MS);
+    await pr.send('pull_request_review_comment', pr.reply('Fixed'));
+    await pr.stub.runCompleted(key('d-review'), 9000, 'success');
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request', 'pull_request_review_comment']);
   });
 
   it('creates no state for the end of a run on a PR it never saw', async () => {
