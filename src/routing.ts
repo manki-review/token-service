@@ -192,13 +192,10 @@ function isTrusted(payload: WebhookPayload): boolean {
  */
 const CLAIMED_WRITER_ASSOCIATIONS = ['MEMBER', 'COLLABORATOR'];
 
-/** The `author_association` values of authors who cannot have write access, so they are never looked up. */
-const NON_WRITER_ASSOCIATIONS = ['FIRST_TIMER', 'FIRST_TIME_CONTRIBUTOR'];
-
 /**
  * What the `author_association` of the comment or review the sender wrote says about their write access. An `OWNER`
- * has it. Anyone else but a first-time contributor is looked up, since a member with private membership shows as
- * `NONE` or `CONTRIBUTOR`. On an edit of someone else's comment, the association is the author's, so it says nothing.
+ * has it. Anyone else is looked up, since a member with private membership can show as `NONE`, `CONTRIBUTOR` or
+ * `FIRST_TIME_CONTRIBUTOR`. On an edit of someone else's comment, the association is the author's, so it says nothing.
  */
 function authorWriter(payload: WebhookPayload): Pick<Work, 'writer' | 'checkWriter'> {
   const { action, comment, sender } = payload;
@@ -206,7 +203,7 @@ function authorWriter(payload: WebhookPayload): Pick<Work, 'writer' | 'checkWrit
   if (!authored || (action === 'edited' && comment && comment.user?.login !== sender?.login)) return { writer: false, checkWriter: false };
   const association = authored.author_association ?? '';
   if (association === 'OWNER') return { writer: true, checkWriter: false };
-  return { writer: CLAIMED_WRITER_ASSOCIATIONS.includes(association), checkWriter: !NON_WRITER_ASSOCIATIONS.includes(association) };
+  return { writer: CLAIMED_WRITER_ASSOCIATIONS.includes(association), checkWriter: true };
 }
 
 /**

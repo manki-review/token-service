@@ -162,6 +162,8 @@ describe('/webhook', () => {
     ['an outsider', 'issue_comment', 'NONE', 'read', 0, 0],
     ['a private member shown with no association', 'issue_comment', 'NONE', 'write', 1, 1],
     ['a private member shown as a contributor', 'issue_comment', 'CONTRIBUTOR', 'admin', 1, 1],
+    ['a private member shown as a first-time contributor', 'issue_comment', 'FIRST_TIME_CONTRIBUTOR', 'write', 1, 1],
+    ['a first-timer', 'issue_comment', 'FIRST_TIMER', 'read', 0, 0],
     ['a writing collaborator', 'pull_request_review', 'COLLABORATOR', 'write', 1, 1],
   ])('looks up the write access of %s before the work is queued', async (_case, event, association, permission, writer, trusted) => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -177,7 +179,7 @@ describe('/webhook', () => {
     expect(await workRows(coordinator(REPOSITORY_ID, number))).toMatchObject([{ sender: login, writer, trusted }]);
   });
 
-  it('looks up no owner or first-timer, reuses an answer, and reads a failed lookup as no write access', async () => {
+  it('looks up no owner, reuses an answer, and reads a failed lookup as no write access', async () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const login = newLogin();
     const failing = newLogin();
@@ -190,7 +192,7 @@ describe('/webhook', () => {
       expect((await postWebhook({ event: 'issue_comment', payload: issueCommentEvent('@manki review', { number, association, author: user, sender: user }) })).status).toBe(202);
       return (await workRows(coordinator(REPOSITORY_ID, number)))[0].writer;
     };
-    expect([await send(91, 'OWNER'), await send(92, 'FIRST_TIMER'), await send(93, 'FIRST_TIME_CONTRIBUTOR')]).toEqual([1, 0, 0]);
+    expect(await send(91, 'OWNER')).toBe(1);
     expect(permissionReads(requests)).toEqual([]);
     expect([await send(94, 'MEMBER'), await send(95, 'NONE')]).toEqual([1, 1]);
     expect(permissionReads(requests)).toEqual([login]);
