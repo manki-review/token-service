@@ -1,7 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import { dispatchInputs, runTitle } from './dispatch';
 import type { Env } from './env';
-import { githubApi, isRateLimited, type MintResult, mintRepositoryToken } from './github';
+import { githubApi, hasWriteAccess, isRateLimited, type MintResult, mintRepositoryToken } from './github';
 import { log } from './log';
 import {
   type BaseConfig, BOT_LOGIN, type BoxChange, HELP_REPLY, matchSkipRule, parseConfig, REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes,
@@ -362,7 +362,7 @@ export class PrCoordinator extends DurableObject<Env> {
         const state = this.reviewState(route.work.headSha);
         if (state !== null) return { accepted: true, effect: 'head already reviewed or under review' };
       }
-      if (route.work.acknowledge && route.work.objectId !== null) {
+      if (route.work.acknowledge && route.work.writer && route.work.objectId !== null) {
         const reaction: PendingReaction = {
           comments: route.work.event.startsWith('pull_request_review_comment.') ? 'pulls' : 'issues',
           commentId: route.work.objectId,
@@ -580,14 +580,18 @@ export class PrCoordinator extends DurableObject<Env> {
       // The check reads the PR when it runs, so one queued check covers every review and thread change before it.
       const [check] = this.queued('state', ['review_state']);
       if (check) {
-        // A review carries the id the dispatch names, so it replaces the queued trigger. A thread change does not, and
-        // an outsider's review never replaces a trusted trigger. Trusted work makes the check trusted.
-        if (work.event.startsWith('pull_request_review.') && (work.trusted || !check.trusted)) {
+        // A review carries the id the dispatch names, so it replaces the queued trigger. An outsider's review never
+        // replaces a trusted trigger. The sender of a trigger not known as a writer's is looked up before the check
+        // starts, so a writer's work always takes it over, and a review that may lack write access never replaces a
+        // writer's. Trusted work makes the check trusted.
+        const review = work.event.startsWith('pull_request_review.');
+        if ((review && (work.trusted || !check.trusted) && (work.writer || !check.writer)) || (work.writer && !check.writer)) {
           this.sql.exec(
-            'UPDATE work SET event = ?, head_sha = ?, object_id = ?, sender = ?, delivery = ?, trusted = ? WHERE id = ?',
-            work.event, work.headSha, work.objectId, work.sender, delivery, Number(work.trusted), check.id,
+            `UPDATE work SET event = ?, head_sha = ?, object_id = ?, sender = ?, delivery = ?, trusted = MAX(trusted, ?), writer = MAX(writer, ?)
+             WHERE id = ?`,
+            work.event, work.headSha, work.objectId, work.sender, delivery, Number(work.trusted), Number(work.writer), check.id,
           );
-        } else if (work.trusted) {
+        } else if (work.trusted && !check.trusted) {
           this.sql.exec('UPDATE work SET trusted = 1 WHERE id = ?', check.id);
         }
         return `merged into work ${check.id}`;
@@ -958,11 +962,13 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Whether the sender of a comment item has write access, as Manki requires of anyone who starts it from a comment.
-   * Only a sender the payload does not show as a writer is looked up. Other items need no check.
+   * Whether the sender of a comment or submitted review item has write access, as Manki requires of anyone who starts
+   * it from a comment. Only a sender not known as a writer is looked up. Other items need no check.
    */
   private async senderMayAsk(item: WorkRow): Promise<boolean> {
-    if (item.writer || !(item.event.startsWith('issue_comment.') || item.event.startsWith('pull_request_review_comment.'))) return true;
+    const asked = item.event.startsWith('issue_comment.') || item.event.startsWith('pull_request_review_comment.')
+      || item.event === 'pull_request_review.submitted';
+    if (item.writer || !asked) return true;
     if (!item.sender) return false;
     const cached = this.writers.get(item.sender);
     if (cached && cached.until > Date.now()) return cached.writer;
@@ -970,11 +976,7 @@ export class PrCoordinator extends DurableObject<Env> {
     if (!target) throw new Error('the repository could not be read');
     const token = await this.token({ metadata: 'read' });
     if (token === null) return false;
-    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/collaborators/${encodeURIComponent(item.sender)}/permission`);
-    if (!response.ok && response.status !== 404) throw new Error(`reading the permission of ${item.sender} failed with ${response.status}`);
-    const { permission } = response.ok ? await response.json() as { permission?: string } : {};
-    // GitHub reports `maintain` as `write` here, as Manki's `hasWriteAccess` expects.
-    const writer = permission === 'admin' || permission === 'write';
+    const writer = await hasWriteAccess(token, target.owner, target.repo, item.sender);
     this.writers.set(item.sender, { writer, until: Date.now() + WRITER_CACHE_MS });
     return writer;
   }

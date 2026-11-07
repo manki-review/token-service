@@ -141,6 +141,8 @@ export interface GitHubStub {
   repository?: StubReply;
   /** The reply to reading run `DISPATCHED_RUN_ID`. */
   run?: StubReply;
+  /** Each login's permission on the repository. Anyone else reads as `read`. */
+  permissions?: Record<string, string>;
   /**
    * Replies keyed by `<METHOD> <path>`, such as `POST /graphql`. They take precedence over the defaults. A function
    * runs in the caller's context, so it can read a request body sent from inside a Durable Object.
@@ -169,6 +171,8 @@ export function stubGitHub(stub: GitHubStub = {}): Request[] {
       return reply(stub.repository, { name: REPO, owner: { login: OWNER, id: OWNER_ID }, default_branch: 'main' });
     }
     if (url.pathname === `/repos/${OWNER}/${REPO}/actions/runs/${DISPATCHED_RUN_ID}`) return reply(stub.run, DISPATCHED_RUN);
+    const permission = new RegExp(`^/repos/${OWNER}/${REPO}/collaborators/([^/]+)/permission$`).exec(url.pathname);
+    if (permission) return Response.json({ permission: stub.permissions?.[decodeURIComponent(permission[1])] ?? 'read' });
     if (url.pathname === `/repos/${OWNER}/${REPO}/installation`) {
       return reply(stub.installation, { id: INSTALLATION_ID, permissions: DEFAULT_INSTALLATION_PERMISSIONS });
     }

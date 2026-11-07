@@ -70,13 +70,22 @@ export interface Work {
    * trusted comment may merge with a push review.
    */
   trusted: boolean;
-  /** Whether the work comes from a comment that gets the eyes reaction as soon as it is queued. */
+  /**
+   * Whether the work comes from a Manki command its sender wrote. A writer's command gets the eyes reaction as soon as
+   * it is queued.
+   */
   acknowledge: boolean;
   /**
    * Whether someone with write access caused the work: a push to a branch of the repository, a thread resolved on a
-   * same-repository PR, a dismissed review, or a comment or review by an `OWNER`, `MEMBER` or `COLLABORATOR`.
+   * same-repository PR, a dismissed review, or a comment or review by an `OWNER`. For a `MEMBER` or `COLLABORATOR` it
+   * is what the payload claims until `checkWriter` is settled.
    */
   writer: boolean;
+  /**
+   * Whether the sender's write access must be looked up before `writer` holds. Set for a comment or review its sender
+   * wrote, unless the author's `author_association` settles it.
+   */
+  checkWriter?: boolean;
   /** For a review, what the settings boxes asked of it. */
   modes?: ReviewMode[];
   /** For a settings edit, the boxes it ticked or unticked. */
@@ -177,30 +186,40 @@ function isTrusted(payload: WebhookPayload): boolean {
   return author !== undefined && payload.sender?.login?.toLowerCase() === author;
 }
 
-/** The `author_association` values Manki's `isTrustedAssociation` takes as write access. */
-const WRITER_ASSOCIATIONS = ['OWNER', 'MEMBER', 'COLLABORATOR'];
+/**
+ * The `author_association` values that claim write access. A member or outside collaborator with read access shows
+ * them too, so a lookup settles them.
+ */
+const CLAIMED_WRITER_ASSOCIATIONS = ['MEMBER', 'COLLABORATOR'];
 
 /**
- * Whether the sender has write access, as the `author_association` of the comment or review they wrote shows it. On an
- * edit of someone else's comment, the association is the author's, so it says nothing about the sender.
+ * What the `author_association` of the comment or review the sender wrote says about their write access. An `OWNER`
+ * has it. Anyone else is looked up, since a member with private membership can show as `NONE`, `CONTRIBUTOR` or
+ * `FIRST_TIME_CONTRIBUTOR`. On an edit of someone else's comment, the association is the author's, so it says nothing.
  */
-function isWriterAuthored(payload: WebhookPayload): boolean {
+function authorWriter(payload: WebhookPayload): Pick<Work, 'writer' | 'checkWriter'> {
   const { action, comment, sender } = payload;
-  if (action === 'edited' && comment && comment.user?.login !== sender?.login) return false;
-  return WRITER_ASSOCIATIONS.includes((comment ?? payload.review)?.author_association ?? '');
+  const authored = comment ?? payload.review;
+  if (!authored || (action === 'edited' && comment && comment.user?.login !== sender?.login)) return { writer: false, checkWriter: false };
+  const association = authored.author_association ?? '';
+  if (association === 'OWNER') return { writer: true, checkWriter: false };
+  return { writer: CLAIMED_WRITER_ASSOCIATIONS.includes(association), checkWriter: true };
 }
 
 /**
- * Whether the comment is a Manki command whose author wrote it with write access, as the payload shows it. Only such a
- * comment gets the eyes reaction when it is queued, so a stranger cannot make the App react.
+ * Whether the comment is a Manki command its sender wrote. Only a writer's gets the eyes reaction when it is queued, so
+ * a stranger cannot make the App react.
  */
-function isWriterCommand(payload: WebhookPayload): boolean {
+function isOwnCommand(payload: WebhookPayload): boolean {
   const { comment, sender } = payload;
-  return hasBotMention(comment?.body ?? '') && isWriterAuthored(payload)
-    && comment?.user?.login !== undefined && comment.user.login === sender?.login;
+  return hasBotMention(comment?.body ?? '') && comment?.user?.login !== undefined && comment.user.login === sender?.login;
 }
 
 function work(lane: Lane, kind: WorkKind, payload: WebhookPayload, event: string, objectId: number | null = null): Work {
+  // Fork heads are dropped before this, so a push and a thread resolution, which only a writer or the PR's author
+  // can make, both take write access. So does dismissing a review.
+  const byEvent = event === 'pull_request' || event === 'pull_request_review_thread'
+    || (event === 'pull_request_review' && payload.action === 'dismissed');
   return {
     lane,
     kind,
@@ -209,11 +228,8 @@ function work(lane: Lane, kind: WorkKind, payload: WebhookPayload, event: string
     objectId,
     sender: payload.sender?.login ?? '',
     trusted: isTrusted(payload),
-    acknowledge: isWriterCommand(payload),
-    // Fork heads are dropped before this, so a push and a thread resolution, which only a writer or the PR's author
-    // can make, both take write access. So does dismissing a review, whose payload names the reviewer's association.
-    writer: event === 'pull_request' || event === 'pull_request_review_thread'
-      || (event === 'pull_request_review' && payload.action === 'dismissed') || isWriterAuthored(payload),
+    acknowledge: isOwnCommand(payload),
+    ...(byEvent ? { writer: true, checkWriter: false } : authorWriter(payload)),
   };
 }
 
@@ -322,7 +338,7 @@ function routeIssueComment(target: Target, payload: WebhookPayload): Route {
     if (boxes.length === 0) return ignore('no settings box changed');
     return { type: 'work', target, work: {
       ...work('settings', 'settings', payload, 'issue_comment', objectId),
-      acknowledge: false, writer: false, boxes, editedAt: Date.parse(comment?.updated_at ?? '') || 0,
+      acknowledge: false, writer: false, checkWriter: false, boxes, editedAt: Date.parse(comment?.updated_at ?? '') || 0,
     } };
   }
 
