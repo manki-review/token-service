@@ -47,6 +47,22 @@ export async function verifyGitHubOIDC(token: string, expectedRepo: string): Pro
   return claims;
 }
 
+/** `<owner>/<repo>/.github/workflows/<file>@<ref>`, the form of the `workflow_ref` claim. */
+const WORKFLOW_REF = /^([^/]+\/[^/]+)\/\.github\/workflows\/([^/@]+)@(refs\/heads\/.+)$/;
+
+/**
+ * Returns the workflow file and branch ref a `workflow_dispatch` run of the token's own repository started from, or why
+ * the claims show no such run. Only a dispatched Manki run may act for a repository.
+ */
+export function dispatchedWorkflow(claims: OIDCClaims): { file: string; ref: string } | string {
+  if (claims.event_name !== 'workflow_dispatch') return `event ${claims.event_name} is not workflow_dispatch`;
+  const workflow = WORKFLOW_REF.exec(claims.workflow_ref);
+  if (!workflow || workflow[1] !== claims.repository || workflow[3] !== claims.ref) {
+    return `workflow ${claims.workflow_ref} is not a branch workflow of ${claims.repository}`;
+  }
+  return { file: workflow[2], ref: workflow[3] };
+}
+
 /**
  * A workflow's request: its JSON body, which names the repository, the verified claims of its OIDC token and the App's
  * installation on that repository.
