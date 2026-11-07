@@ -12,6 +12,7 @@ import {
   POLL_MS,
   QUEUED_MAX_AGE_MS,
   QUEUED_RUN_TIMEOUT_MS,
+  REPLY_FIRST_MS,
   RUN_DEADLINE_MS,
   RUN_LOOKUP_TIMEOUT_MS,
   RUNNING_RUN_TIMEOUT_MS,
@@ -377,13 +378,13 @@ describe('PrCoordinator.alarm', () => {
     });
     const pr = pullRequest();
     await pr.send('pull_request', pr.push(SHA_1), 'd-push');
-    await pr.send('pull_request_review_comment', pr.reply('Fixed'));
+    await pr.send('pull_request_review', pr.review());
     await pr.send('issue_comment', pr.comment('@manki explain'));
     await pr.send('issue_comment', pr.comment('@manki help'));
 
     // A help answer is no run, but it writes to the PR, so it is held back too. `stubGitHub` refuses any other call.
     expect(await runDurableObjectAlarm(pr.stub)).toBe(true);
-    expect((await workRows(pr.stub)).map((row) => `${row.kind}:${row.status}`)).toEqual(['review:skipped', 'thread:queued', 'comment:skipped', 'help:skipped']);
+    expect((await workRows(pr.stub)).map((row) => `${row.kind}:${row.status}`)).toEqual(['review:skipped', 'review_state:queued', 'comment:skipped', 'help:skipped']);
     expect(logged(log, 'coordinator_would_dispatch')).toEqual([
       expect.objectContaining({ work_id: 1, lane: 'state', kind: 'review', event: 'pull_request.synchronize', head_sha: SHA_1, delivery: 'd-push', opted_in: true }),
       expect.objectContaining({ work_id: 3, lane: 'chat', kind: 'comment', event: 'issue_comment.created', object_id: 1001, sender: 'alice' }),
@@ -481,7 +482,7 @@ describe('PrCoordinator.alarm', () => {
     stubGitHub({ api: { 'POST /graphql': { status: 502, body: {} } } });
     const pr = pullRequest();
     await pr.send('pull_request', pr.push(SHA_1));
-    await pr.send('pull_request_review_comment', pr.reply('Fixed'));
+    await pr.send('pull_request_review', pr.review());
     await runDurableObjectAlarm(pr.stub);
     advanceClock(30_000);
     await runDurableObjectAlarm(pr.stub);
@@ -805,7 +806,7 @@ describe('PrCoordinator dispatch', () => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
     await pr.send('pull_request', pr.push(SHA_1), 'd-push');
-    await pr.send('pull_request_review_comment', pr.reply('Fixed'));
+    await pr.send('pull_request_review', pr.review());
     await pr.send('issue_comment', pr.comment('@manki explain'), 'd-explain');
 
     await runDurableObjectAlarm(pr.stub);
@@ -816,7 +817,7 @@ describe('PrCoordinator dispatch', () => {
       { ref: 'main', return_run_details: true, inputs: { event: 'issue_comment', action: 'created', pr: String(pr.number), comment_id: '1001', delivery_id: 'd-explain' } },
     ]));
     expect((await workRows(pr.stub)).map((row) => [row.kind, row.status, row.run_id !== null])).toEqual([
-      ['review', 'running', true], ['thread', 'queued', false], ['comment', 'running', true],
+      ['review', 'running', true], ['review_state', 'queued', false], ['comment', 'running', true],
     ]);
     expect(logged(log, 'coordinator_dispatched')).toHaveLength(2);
   });
@@ -898,7 +899,7 @@ describe('PrCoordinator dispatch', () => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
     await pr.send('pull_request', pr.push(SHA_1));
-    await pr.send('pull_request_review_comment', pr.reply('Fixed'));
+    await pr.send('pull_request_review', pr.review());
     await runDurableObjectAlarm(pr.stub);
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches).toHaveLength(1);
@@ -909,7 +910,45 @@ describe('PrCoordinator dispatch', () => {
     expect(await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm())).toBe(Date.now());
 
     await runDurableObjectAlarm(pr.stub);
-    expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request', 'pull_request_review_comment']);
+    expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request', 'pull_request_review']);
+  });
+
+  it.each([
+    ['a push, then a reply in the same second', ['push', 'reply']],
+    ['a reply, then a push in the same second', ['reply', 'push']],
+  ])('runs a thread reply before a review for %s, and the review right after it', async (_case, order) => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    for (const item of order) {
+      await (item === 'push' ? pr.send('pull_request', pr.push(SHA_1)) : pr.send('pull_request_review_comment', pr.reply('Fixed')));
+    }
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request_review_comment']);
+    await pr.stub.runCompleted(key('d-reply'), 9000, 'success');
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request_review_comment', 'pull_request']);
+  });
+
+  it('starts a review at once when no reply is queued', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    await pr.send('pull_request', pr.push(SHA_1));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request']);
+  });
+
+  it(`lets a review go before replies once it waited ${REPLY_FIRST_MS / MINUTE} minutes`, async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    await pr.send('pull_request', pr.push(SHA_1));
+    await pr.send('pull_request_review_comment', pr.reply('Fixed'));
+    await runDurableObjectAlarm(pr.stub);
+    // The reply runs long, and another one is queued meanwhile.
+    advanceClock(REPLY_FIRST_MS);
+    await pr.send('pull_request_review_comment', { ...pr.reply('Also fixed'), comment: { id: 1002, body: 'Also fixed', in_reply_to_id: 2, user: { login: 'alice', type: 'User' }, author_association: 'COLLABORATOR' } });
+    await pr.stub.runCompleted(key('d-reply'), 9000, 'success');
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request_review_comment', 'pull_request']);
   });
 
   it('creates no state for the end of a run on a PR it never saw', async () => {
@@ -1181,11 +1220,11 @@ describe('PrCoordinator dispatch', () => {
     await pr.send('pull_request', pr.push(SHA_1, 'opened'));
     await pr.send('pull_request_review_comment', pr.reply('Fixed'));
     await runDurableObjectAlarm(pr.stub);
-    expect(github.dispatches).toEqual([]);
-    expect((await workRows(pr.stub))[0]).toMatchObject({ status: 'dropped', note: 'pull request is a draft' });
-    await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request_review_comment']);
     await pr.stub.runCompleted(key('d-reply'), 9000, 'success');
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches).toHaveLength(1);
+    expect((await workRows(pr.stub))[0]).toMatchObject({ status: 'dropped', note: 'pull request is a draft' });
 
     github.config = 'drafts: review';
     await pr.send('pull_request', pr.push(SHA_2));
