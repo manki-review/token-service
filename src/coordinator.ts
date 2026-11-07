@@ -30,6 +30,8 @@ export const OPT_IN_TTL_MS = 5 * MINUTE;
 export const FINISHED_RETENTION_MS = 7 * DAY;
 /** How long an alarm may hold an item in `dispatching` before another pass takes it back. */
 const LEASE_MS = 5 * MINUTE;
+/** How long a queued review lets thread replies go first. */
+export const REPLY_FIRST_MS = 5 * MINUTE;
 const LANES: readonly Lane[] = ['state', 'chat', 'help', 'settings'];
 
 /** The wait before each retry of a dispatch that failed with a 5xx or a network error. */
@@ -95,6 +97,8 @@ export interface WorkRow extends Record<string, string | number | null> {
   requeues: number;
   /** The workflow file the last dispatch attempt named. Null before the first attempt. */
   workflow: string | null;
+  /** For a queued review, when a thread reply first went ahead of it. */
+  passed_at: number | null;
 }
 
 /** The fields of `GET /repos/{owner}/{repo}/pulls/{number}` a review start reads. */
@@ -211,6 +215,7 @@ export const MIGRATIONS = [
   `ALTER TABLE work ADD COLUMN writer INTEGER NOT NULL DEFAULT 0;`,
   `ALTER TABLE work ADD COLUMN modes TEXT;
    ALTER TABLE work ADD COLUMN boxes TEXT;`,
+  `ALTER TABLE work ADD COLUMN passed_at INTEGER;`,
 ];
 
 const ACTIVE = `status IN ('dispatching', 'running')`;
@@ -694,15 +699,27 @@ export class PrCoordinator extends DurableObject<Env> {
         if (this.sql.exec(`SELECT 1 FROM work WHERE lane = ? AND ${ACTIVE}`, lane).toArray().length > 0) return;
         const next = this.nextQueued(lane);
         // A queued item's `check_at` holds it until the dispatch cap allows another run.
-        if (next && (next.check_at ?? 0) <= now) await this.start(next);
+        if (!next || (next.check_at ?? 0) > now) return;
+        if (next.kind === 'thread') {
+          this.sql.exec(`UPDATE work SET passed_at = ? WHERE lane = ? AND status = 'queued' AND kind = 'review' AND id < ? AND passed_at IS NULL`, now, lane, next.id);
+        }
+        await this.start(next);
       } catch (error) {
         log('coordinator_lane_error', { ...this.logFields(), lane, error: String(error) });
       }
     }));
   }
 
+  /**
+   * Returns the item a lane starts next: the oldest queued one, except that a queued thread reply goes before a review.
+   * The review then sees each thread as the reply leaves it, instead of requesting changes the reply withdraws a minute
+   * later. Once replies have gone ahead of a review for `REPLY_FIRST_MS`, the review goes first again, so a stream of
+   * replies cannot hold it back. Time spent waiting behind a run does not count.
+   */
   private nextQueued(lane: Lane): WorkRow | undefined {
-    return this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'queued' ORDER BY id LIMIT 1`, lane).toArray()[0];
+    const next = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'queued' ORDER BY id LIMIT 1`, lane).toArray()[0];
+    if (next?.kind !== 'review' || (next.passed_at !== null && Date.now() - next.passed_at >= REPLY_FIRST_MS)) return next;
+    return this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'queued' AND kind = 'thread' ORDER BY id LIMIT 1`, lane).toArray()[0] ?? next;
   }
 
   private row(id: number): WorkRow | undefined {
