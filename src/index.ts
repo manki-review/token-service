@@ -2,6 +2,7 @@ import { createAppJWT } from './app-jwt';
 import type { Env } from './env';
 import { createInstallationToken, logMintedToken, type TokenAudit } from './github';
 import { failure, log } from './log';
+import { handleMemory, type MemoryOperation } from './memory';
 import { verifyWorkflowRequest } from './oidc';
 import { cappedPermissions, MANKI_PERMISSION_CAPS, type Permissions } from './permissions';
 import { RECONCILER_NAME } from './reconciler';
@@ -44,6 +45,8 @@ export default {
       return handleState(request, env, url.pathname === '/state/report');
     }
     if (url.pathname === '/resolve') return handleResolve(request, env);
+    const memory = url.pathname.match(/^\/memory\/(read|write|append)$/);
+    if (memory) return handleMemory(request, env, memory[1] as MemoryOperation);
     if (url.pathname !== '/token') {
       return Response.json({ error: 'Not found' }, { status: 404 });
     }
