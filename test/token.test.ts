@@ -292,6 +292,17 @@ describe('/token', () => {
     expect(handedOut()).toEqual([]);
   });
 
+  it.each([
+    ['a 502', { status: 502, body: { message: 'Bad gateway' } }],
+    ['a rate limit', { status: 403, body: { message: 'API rate limit exceeded for installation' } }],
+  ])('answers 500, not a refusal, when reading the run fails with %s', async (_case, run) => {
+    stubGitHub({ run });
+    const response = await post();
+    expect(response.status).toBe(500);
+    expect(logged(log, 'token_refused')).toEqual([]);
+    expect(handedOut()).toEqual([]);
+  });
+
   it('asks the coordinator its run title names, and refuses when it does not hold the run', async () => {
     stubGitHub();
     const { env: refusing, checks } = dispatchedEnv('run 9000 is not of manki.yml');

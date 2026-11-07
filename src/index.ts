@@ -1,7 +1,7 @@
 import { createAppJWT } from './app-jwt';
 import type { Env } from './env';
 import { parseRunTitle } from './dispatch';
-import { createInstallationToken, getInstallation, githubApi, type Installation, logMintedToken, mintRepositoryToken, type TokenAudit } from './github';
+import { createInstallationToken, getInstallation, githubApi, type Installation, isRefusal, logMintedToken, mintRepositoryToken, type TokenAudit } from './github';
 import { log } from './log';
 import { BOT_LOGIN } from './manki';
 import { type OIDCClaims, verifyWorkflowRequest } from './oidc';
@@ -61,10 +61,16 @@ async function refuseWorkflow(env: Env, claims: OIDCClaims, installationId: numb
   if (!workflow || workflow[1] !== claims.repository || workflow[3] !== claims.ref) {
     return `workflow ${claims.workflow_ref} is not a branch workflow of ${claims.repository}`;
   }
+  // Only a refusal refuses the run. Any other GitHub failure throws, so the caller answers 500 and the run can retry.
   const mint = await mintRepositoryToken(env, installationId, repositoryId, { actions: 'read' }, { purpose: 'run_check', repository: claims.repository });
-  if (!mint.ok) return `the run could not be read: token mint failed with ${mint.status}`;
+  if (!mint.ok && !mint.refused) throw new Error(`the run check's token mint failed with ${mint.status}`);
+  if (!mint.ok) return `the run could not be read: token mint refused with ${mint.status}`;
   const response = await githubApi(mint.token, `/repos/${claims.repository}/actions/runs/${claims.run_id}`);
-  if (!response.ok) return `run ${claims.run_id} could not be read: ${response.status}`;
+  if (!response.ok) {
+    const text = await response.text();
+    if (!isRefusal(response, text)) throw new Error(`reading run ${claims.run_id} failed with ${response.status}`);
+    return `run ${claims.run_id} could not be read: ${response.status}`;
+  }
   const run = await response.json() as { event?: string; display_title?: string; actor?: { login?: string } };
   const title = parseRunTitle(run.display_title);
   if (run.event !== 'workflow_dispatch' || run.actor?.login !== BOT_LOGIN || !title) return `run ${claims.run_id} is not a run Manki dispatched`;
