@@ -1,5 +1,10 @@
-import { describe, expect, it } from 'vitest';
-import { apiRequests, dispatchedEnv, INSTALLATION_ID, oidcToken, OWNER, postToken, REPO, REPOSITORY_ID, RUN_CHECK_MINT, stubGitHub } from './helpers';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { apiRequests, dispatchedEnv, INSTALLATION_ID, oidcToken, OWNER, passInstallationCache, postToken, REPO, REPOSITORY_ID, RUN_CHECK_MINT, stubGitHub } from './helpers';
+
+beforeEach(passInstallationCache);
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 /** The env whose coordinators hold the run each request's OIDC token names. */
 const { env } = dispatchedEnv();

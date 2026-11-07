@@ -19,6 +19,8 @@ export interface Env {
   WEBHOOK_ACCOUNTS?: string;
   /** The most deliveries per installation and clock hour that reach a coordinator. Defaults to 500. */
   INSTALLATION_EVENTS_PER_HOUR?: string;
+  /** Caps the `/token` and `/state` requests of one account, keyed by its id. */
+  ACCOUNT_RATE_LIMIT: RateLimit;
   PR_COORDINATOR: DurableObjectNamespace<PrCoordinator>;
   INSTALLATION_LIMITER: DurableObjectNamespace<InstallationLimiter>;
   RECONCILER: DurableObjectNamespace<Reconciler>;

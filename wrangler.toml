@@ -32,6 +32,12 @@ new_sqlite_classes = ["Reconciler"]
 tag = "v3"
 new_sqlite_classes = ["InstallationLimiter"]
 
+# The `/token` and `/state` requests of one account. A Manki run makes a handful.
+[[ratelimits]]
+name = "ACCOUNT_RATE_LIMIT"
+namespace_id = "1001"
+simple = { limit = 120, period = 60 }
+
 [triggers]
 crons = ["*/5 * * * *"]
 

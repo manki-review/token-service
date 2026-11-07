@@ -18,10 +18,13 @@ import {
   OIDC_AUDIENCE,
   oidcToken,
   OWNER,
+  OWNER_ID,
   dispatchedEnv,
+  passInstallationCache,
   postToken,
   REPO,
   REPOSITORY_ID,
+  RUNTIME_ENV,
   stubGitHub,
   TEST_ENV,
   type StubReply,
@@ -75,9 +78,11 @@ let log: ReturnType<typeof vi.spyOn>;
 
 beforeEach(() => {
   log = vi.spyOn(console, 'log').mockImplementation(() => {});
+  passInstallationCache();
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   expect(log.mock.calls.flat().join('\n')).not.toContain('ghs_');
 });
 
@@ -127,6 +132,34 @@ describe('/token', () => {
       { ...REVIEW_AUDIT, purpose: 'run_check', run_id: undefined, permissions: DEFAULT_INSTALLATION_PERMISSIONS },
       { ...REVIEW_AUDIT, run_id: String(DISPATCHED_RUN_ID), permissions: DEFAULT_INSTALLATION_PERMISSIONS },
     ].map((line) => JSON.parse(JSON.stringify(line))));
+
+    // The installation lookup is reused for a minute, so the next call makes no lookup.
+    expect((await post()).status).toBe(200);
+    passInstallationCache();
+    expect((await post()).status).toBe(200);
+    expect(paths(requests)).toEqual([...CHECKED, ...CHECKED.slice(1), ...CHECKED]);
+  });
+
+  it('throttles a burst from one account without refusing another account', async () => {
+    const requests = stubGitHub();
+    const tight = (RUNTIME_ENV as unknown as { TIGHT_RATE_LIMIT: RateLimit }).TIGHT_RATE_LIMIT;
+    const { env: throttled } = dispatchedEnv(null, { ...TEST_ENV, ACCOUNT_RATE_LIMIT: tight });
+    const statuses: number[] = [];
+    for (let i = 0; i < 10; i++) statuses.push((await postToken({ env: throttled })).status);
+    // The limit counts per minute, so a burst that crosses into the next minute may pass twice the limit of 3.
+    expect(statuses.filter((status) => status === 200).length).toBeLessThanOrEqual(6);
+    expect(statuses.every((status) => status === 200 || status === 429)).toBe(true);
+    expect(statuses.at(-1)).toBe(429);
+    const state = await postToken({ env: throttled, path: '/state', body: { owner: OWNER, repo: REPO, pr: 7 } });
+    expect(state.status).toBe(429);
+    // A refused call costs no GitHub request.
+    expect(paths(requests).filter((path) => path === RUN)).toHaveLength(statuses.filter((status) => status === 200).length);
+    expect(logged(log, 'workflow_request_throttled').at(-1)).toEqual({
+      msg: 'workflow_request_throttled', repository: `${OWNER}/${REPO}`, repository_owner_id: String(OWNER_ID),
+    });
+
+    const other = await oidcToken({ claims: { repository_owner_id: String(OWNER_ID + 1) } });
+    expect((await postToken({ env: throttled, token: other })).status).toBe(200);
   });
 
   it('encodes the owner and repo into the installation lookup path', async () => {
@@ -238,12 +271,18 @@ describe('/token', () => {
     ['a body that is a string', '"manki"'],
     ['a body with a numeric owner', { owner: 1, repo: REPO }],
     ['a body with an empty repo', { owner: OWNER, repo: '' }],
-    ['a body with a string memory flag', { owner: OWNER, repo: REPO, memory: 'true' }],
   ])('rejects %s', async (_case, body) => {
     const requests = stubGitHub();
     const response = await post({ body });
     expect(response.status).toBe(400);
     expect(apiRequests(requests)).toEqual([]);
+  });
+
+  it('rejects a body with a string memory flag without minting', async () => {
+    const requests = stubGitHub();
+    const response = await post({ body: { owner: OWNER, repo: REPO, memory: 'true' } });
+    expect(response.status).toBe(400);
+    expect(paths(requests)).toEqual([LOOKUP]);
   });
 
   it.each([
@@ -331,7 +370,19 @@ describe('/token', () => {
     const response = await post();
     expect(response.status).toBe(404);
     expect(await response.json()).toEqual({ error: 'App not installed on this repository' });
+    // The missing installation is reused too, and `/state` refuses the repository before it reaches a coordinator.
+    expect((await post()).status).toBe(404);
+    const state = await post({ path: '/state', body: { owner: OWNER, repo: REPO, pr: 7 } });
+    expect(state.status).toBe(404);
     expect(paths(requests)).toEqual([LOOKUP]);
+  });
+
+  it('looks the installation up again after GitHub failed to answer', async () => {
+    const requests = stubGitHub({ installation: { status: 502, body: { message: 'Bad gateway' } } });
+    const response = await post();
+    await expectFailure(response, 500, 'Installation lookup failed', 'installation lookup failed with 502');
+    expect((await post()).status).toBe(500);
+    expect(paths(requests)).toEqual([LOOKUP, LOOKUP]);
   });
 
   it.each([403, 422, 500, 502])('passes the status of a %i from the token mint through without its body', async (status) => {
@@ -344,7 +395,7 @@ describe('/token', () => {
   it('returns 500 when the App key cannot be read', async () => {
     const requests = stubGitHub();
     const response = await post({ env: { ...env, APP_PRIVATE_KEY: 'not a key' } });
-    await expectFailure(response, 500, 'Token generation failed', /\S/);
+    await expectFailure(response, 500, 'Installation lookup failed', /\S/);
     expect(apiRequests(requests)).toEqual([]);
   });
 });

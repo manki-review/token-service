@@ -1,5 +1,7 @@
 import { jwtVerify, createRemoteJWKSet } from 'jose';
-import { failure } from './log';
+import type { Env } from './env';
+import { getInstallation, type Installation } from './github';
+import { failure, log } from './log';
 
 const GITHUB_OIDC_ISSUER = 'https://token.actions.githubusercontent.com';
 
@@ -45,17 +47,22 @@ export async function verifyGitHubOIDC(token: string, expectedRepo: string): Pro
   return claims;
 }
 
-/** A workflow's request: its JSON body, which names the repository, and the verified claims of its OIDC token. */
+/**
+ * A workflow's request: its JSON body, which names the repository, the verified claims of its OIDC token and the App's
+ * installation on that repository.
+ */
 export interface WorkflowRequest {
   claims: OIDCClaims;
   body: Record<string, unknown> & { owner: string; repo: string };
+  installation: Installation;
 }
 
 /**
  * Reads a request that carries a GitHub Actions OIDC token as its bearer token and a JSON body naming `owner` and
- * `repo`. Returns the error response when the token is missing or not from a workflow in that repository.
+ * `repo`. Returns the error response when the token is missing or not from a workflow in that repository, when the
+ * token's account is over its rate limit, or when the App is not installed on the repository.
  */
-export async function verifyWorkflowRequest(request: Request): Promise<WorkflowRequest | Response> {
+export async function verifyWorkflowRequest(request: Request, env: Env): Promise<WorkflowRequest | Response> {
   const authHeader = request.headers.get('Authorization');
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return Response.json({ error: 'Authorization header with Bearer token required' }, { status: 401 });
@@ -72,9 +79,26 @@ export async function verifyWorkflowRequest(request: Request): Promise<WorkflowR
   }
   const body = { ...parsed, owner: parsed.owner, repo: parsed.repo };
 
+  let claims: OIDCClaims;
   try {
-    return { claims: await verifyGitHubOIDC(authHeader.slice(7), `${body.owner}/${body.repo}`), body };
+    claims = await verifyGitHubOIDC(authHeader.slice(7), `${body.owner}/${body.repo}`);
   } catch (error) {
     return failure(403, 'OIDC verification failed', { detail: String(error) });
   }
+
+  // Anyone can get a valid token for a repository of their own, so each account gets a share of the GitHub requests
+  // and Durable Object calls the service makes. The key is a verified claim, so no caller spends another's share.
+  if (!(await env.ACCOUNT_RATE_LIMIT.limit({ key: claims.repository_owner_id })).success) {
+    log('workflow_request_throttled', { repository: claims.repository, repository_owner_id: claims.repository_owner_id });
+    return Response.json({ error: 'Too many requests' }, { status: 429 });
+  }
+
+  let installation: Installation | null;
+  try {
+    installation = await getInstallation(env, body.owner, body.repo);
+  } catch (error) {
+    return failure(500, 'Installation lookup failed', { repository: claims.repository, detail: String(error) });
+  }
+  if (!installation) return Response.json({ error: 'App not installed on this repository' }, { status: 404 });
+  return { claims, body, installation };
 }

@@ -18,6 +18,12 @@ export default defineConfig({
         // Pinned so the value in `wrangler.toml` never changes the tests. A test that needs dispatch turns it on.
         DISPATCH_ENABLED: 'false',
       },
+      ratelimits: {
+        // Far above what the tests send, so the shared count of the test account never refuses a request.
+        ACCOUNT_RATE_LIMIT: { namespace_id: '1001', simple: { limit: 100_000, period: 60 } },
+        // What a test binds as `ACCOUNT_RATE_LIMIT` to see a refusal.
+        TIGHT_RATE_LIMIT: { namespace_id: '1002', simple: { limit: 3, period: 60 } },
+      },
     },
   })],
   test: {
