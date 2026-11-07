@@ -18,6 +18,20 @@ export const OWNER_ID = 7070;
 
 const OIDC_KID = 'test-oidc-key';
 
+/** The run id the OIDC tokens of `oidcToken` name unless a test gives another. */
+export const DISPATCHED_RUN_ID = 9000;
+
+/** Run `DISPATCHED_RUN_ID` as GitHub shows it: a dispatch by the App for PR 7. */
+export const DISPATCHED_RUN = {
+  id: DISPATCHED_RUN_ID,
+  event: 'workflow_dispatch',
+  display_title: 'Manki pull_request.synchronize on #7 (d-7)',
+  actor: { login: 'manki-review[bot]' },
+};
+
+/** The mint `/token` makes to read the requesting run, before any token it returns. */
+export const RUN_CHECK_MINT = { permissions: { actions: 'read' }, repository_ids: [REPOSITORY_ID] };
+
 export const oidcKeys = await generateKeyPair('RS256', { extractable: true });
 export const appKeys = await generateKeyPair('RS256', { extractable: true });
 export const appPrivateKeyPkcs8 = await exportPKCS8(appKeys.privateKey);
@@ -82,6 +96,10 @@ export async function oidcToken(options: OidcTokenOptions = {}): Promise<string>
     repository_owner: OWNER,
     repository_id: String(REPOSITORY_ID),
     repository_owner_id: String(OWNER_ID),
+    run_id: String(DISPATCHED_RUN_ID),
+    event_name: 'workflow_dispatch',
+    workflow_ref: `${OWNER}/${REPO}/.github/workflows/manki.yml@refs/heads/main`,
+    ref: 'refs/heads/main',
     ...options.claims,
   })
     .setProtectedHeader({ alg: 'RS256', kid: OIDC_KID })
@@ -109,6 +127,8 @@ export interface GitHubStub {
   accessToken?: StubReply;
   /** The reply to `GET /repositories/<id>`. */
   repository?: StubReply;
+  /** The reply to reading run `DISPATCHED_RUN_ID`. */
+  run?: StubReply;
   /**
    * Replies keyed by `<METHOD> <path>`, such as `POST /graphql`. They take precedence over the defaults. A function
    * runs in the caller's context, so it can read a request body sent from inside a Durable Object.
@@ -136,6 +156,7 @@ export function stubGitHub(stub: GitHubStub = {}): Request[] {
     if (/^\/repositories\/[0-9]+$/.test(url.pathname)) {
       return reply(stub.repository, { name: REPO, owner: { login: OWNER, id: OWNER_ID }, default_branch: 'main' });
     }
+    if (url.pathname === `/repos/${OWNER}/${REPO}/actions/runs/${DISPATCHED_RUN_ID}`) return reply(stub.run, DISPATCHED_RUN);
     if (url.pathname === `/repos/${OWNER}/${REPO}/installation`) {
       return reply(stub.installation, { id: INSTALLATION_ID, permissions: DEFAULT_INSTALLATION_PERMISSIONS });
     }
@@ -240,6 +261,23 @@ export async function workRows(stub: DurableObjectStub<PrCoordinator>): Promise<
 export async function tableNames(stub: DurableObjectStub): Promise<string[]> {
   return runInDurableObject(stub, (_instance, state) =>
     state.storage.sql.exec<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '\\_%' ESCAPE '\\'`).toArray().map((row) => row.name));
+}
+
+/**
+ * Returns an env whose PR coordinators answer `refuseRun` with `refusal`, null when they hold the run, and records each
+ * check as the coordinator name and arguments. Every other coordinator call goes nowhere, so only `/token` may use it.
+ */
+export function dispatchedEnv(refusal: string | null = null, base: Env = TEST_ENV): { env: Env; checks: unknown[][] } {
+  const checks: unknown[][] = [];
+  const coordinators = {
+    getByName: (name: string) => ({
+      refuseRun: async (...args: unknown[]) => {
+        checks.push([name, ...args]);
+        return refusal;
+      },
+    }),
+  };
+  return { env: { ...base, PR_COORDINATOR: coordinators as unknown as Env['PR_COORDINATOR'] }, checks };
 }
 
 /** Switches dispatch on or off for the Durable Objects, which read `DISPATCH_ENABLED` from the runtime env. */

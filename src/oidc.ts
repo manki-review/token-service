@@ -10,7 +10,11 @@ export interface OIDCClaims {
   repository_owner: string;
   repository_id: string;
   repository_owner_id: string;
-  run_id?: string;
+  run_id: string;
+  event_name: string;
+  /** `<owner>/<repo>/<path>@<ref>` of the workflow file the run started from. */
+  workflow_ref: string;
+  ref: string;
   check_run_id?: string;
   [key: string]: unknown;
 }
@@ -22,7 +26,7 @@ export async function verifyGitHubOIDC(token: string, expectedRepo: string): Pro
     issuer: GITHUB_OIDC_ISSUER,
     audience: 'manki-api.dustinface.me',
     algorithms: ['RS256'],
-    requiredClaims: ['exp', 'iat', 'repository', 'repository_id', 'repository_owner_id'],
+    requiredClaims: ['exp', 'iat', 'repository', 'repository_id', 'repository_owner_id', 'run_id', 'event_name', 'workflow_ref', 'ref'],
     maxTokenAge: '10m',
   });
 
@@ -31,7 +35,7 @@ export async function verifyGitHubOIDC(token: string, expectedRepo: string): Pro
   if (claims.repository !== expectedRepo) {
     throw new Error(`Repository mismatch: token is for ${claims.repository}, requested ${expectedRepo}`);
   }
-  for (const name of ['repository_id', 'repository_owner_id'] as const) {
+  for (const name of ['repository_id', 'repository_owner_id', 'run_id'] as const) {
     if (typeof claims[name] !== 'string' || !NUMERIC_ID.test(claims[name])) {
       throw new Error(`Invalid ${name} claim`);
     }

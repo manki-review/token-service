@@ -302,6 +302,25 @@ export class PrCoordinator extends DurableObject<Env> {
     if (delivery.bodyHash !== null) this.sql.exec('INSERT INTO deliveries (id, received_at) VALUES (?, ?)', `sha256:${delivery.bodyHash}`, now);
   }
 
+  /**
+   * Returns why run `runId` may not act for this PR, or null when it may: it must be the run of an item this coordinator
+   * dispatched and holds as dispatching or running, from that item's `workflow` on the default branch (`ref`). A run
+   * whose dispatch was answered without its id is matched by its `delivery` id and takes the run id.
+   */
+  async refuseRun(runId: number, delivery: string | null, workflow: string, ref: string): Promise<string | null> {
+    if (!this.hasState()) return 'no coordinator state';
+    this.ensureSchema();
+    const row = this.sql.exec<WorkRow>(
+      `SELECT * FROM work WHERE ${ACTIVE} AND (run_id = ? OR (run_id IS NULL AND delivery = ?)) ORDER BY id LIMIT 1`, runId, delivery ?? '',
+    ).toArray()[0];
+    if (!row) return `run ${runId} is not active on this PR`;
+    if (row.workflow !== workflow) return `run ${runId} is not of ${row.workflow}`;
+    const branch = this.getMeta<CachedOptIn>('opt_in')?.repository?.defaultBranch ?? this.target().defaultBranch;
+    if (ref !== `refs/heads/${branch}`) return `run ${runId} is not on ${branch}`;
+    if (row.run_id === null) this.sql.exec('UPDATE work SET run_id = ? WHERE id = ?', runId, row.id);
+    return null;
+  }
+
   /** Records a routed delivery and queues its work. A delivery whose id or body was seen before is refused. */
   async receive(delivery: Delivery, route: Extract<Route, { type: 'work' | 'close' }>): Promise<ReceiveResult> {
     // A close from before the PR's last reopen is a late redelivery, so it changes nothing. Both times are GitHub's. A
@@ -1163,7 +1182,7 @@ export class PrCoordinator extends DurableObject<Env> {
   private markRunning(item: WorkRow, runId: number | null, note: string): void {
     const now = Date.now();
     this.sql.exec(
-      `UPDATE work SET status = 'running', run_id = ?, dispatched_at = ?, check_at = ?, lease_until = NULL, errors = 0, note = ? WHERE id = ?`,
+      `UPDATE work SET status = 'running', run_id = COALESCE(?, run_id), dispatched_at = ?, check_at = ?, lease_until = NULL, errors = 0, note = ? WHERE id = ?`,
       runId, now, now + POLL_MS, note, item.id,
     );
     log('coordinator_dispatched', { ...this.logFields(), ...this.describe(this.row(item.id)!), run_id: runId, note });
