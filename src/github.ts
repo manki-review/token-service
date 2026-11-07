@@ -87,7 +87,7 @@ export type MintResult =
 
 /** The `token_minted` audit line of a minted token. `run_id` and `check_run_id` come from the requesting workflow's OIDC token. */
 export interface TokenAudit {
-  purpose: 'review' | 'memory' | 'coordinator' | 'reconciler' | 'run_check';
+  purpose: 'review' | 'memory' | 'coordinator' | 'reconciler' | 'run_check' | 'resolve';
   repository_id: number;
   repository: string;
   installation_id: number;
