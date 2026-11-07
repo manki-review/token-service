@@ -81,6 +81,19 @@ afterEach(() => {
   expect(log.mock.calls.flat().join('\n')).not.toContain('ghs_');
 });
 
+/**
+ * Checks that `response` names only `error` and a request id, and that the `request_failed` line under that id holds
+ * the details, with `detail` among them.
+ */
+async function expectFailure(response: Response, status: number, error: string, detail: string | RegExp): Promise<void> {
+  expect(response.status).toBe(status);
+  const body = await response.json() as { request_id: string };
+  expect(body).toEqual({ error, request_id: expect.stringMatching(/^[0-9a-f-]{36}$/) });
+  const [line] = logged(log, 'request_failed').filter((entry) => entry.request_id === body.request_id);
+  expect(line).toMatchObject({ status, error });
+  expect(line.detail).toMatch(detail);
+}
+
 const MEMORY_TOKEN = { token: 'ghs_memory', expires_at: '2026-11-05T13:30:00Z', permissions: { contents: 'write', metadata: 'read' } };
 
 /** Stubs GitHub so the review mint returns `ghs_test` and the mint for named repositories answers with `memory`. */
@@ -252,16 +265,14 @@ describe('/token', () => {
   ])('refuses %s', async (_case, options) => {
     const requests = stubGitHub();
     const response = await post({ token: await oidcToken(options) });
-    expect(response.status).toBe(403);
-    expect(((await response.json()) as { error: string }).error).toMatch(/^OIDC verification failed/);
+    await expectFailure(response, 403, 'OIDC verification failed', /\S/);
     expect(apiRequests(requests)).toEqual([]);
   });
 
   it('refuses a token for the repository when the body names another', async () => {
     const requests = stubGitHub();
     const response = await post({ body: { owner: OWNER, repo: 'other' } });
-    expect(response.status).toBe(403);
-    expect(((await response.json()) as { error: string }).error).toContain(`token is for ${OWNER}/${REPO}, requested ${OWNER}/other`);
+    await expectFailure(response, 403, 'OIDC verification failed', `token is for ${OWNER}/${REPO}, requested ${OWNER}/other`);
     expect(apiRequests(requests)).toEqual([]);
   });
 
@@ -323,19 +334,17 @@ describe('/token', () => {
     expect(paths(requests)).toEqual([LOOKUP]);
   });
 
-  it.each([403, 422, 500, 502])('passes a %i from the token mint through', async (status) => {
+  it.each([403, 422, 500, 502])('passes the status of a %i from the token mint through without its body', async (status) => {
     failMints(status);
     const response = await post();
-    expect(response.status).toBe(status);
-    expect(await response.json()).toEqual({ error: `GitHub API error: ${status}`, details: '{"message":"GitHub said no"}' });
+    await expectFailure(response, status, 'Token mint failed', '{"message":"GitHub said no"}');
     expect(handedOut()).toEqual([]);
   });
 
   it('returns 500 when the App key cannot be read', async () => {
     const requests = stubGitHub();
     const response = await post({ env: { ...env, APP_PRIVATE_KEY: 'not a key' } });
-    expect(response.status).toBe(500);
-    expect(((await response.json()) as { error: string }).error).toMatch(/^Token generation failed/);
+    await expectFailure(response, 500, 'Token generation failed', /\S/);
     expect(apiRequests(requests)).toEqual([]);
   });
 });

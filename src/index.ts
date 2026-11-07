@@ -2,7 +2,7 @@ import { createAppJWT } from './app-jwt';
 import type { Env } from './env';
 import { parseRunTitle } from './dispatch';
 import { createInstallationToken, getInstallation, githubApi, type Installation, isRefusal, logMintedToken, mintRepositoryToken, type TokenAudit } from './github';
-import { log } from './log';
+import { failure, log } from './log';
 import { BOT_LOGIN } from './manki';
 import { type OIDCClaims, verifyWorkflowRequest } from './oidc';
 import { cappedPermissions, MANKI_PERMISSION_CAPS, MEMORY_PERMISSION_CAPS, type Permissions } from './permissions';
@@ -147,11 +147,7 @@ export default {
       const tokenResponse = await createInstallationToken(appJwt, installation.id, permissions, { repository_ids: [repositoryId] });
 
       if (!tokenResponse.ok) {
-        const error = await tokenResponse.text();
-        return Response.json(
-          { error: `GitHub API error: ${tokenResponse.status}`, details: error },
-          { status: tokenResponse.status },
-        );
+        return failure(tokenResponse.status, 'Token mint failed', { detail: await tokenResponse.text() });
       }
 
       const tokenData = await tokenResponse.json() as MintedToken & { permissions: Permissions };
@@ -165,10 +161,7 @@ export default {
         ...(memory && { memory_token: memory.token, memory_expires_at: memory.expires_at }),
       });
     } catch (error) {
-      return Response.json(
-        { error: `Token generation failed: ${error}` },
-        { status: 500 },
-      );
+      return failure(500, 'Token generation failed', { detail: String(error) });
     }
   },
 };
