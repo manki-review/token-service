@@ -1,4 +1,5 @@
 import { jwtVerify, createRemoteJWKSet } from 'jose';
+import { readBody } from './body';
 import type { Env } from './env';
 import { getInstallation, type Installation } from './github';
 import { failure, log } from './log';
@@ -23,6 +24,8 @@ export interface OIDCClaims {
 }
 
 const NUMERIC_ID = /^[1-9][0-9]*$/;
+/** The largest body an OIDC endpoint reads, before it checks the token. */
+const MAX_REQUEST_BYTES = 1024 * 1024;
 
 export async function verifyGitHubOIDC(token: string, expectedRepo: string): Promise<OIDCClaims> {
   const { payload } = await jwtVerify(token, GITHUB_JWKS, {
@@ -47,6 +50,22 @@ export async function verifyGitHubOIDC(token: string, expectedRepo: string): Pro
   return claims;
 }
 
+/** `<owner>/<repo>/.github/workflows/<file>@<ref>`, the form of the `workflow_ref` claim. */
+const WORKFLOW_REF = /^([^/]+\/[^/]+)\/\.github\/workflows\/([^/@]+)@(refs\/heads\/.+)$/;
+
+/**
+ * Returns the workflow file and branch ref a `workflow_dispatch` run of the token's own repository started from, or why
+ * the claims show no such run. Only a dispatched Manki run may act for a repository.
+ */
+export function dispatchedWorkflow(claims: OIDCClaims): { file: string; ref: string } | string {
+  if (claims.event_name !== 'workflow_dispatch') return `event ${claims.event_name} is not workflow_dispatch`;
+  const workflow = WORKFLOW_REF.exec(claims.workflow_ref);
+  if (!workflow || workflow[1] !== claims.repository || workflow[3] !== claims.ref) {
+    return `workflow ${claims.workflow_ref} is not a branch workflow of ${claims.repository}`;
+  }
+  return { file: workflow[2], ref: workflow[3] };
+}
+
 /**
  * A workflow's request: its JSON body, which names the repository, the verified claims of its OIDC token and the App's
  * installation on that repository.
@@ -68,9 +87,11 @@ export async function verifyWorkflowRequest(request: Request, env: Env): Promise
     return Response.json({ error: 'Authorization header with Bearer token required' }, { status: 401 });
   }
 
+  const raw = await readBody(request, MAX_REQUEST_BYTES);
+  if (raw === null) return Response.json({ error: `The body is over ${MAX_REQUEST_BYTES} bytes` }, { status: 413 });
   let parsed: Record<string, unknown> | null;
   try {
-    parsed = await request.json();
+    parsed = JSON.parse(new TextDecoder().decode(raw));
   } catch {
     return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
   }

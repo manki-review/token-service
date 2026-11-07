@@ -1,3 +1,4 @@
+import { readBody } from './body';
 import { allowedAccounts, type Env } from './env';
 import { eventsPerHour } from './limiter';
 import { log } from './log';
@@ -29,31 +30,6 @@ function summarize(route: Route): Record<string, unknown> {
   }
 }
 
-/** Reads the body, refusing it once it passes `MAX_BODY_BYTES`. Returns null when it is too large. */
-async function readBody(request: Request): Promise<ArrayBuffer | null> {
-  if (!request.body) return new ArrayBuffer(0);
-  const reader = request.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    size += value.byteLength;
-    if (size > MAX_BODY_BYTES) {
-      await reader.cancel();
-      return null;
-    }
-    chunks.push(value);
-  }
-  const body = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) {
-    body.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return body.buffer;
-}
-
 /**
  * Verifies a GitHub App webhook delivery, logs its route and hands work, closes and run ends to the PR's
  * `PrCoordinator`.
@@ -70,7 +46,7 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
   // `Content-Length`, so the limit is also enforced while reading.
   const tooLarge = () => Response.json({ error: 'Payload too large' }, { status: 413 });
   if (Number(request.headers.get('Content-Length') ?? 0) > MAX_BODY_BYTES) return tooLarge();
-  const body = await readBody(request);
+  const body = await readBody(request, MAX_BODY_BYTES);
   if (body === null) return tooLarge();
   const signature = request.headers.get('X-Hub-Signature-256');
   // The previous secret stays valid while a rotation is under way, so no delivery fails in between.

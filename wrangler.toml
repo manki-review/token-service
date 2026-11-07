@@ -45,6 +45,7 @@ crons = ["*/5 * * * *"]
 DISPATCH_ENABLED = "true"
 # The manki-review organization and the xdustinface user.
 WEBHOOK_ACCOUNTS = "270828077,35775977"
+MEMORY_REPO = "manki-review/review-memory"
 
 [observability]
 enabled = true
