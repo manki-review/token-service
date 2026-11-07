@@ -7,6 +7,7 @@ import { BOT_LOGIN } from './manki';
 import { dispatchedWorkflow, type OIDCClaims, verifyWorkflowRequest } from './oidc';
 import { cappedPermissions, MANKI_PERMISSION_CAPS, type Permissions } from './permissions';
 import { RECONCILER_NAME } from './reconciler';
+import { handleMemory, type MemoryOperation } from './memory';
 import { handleState } from './state';
 import { handleWebhook } from './webhook';
 
@@ -67,6 +68,8 @@ export default {
     if (url.pathname === '/state' || url.pathname === '/state/report') {
       return handleState(request, env, url.pathname === '/state/report');
     }
+    const memory = url.pathname.match(/^\/memory\/(read|write|append)$/);
+    if (memory) return handleMemory(request, env, memory[1] as MemoryOperation);
     if (url.pathname !== '/token') {
       return Response.json({ error: 'Not found' }, { status: 404 });
     }

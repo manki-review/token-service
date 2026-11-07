@@ -21,6 +21,8 @@ export interface Env {
   INSTALLATION_EVENTS_PER_HOUR?: string;
   /** Caps the `/token` and `/state` requests of one account, keyed by its id. */
   ACCOUNT_RATE_LIMIT: RateLimit;
+  /** The central memory repository, `<owner>/<repo>`, which the memory endpoints read and write for each repository. */
+  MEMORY_REPO?: string;
   PR_COORDINATOR: DurableObjectNamespace<PrCoordinator>;
   INSTALLATION_LIMITER: DurableObjectNamespace<InstallationLimiter>;
   RECONCILER: DurableObjectNamespace<Reconciler>;
