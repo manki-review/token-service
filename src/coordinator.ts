@@ -4,8 +4,8 @@ import type { Env } from './env';
 import { githubApi, hasWriteAccess, isRateLimited, type MintResult, mintRepositoryToken } from './github';
 import { log } from './log';
 import {
-  type BaseConfig, BOT_LOGIN, type BoxChange, HELP_REPLY, matchSkipRule, parseConfig, REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes,
-  skipRulesOf,
+  type BaseConfig, BOT_LOGIN, type BoxChange, cancelledProgress, HELP_REPLY, isRunningProgress, MANKI_LOGINS, matchSkipRule, parseConfig,
+  REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes, skipRulesOf,
 } from './manki';
 import { type OptIn, readOptIn, type Repository } from './opt-in';
 import type { Permissions } from './permissions';
@@ -1063,7 +1063,77 @@ export class PrCoordinator extends DurableObject<Env> {
     if (!(await this.cancel(running, target, `cancelled by ${item.sender}`, false, ['skipped', 'cancelled']))) {
       throw new Error(`cancelling the run of work ${running.id} failed`);
     }
+    const ended = this.row(running.id);
+    if (ended?.status === 'skipped' && ended.conclusion === 'cancelled') {
+      // The run's own post step can no longer mint a token, so the Worker ends its progress comment and check instead.
+      const failed = (part: string) => (error: unknown) => {
+        log('coordinator_cancel_report_failed', { ...this.logFields(), work_id: running.id, part, error: error instanceof Error ? error.message : String(error) });
+      };
+      await this.markCommentCancelled(item, running, target).catch(failed('comment'));
+      await this.markCheckCancelled(item, running, target).catch(failed('check'));
+    }
     return `cancel of work ${running.id} requested`;
+  }
+
+  /**
+   * Marks the progress comment of the cancelled review as cancelled by the sender of `item`. The comment is the one whose
+   * Cancel box was ticked, or else Manki's newest progress comment of a review that has not ended. Without one, it does nothing.
+   */
+  private async markCommentCancelled(item: WorkRow, running: WorkRow, target: Target): Promise<void> {
+    const token = await this.token({ issues: 'write', pull_requests: 'write' });
+    if (token === null) return;
+    const comment = await this.runningProgress(token, item, running, target);
+    if (comment === null) {
+      log('coordinator_cancel_no_comment', { ...this.logFields(), work_id: running.id });
+      return;
+    }
+    const path = `/repos/${target.owner}/${target.repo}/issues/comments/${comment.id}`;
+    const response = await githubApi(token, path, { method: 'PATCH', body: { body: cancelledProgress(comment.body, item.sender) } });
+    if (!response.ok) throw new Error(`marking the progress comment cancelled failed with ${response.status}`);
+  }
+
+  /** Completes the in-progress `Manki` checks on the cancelled review's head as cancelled by the sender of `item`. */
+  private async markCheckCancelled(item: WorkRow, running: WorkRow, target: Target): Promise<void> {
+    const repo = `/repos/${target.owner}/${target.repo}`;
+    const checks = await this.token({ checks: 'write' });
+    if (checks === null) return;
+    let head = running.head_sha;
+    if (head === null) {
+      const pr = await githubApi(checks, `${repo}/pulls/${target.number}`);
+      if (!pr.ok) throw new Error(`reading the pull request failed with ${pr.status}`);
+      head = ((await pr.json()) as PullRequestRead).head.sha;
+    }
+    const list = await githubApi(checks, `${repo}/commits/${head}/check-runs?check_name=Manki&status=in_progress`);
+    if (!list.ok) throw new Error(`listing the Manki checks failed with ${list.status}`);
+    const { check_runs: runs } = await list.json() as { check_runs: Array<{ id: number }> };
+    for (const run of runs) {
+      const response = await githubApi(checks, `${repo}/check-runs/${run.id}`, {
+        method: 'PATCH',
+        body: { status: 'completed', conclusion: 'cancelled', output: { title: 'Review cancelled', summary: `Review cancelled by @${item.sender}.` } },
+      });
+      if (!response.ok) throw new Error(`completing the Manki check failed with ${response.status}`);
+    }
+  }
+
+  /** Returns the progress comment of the cancelled review, or null when Manki has none that is still running. */
+  private async runningProgress(token: string, item: WorkRow, running: WorkRow, target: Target): Promise<{ id: number; body: string } | null> {
+    const repo = `/repos/${target.owner}/${target.repo}`;
+    if (item.object_id !== null) {
+      const read = await githubApi(token, `${repo}/issues/comments/${item.object_id}`);
+      if (read.ok) {
+        const { body } = await read.json() as { body?: string };
+        if (body && isRunningProgress(body)) return { id: item.object_id, body };
+      } else if (read.status !== 404) {
+        throw new Error(`reading the settings comment failed with ${read.status}`);
+      }
+    }
+    // Only comments edited since the run started can belong to it. GitHub lists them oldest first.
+    const since = new Date((running.dispatched_at ?? Date.now()) - MINUTE).toISOString();
+    const list = await githubApi(token, `${repo}/issues/${target.number}/comments?since=${since}&per_page=100`);
+    if (!list.ok) throw new Error(`listing the PR comments failed with ${list.status}`);
+    const comments = await list.json() as Array<{ id: number; body?: string; user?: { login?: string } | null }>;
+    const newest = comments.reverse().find((c) => MANKI_LOGINS.includes(c.user?.login ?? '') && !!c.body && isRunningProgress(c.body));
+    return newest ? { id: newest.id, body: newest.body! } : null;
   }
 
   /** Puts back the boxes someone without write access changed: Pause as it applies, and every other box unticked. */

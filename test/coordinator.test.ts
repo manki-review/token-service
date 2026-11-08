@@ -708,8 +708,13 @@ function fakeGitHub(number: number) {
     /** Each login's permission on the repository. Anyone else reads as `read`. */
     permissions: {} as Record<string, string>,
     permissionReads: [] as string[],
-    /** Manki's comments by id, which a revert reads and edits. */
+    /** Manki's comments by id, which a revert reads and edits, the author of any comment not Manki's, and the status of a list. */
     issueComments: new Map<number, string>(),
+    commentAuthors: new Map<number, string>(),
+    commentListStatus: 200,
+    /** The in-progress `Manki` checks, and the edits made to checks. */
+    openChecks: [] as Array<{ id: number; head_sha: string }>,
+    checkEdits: [] as Array<{ id: number; body: Record<string, unknown> }>,
     /** The workflow files on the default branch, and the file each dispatch named. */
     workflows: { 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML } as Record<string, string>,
     dispatchedWorkflows: [] as string[],
@@ -795,6 +800,21 @@ function fakeGitHub(number: number) {
     }
     if (issueComment && request.method === 'PATCH') {
       state.issueComments.set(Number(issueComment[1]), ((await request.json()) as { body: string }).body);
+      return Response.json({});
+    }
+    if (route === `GET ${repo}/issues/${number}/comments`) {
+      if (state.commentListStatus !== 200) return Response.json({ message: 'no' }, { status: state.commentListStatus });
+      return Response.json([...state.issueComments].sort(([a], [b]) => a - b)
+        .map(([id, body]) => ({ id, body, user: { login: state.commentAuthors.get(id) ?? 'manki-review[bot]' } })));
+    }
+    const checksOf = url.pathname.match(new RegExp(`^${repo}/commits/([0-9a-f]+)/check-runs$`));
+    if (checksOf && request.method === 'GET' && url.searchParams.get('check_name') === 'Manki' && url.searchParams.get('status') === 'in_progress') {
+      return Response.json({ check_runs: state.openChecks.filter((check) => check.head_sha === checksOf[1]) });
+    }
+    const check = url.pathname.match(new RegExp(`^${repo}/check-runs/(\\d+)$`));
+    if (check && request.method === 'PATCH') {
+      state.checkEdits.push({ id: Number(check[1]), body: await request.json() as Record<string, unknown> });
+      state.openChecks = state.openChecks.filter((open) => open.id !== Number(check[1]));
       return Response.json({});
     }
     const reaction = url.pathname.match(new RegExp(`^${repo}/(issues|pulls)/comments/(\\d+)/reactions$`));
@@ -1572,6 +1592,19 @@ describe('PrCoordinator dispatch', () => {
     const boxes = (ticked: string[] = []) => ['Last reviewed `1111111` · head `1111111` · up to date', '',
       ...(['pause', 'full', 'deeper', 'cancel', 'draft', 'force'] as const).map((box) => `- [${ticked.includes(box) ? 'x' : ' '}] ${box} <!-- manki-box:${box} -->`),
       '<!-- manki-settings -->', '<!-- manki-bot -->'].join('\n');
+    /** A running review's progress comment as Manki writes it, with a hidden marker another writer appended. */
+    const progress = (ticked: string[] = []) => ['**Review in progress**', '', '**Planner**', '<!-- manki-bot -->', '', '---',
+      'Last reviewed `1111111` · head `1111111` · review running',
+      ...(['pause', 'cancel'] as const).map((box) => `- [${ticked.includes(box) ? 'x' : ' '}] ${box} <!-- manki-box:${box} -->`),
+      '<!-- manki-settings -->', '<!-- manki-answered:7 -->'].join('\n');
+    /** `progress` once `login` cancelled the review: the progress folded away and the block kept without its Cancel box. */
+    const cancelled = (login: string) => [`**Review cancelled by @${login}.**`, '', '<details><summary>Original progress</summary>', '',
+      '**Review in progress**', '', '**Planner**', '<!-- manki-bot -->', '', '</details>', '', '<!-- manki-review-cancelled -->', '', '---',
+      'Last reviewed `1111111` · head `1111111` · review cancelled', '- [ ] pause <!-- manki-box:pause -->',
+      '<!-- manki-settings -->', '<!-- manki-answered:7 -->'].join('\n');
+    const cancelledCheck = (id: number, login: string) => ({
+      id, body: { status: 'completed', conclusion: 'cancelled', output: { title: 'Review cancelled', summary: `Review cancelled by @${login}.` } },
+    });
     const setup = () => {
       const pr = pullRequest();
       const github = fakeGitHub(pr.number);
@@ -1581,11 +1614,11 @@ describe('PrCoordinator dispatch', () => {
         return (await postToken({ path: '/state', token, body: { owner: OWNER, repo: REPO, pr: pr.number } })).json() as Promise<Record<string, unknown>>;
       };
       /** Has `sender` change the boxes from `before` to `after`, and runs the alarm twice, so a review it queues starts. */
-      const edit = async (before: string[], after: string[], sender = 'alice', at = new Date().toISOString()) => {
-        const payload = issueCommentEvent(boxes(after), {
-          number: pr.number, action: 'edited', author: MANKI_AUTHOR, sender: { login: sender, type: 'User' }, previousBody: boxes(before),
+      const edit = async (before: string[], after: string[], sender = 'alice', at = new Date().toISOString(), render = boxes) => {
+        const payload = issueCommentEvent(render(after), {
+          number: pr.number, action: 'edited', author: MANKI_AUTHOR, sender: { login: sender, type: 'User' }, previousBody: render(before),
         });
-        github.issueComments.set(SETTINGS, boxes(after));
+        github.issueComments.set(SETTINGS, render(after));
         const result = await pr.send('issue_comment', { ...payload, comment: { ...payload.comment!, id: SETTINGS, updated_at: at } });
         await runDurableObjectAlarm(pr.stub);
         await runDurableObjectAlarm(pr.stub);
@@ -1659,22 +1692,30 @@ describe('PrCoordinator dispatch', () => {
       const { pr, github, state, edit } = setup();
       await pr.send('pull_request', pr.push(SHA_1));
       await runDurableObjectAlarm(pr.stub);
-      await edit([], ['cancel']);
+      github.openChecks = [{ id: 70, head_sha: SHA_1 }, { id: 71, head_sha: SHA_2 }];
+      await edit([], ['cancel'], 'alice', new Date().toISOString(), progress);
       expect(github.cancels).toEqual([9000]);
       expect((await workRows(pr.stub))[0]).toMatchObject({ status: 'skipped', conclusion: 'cancelled', note: 'cancelled by alice, cancel requested' });
       expect(await pr.stub.catchUpState(SHA_1)).toBe('handled');
       expect(await state()).toMatchObject({ active: [] });
-      // A cancel GitHub fails is tried again, so the tick is not lost.
+      // The run's post step cannot end its progress comment and check any more, so the Worker does.
+      expect(github.issueComments.get(SETTINGS)).toBe(cancelled('alice'));
+      expect(github.checkEdits).toEqual([cancelledCheck(70, 'alice')]);
+      // A cancel GitHub fails is tried again, so the tick is not lost. A review with no queued head finds its check on the PR's head.
       await pr.send('issue_comment', pr.comment('@manki review'));
       await runDurableObjectAlarm(pr.stub);
+      github.openChecks = [{ id: 72, head_sha: SHA_1 }];
       github.cancelStatuses = [500];
-      await edit([], ['cancel']);
+      await edit([], ['cancel'], 'alice', new Date().toISOString(), progress);
       expect(github.cancels).toEqual([9000, 9001]);
       expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'dispatching', errors: 1 });
+      expect(github.issueComments.get(SETTINGS)).toBe(progress(['cancel']));
       advanceClock(backoff(0));
       await runDurableObjectAlarm(pr.stub);
       expect(github.cancels).toEqual([9000, 9001, 9001]);
       expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'done', note: 'cancel of work 3 requested' });
+      expect(github.issueComments.get(SETTINGS)).toBe(cancelled('alice'));
+      expect(github.checkEdits.slice(1)).toEqual([cancelledCheck(72, 'alice')]);
 
       // A Cancel made before the running review started leaves it alone.
       await pr.send('issue_comment', pr.comment('@manki review again'));
@@ -1688,6 +1729,41 @@ describe('PrCoordinator dispatch', () => {
       await edit([], ['cancel']);
       expect(github.cancels).toEqual([9000, 9001, 9001]);
       expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'done', note: 'no review to cancel' });
+    });
+
+    it('falls back to Manki\'s newest running progress comment on a cancel, and skips the comment cleanly when there is none', async () => {
+      const { pr, github, edit } = setup();
+      await pr.send('pull_request', pr.push(SHA_1));
+      await runDurableObjectAlarm(pr.stub);
+      // The ticked comment is an ended review's, so the running review's comment is looked up. A look-alike from someone else is not Manki's.
+      github.issueComments.set(1400, progress());
+      github.issueComments.set(1401, progress());
+      github.commentAuthors.set(1401, 'mallory');
+      github.openChecks = [{ id: 70, head_sha: SHA_1 }];
+      await edit([], ['cancel']);
+      expect(github.issueComments.get(1400)).toBe(cancelled('alice'));
+      expect(github.issueComments.get(1401)).toBe(progress());
+      expect(github.issueComments.get(SETTINGS)).toBe(boxes(['cancel']));
+      expect(github.checkEdits).toEqual([cancelledCheck(70, 'alice')]);
+
+      // With no running progress comment, only the check is completed, and the cancel is not tried again.
+      await pr.send('issue_comment', pr.comment('@manki review'));
+      await runDurableObjectAlarm(pr.stub);
+      github.openChecks = [{ id: 71, head_sha: SHA_1 }];
+      await edit([], ['cancel']);
+      expect(github.issueComments.get(1401)).toBe(progress());
+      expect(github.checkEdits.slice(1)).toEqual([cancelledCheck(71, 'alice')]);
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'done', note: 'cancel of work 3 requested' });
+
+      // A comment list GitHub fails still completes the check, and the cancel stands.
+      await pr.send('issue_comment', pr.comment('@manki review again'));
+      await runDurableObjectAlarm(pr.stub);
+      github.openChecks = [{ id: 72, head_sha: SHA_1 }];
+      github.commentListStatus = 500;
+      await edit([], ['cancel']);
+      expect(github.cancels).toEqual([9000, 9001, 9002]);
+      expect(github.checkEdits.slice(2)).toEqual([cancelledCheck(72, 'alice')]);
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'done', note: 'cancel of work 5 requested' });
     });
 
     it('puts back the boxes as they apply after someone without write access changed them, looking them up once', async () => {
