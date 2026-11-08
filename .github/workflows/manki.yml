@@ -15,7 +15,7 @@ on:
 permissions:
   contents: read          # read repo files and diffs
   pull-requests: write    # post review comments and approvals
-  issues: write           # post progress comments and app warnings on PRs
+  issues: write           # post a note on the PR when the token service gives no token
   id-token: write         # OIDC token for GitHub App identity
   actions: read           # verify workflow run is legitimate
   checks: read            # read CI annotations as review evidence
@@ -29,6 +29,6 @@ jobs:
         with:
           node-version: '24'
       - name: Manki Review
-        uses: manki-review/manki@484752ad69f4170912fdfcc229651bc4645ec1d4  # v7.0.0
+        uses: manki-review/manki@235c3d3348be98d0b45adb5fc364a35a5f16b77b  # v7.1.1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

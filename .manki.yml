@@ -29,3 +29,6 @@ static_analysis:
   analyzers:
     secrets: true
     dependencies: true
+
+memory:
+  enabled: true
