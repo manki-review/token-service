@@ -204,6 +204,22 @@ describe('/webhook', () => {
     expect(await workRows(coordinator(REPOSITORY_ID, number))).toMatchObject(writer === null ? [] : [{ sender: editor?.login, writer, event: 'pull_request_review.edited' }]);
   });
 
+  it('fails the delivery of a box tick in Manki\'s review when the editor lookup fails, so it can be delivered again', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    stubGitHub({ api: { 'POST /graphql': { status: 502, body: { message: 'Bad gateway' } } } });
+    const box = '- [ ] Create an issue for this <!-- manki-box:issue:src/a.ts:3:Off-by-one -->';
+    const payload = {
+      ...reviewEvent('edited', { user: MANKI_AUTHOR, node_id: 'PRR_fail', body: box.replace('[ ]', '[x]') }, { number: 75 }),
+      sender: MANKI_AUTHOR,
+      changes: { body: { from: box } },
+    };
+
+    expect((await postWebhook({ event: 'pull_request_review', payload })).status).toBe(500);
+
+    expect(logged(log, 'webhook_editor_lookup_failed')).toHaveLength(1);
+    expect(await workRows(coordinator(REPOSITORY_ID, 75))).toEqual([]);
+  });
+
   it('looks up no owner, reuses an answer and its token, and reads a failed lookup as no write access', async () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const login = newLogin();

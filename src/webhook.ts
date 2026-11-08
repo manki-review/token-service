@@ -56,22 +56,17 @@ async function isWriter(env: Env, target: Target, login: string): Promise<boolea
 
 /**
  * Names the last editor of an edited review as the work's sender, since GitHub sends the review's author. Returns
- * `null` when the editor is unknown or a bot, such as Manki rewriting its own review.
+ * `null` when the editor is unknown or a bot, such as Manki rewriting its own review. Throws when the lookup fails.
  */
 async function editedWork(env: Env, target: Target, work: Work): Promise<Work | null> {
   if (!work.editorOf) return work;
-  try {
-    const { node } = await githubGraphql<{ node: { editor: { login: string; __typename: string } | null } | null }>(
-      await lookupToken(env, target),
-      'query($id: ID!) { node(id: $id) { ... on PullRequestReview { editor { login __typename } } } }',
-      { id: work.editorOf },
-    );
-    const editor = node?.editor;
-    return editor && editor.__typename !== 'Bot' ? { ...work, sender: editor.login } : null;
-  } catch (error) {
-    log('webhook_editor_lookup_failed', { repository_id: target.repositoryId, error: String(error) });
-    return null;
-  }
+  const { node } = await githubGraphql<{ node: { editor: { login: string; __typename: string } | null } | null }>(
+    await lookupToken(env, target),
+    'query($id: ID!) { node(id: $id) { ... on PullRequestReview { editor { login __typename } } } }',
+    { id: work.editorOf },
+  );
+  const editor = node?.editor;
+  return editor && editor.__typename !== 'Bot' ? { ...work, sender: editor.login } : null;
 }
 
 /** Settles `writer` with a lookup when the payload cannot. A writer is a repository user, so the work is trusted too. */
@@ -153,7 +148,14 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
     ? { type: 'ignore', reason: `account ${routed.target.ownerId} is not in WEBHOOK_ACCOUNTS` }
     : routed;
   if (route.type === 'work') {
-    const edited = await editedWork(env, route.target, route.work);
+    let edited: Work | null;
+    try {
+      edited = await editedWork(env, route.target, route.work);
+    } catch (error) {
+      // The tick would be lost, so the delivery fails and can be delivered again, as for a coordinator failure.
+      log('webhook_editor_lookup_failed', { delivery, repository_id: route.target.repositoryId, error: String(error) });
+      return Response.json({ error: 'Could not read the review\'s editor' }, { status: 500 });
+    }
     route = edited ? { ...route, work: await checkedWork(env, route.target, edited) } : { type: 'ignore', reason: 'the review\'s editor is unknown or a bot' };
   }
   // One installation may store only so many deliveries from people without write access an hour, so a flood from it
