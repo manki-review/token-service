@@ -161,6 +161,21 @@ export function changedBoxes(before: string, after: string): BoxChange[] {
     .map(([box, ticked]) => ({ box, ticked }));
 }
 
+// A finding's issue box: a task list line that ends with the finding's id.
+const ISSUE_BOX_LINE = /^[ \t]*[-*] \[([ xX])\] .*<!-- manki-box:issue:(.+?) -->[ \t]*$/gm;
+
+function issueBoxStates(body: string): Map<string, boolean> {
+  const states = new Map<string, boolean>();
+  for (const match of body.matchAll(ISSUE_BOX_LINE)) states.set(match[2], match[1] !== ' ');
+  return states;
+}
+
+/** Returns the ids of the issue boxes that are ticked in `after` and were unticked in `before`. */
+export function tickedIssueBoxes(before: string, after: string): string[] {
+  const old = issueBoxStates(before);
+  return [...issueBoxStates(after)].filter(([id, ticked]) => ticked && old.get(id) === false).map(([id]) => id);
+}
+
 /** Returns `body` with each box in `changes` set to its `ticked`. */
 export function setBoxes(body: string, changes: BoxChange[]): string {
   const wanted = new Map(changes.map(({ box, ticked }) => [box, ticked]));

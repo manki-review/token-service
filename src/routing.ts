@@ -11,6 +11,7 @@ import {
   parseCommandType,
   type ReviewMode,
   SETTINGS_MARKER,
+  tickedIssueBoxes,
 } from './manki';
 
 /** A comment event older than this when it arrives, such as a late redelivery, is dropped. */
@@ -315,8 +316,16 @@ function routeReviewThread(target: Target, payload: WebhookPayload): Route {
 
 function routeReviewComment(target: Target, payload: WebhookPayload): Route {
   const { action, comment } = payload;
-  if (action !== 'created') return ignore(`pull_request_review_comment action ${action}`);
   const body = comment?.body ?? '';
+  // A tick of a finding's issue box in Manki's comment. The editor is looked up, so a writer's tick is trusted work.
+  if (action === 'edited' && MANKI_LOGINS.includes(comment?.user?.login ?? '')) {
+    const before = payload.changes?.body?.from;
+    if (before === undefined || tickedIssueBoxes(before, body).length === 0) return ignore('no issue box ticked');
+    return { type: 'work', target, work: {
+      ...work('state', 'thread', payload, 'pull_request_review_comment', comment?.id ?? null), acknowledge: false, writer: false, checkWriter: true,
+    } };
+  }
+  if (action !== 'created') return ignore(`pull_request_review_comment action ${action}`);
   if (comment?.user?.type === 'Bot' || body.includes(MANKI_COMMENT_MARKER)) return ignore('comment is from a bot');
   if (!comment?.in_reply_to_id && !hasBotMention(body)) return ignore('comment is neither a reply nor a mention');
   if (parseCommandType(body) === 'help') return helpRoute(target, payload, 'pull_request_review_comment');

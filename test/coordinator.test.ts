@@ -1441,6 +1441,13 @@ describe('PrCoordinator dispatch', () => {
     await run('pull_request_review_comment', reviewCommentEvent('Fixed', { in_reply_to_id: 1, author_association: 'NONE' }, 'created', { number: pr.number }));
     await run('issue_comment', by('mallory', 'COLLABORATOR', '@manki explain more', 'edited', 'carol'));
     await run('pull_request_review', reviewEvent('submitted', { author_association: 'NONE' }, { number: pr.number }));
+    // Ticking the issue box in Manki's finding is an edit by someone else, so the editor is looked up too.
+    const finding = '- [ ] Create an issue for this <!-- manki-box:issue:src/a.ts:3:3:Off-by-one -->';
+    await run('pull_request_review_comment', {
+      ...reviewCommentEvent(finding.replace('[ ]', '[x]'), { user: MANKI_AUTHOR }, 'edited', { number: pr.number }),
+      sender: { login: 'mallory', type: 'User' },
+      changes: { body: { from: finding } },
+    });
     expect(github.dispatches).toEqual([]);
     expect(github.comments).toEqual([]);
     expect((await workRows(pr.stub)).map((row) => [row.kind, row.status, row.note])).toEqual([
@@ -1449,6 +1456,7 @@ describe('PrCoordinator dispatch', () => {
       ['thread', 'skipped', 'commenter has no write access'],
       ['comment', 'skipped', 'commenter has no write access'],
       ['review_state', 'skipped', 'commenter has no write access'],
+      ['thread', 'skipped', 'commenter has no write access'],
     ]);
 
     // An org member GitHub shows as a contributor has write access by the lookup. A collaborator needs no lookup.
@@ -1456,6 +1464,15 @@ describe('PrCoordinator dispatch', () => {
     await pr.stub.runCompleted(key('d-bob'), 9000, 'success');
     await run('issue_comment', by('dave', 'COLLABORATOR', '@manki explain again'));
     expect(github.dispatches).toHaveLength(2);
+    // A writer's tick of the issue box is dispatched as the edit of Manki's comment.
+    await run('pull_request_review_comment', {
+      ...reviewCommentEvent(finding.replace('[ ]', '[x]'), { user: MANKI_AUTHOR }, 'edited', { number: pr.number }),
+      sender: { login: 'bob', type: 'User' },
+      changes: { body: { from: finding } },
+    });
+    expect(github.dispatches.map((dispatch) => [dispatch.inputs.event, dispatch.inputs.action])).toEqual([
+      ['issue_comment', 'created'], ['issue_comment', 'created'], ['pull_request_review_comment', 'edited'],
+    ]);
     // Each login is looked up once and reused for a few minutes.
     expect(github.permissionReads).toEqual(['alice', 'mallory', 'bob']);
     expect(github.mints).toContainEqual({ permissions: { metadata: 'read' }, repository_ids: [REPOSITORY_ID] });
