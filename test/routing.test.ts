@@ -253,8 +253,8 @@ describe('routeDelivery', () => {
     ['an outsider\'s review', 'pull_request_review', reviewEvent('submitted', { author_association: 'NONE' }), false, true],
     ['a dismissed review', 'pull_request_review', reviewEvent('dismissed', { author_association: 'NONE' }), true, false],
     ['a push', 'pull_request', pullRequestEvent('synchronize'), true, false],
-    // The coordinator looks up the editor of Manki's comment, as for a settings edit.
-    ['a tick in Manki\'s finding', 'pull_request_review_comment', findingEdit(TICKED_FINDING, FINDING_COMMENT), false, false],
+    // The editor of Manki's comment is looked up, so a writer's tick counts as trusted work.
+    ['a tick in Manki\'s finding', 'pull_request_review_comment', findingEdit(TICKED_FINDING, FINDING_COMMENT), false, true],
   ])('marks %s as a writer or not, and whether to look the sender up', (_case, event, payload, writer, checkWriter) => {
     const route = routeDelivery(event, payload);
     expect(route.type === 'work' && { writer: route.work.writer, checkWriter: route.work.checkWriter }).toEqual({ writer, checkWriter });

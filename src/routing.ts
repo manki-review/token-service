@@ -317,11 +317,13 @@ function routeReviewThread(target: Target, payload: WebhookPayload): Route {
 function routeReviewComment(target: Target, payload: WebhookPayload): Route {
   const { action, comment } = payload;
   const body = comment?.body ?? '';
-  // A tick of a finding's issue box in Manki's comment. Editing it takes write access, which the coordinator checks for the editor.
+  // A tick of a finding's issue box in Manki's comment. The editor is looked up, so a writer's tick is trusted work.
   if (action === 'edited' && MANKI_LOGINS.includes(comment?.user?.login ?? '')) {
     const before = payload.changes?.body?.from;
     if (before === undefined || tickedIssueBoxes(before, body).length === 0) return ignore('no issue box ticked');
-    return { type: 'work', target, work: { ...work('state', 'thread', payload, 'pull_request_review_comment', comment?.id ?? null), acknowledge: false } };
+    return { type: 'work', target, work: {
+      ...work('state', 'thread', payload, 'pull_request_review_comment', comment?.id ?? null), acknowledge: false, writer: false, checkWriter: true,
+    } };
   }
   if (action !== 'created') return ignore(`pull_request_review_comment action ${action}`);
   if (comment?.user?.type === 'Bot' || body.includes(MANKI_COMMENT_MARKER)) return ignore('comment is from a bot');

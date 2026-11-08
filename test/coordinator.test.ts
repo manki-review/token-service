@@ -1464,6 +1464,15 @@ describe('PrCoordinator dispatch', () => {
     await pr.stub.runCompleted(key('d-bob'), 9000, 'success');
     await run('issue_comment', by('dave', 'COLLABORATOR', '@manki explain again'));
     expect(github.dispatches).toHaveLength(2);
+    // A writer's tick of the issue box is dispatched as the edit of Manki's comment.
+    await run('pull_request_review_comment', {
+      ...reviewCommentEvent(finding.replace('[ ]', '[x]'), { user: MANKI_AUTHOR }, 'edited', { number: pr.number }),
+      sender: { login: 'bob', type: 'User' },
+      changes: { body: { from: finding } },
+    });
+    expect(github.dispatches.map((dispatch) => [dispatch.inputs.event, dispatch.inputs.action])).toEqual([
+      ['issue_comment', 'created'], ['issue_comment', 'created'], ['pull_request_review_comment', 'edited'],
+    ]);
     // Each login is looked up once and reused for a few minutes.
     expect(github.permissionReads).toEqual(['alice', 'mallory', 'bob']);
     expect(github.mints).toContainEqual({ permissions: { metadata: 'read' }, repository_ids: [REPOSITORY_ID] });
