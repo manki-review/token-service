@@ -194,14 +194,16 @@ To rotate the webhook secret, put the current one into `WEBHOOK_SECRET_PREVIOUS`
 
 GitHub never holds the App key or the webhook secret. The Worker secrets above stay set by hand with `wrangler secret put`, and a deploy keeps them.
 
-The owner sets this up once:
+The `production` environment is set up in the repository settings:
 
-1. In the Cloudflare dashboard, create an API token (My Profile, API Tokens, Create Token, Create Custom Token) with only these permissions:
-   - Account, Workers Scripts, Edit, with Account Resources set to the account that runs the Worker.
-   - Zone, Workers Routes, Edit, with Zone Resources set to the specific zone `dustinface.me`.
-2. In the repository settings on GitHub, open Environments and create `production`. Under Deployment protection rules, tick Required reviewers and add yourself. Leave Prevent self-review off, as you approve your own merges. Under Deployment branches and tags, allow only `main`.
-3. In `production`, add the token as the environment secret `CLOUDFLARE_API_TOKEN`, and the account ID (on the account's overview page in the dashboard) as the environment variable `CLOUDFLARE_ACCOUNT_ID`. Wrangler needs the account ID to deploy from CI.
-4. Remove `CLOUDFLARE_API_TOKEN` from `~/.zshenv`, and delete that token in the dashboard once nothing else uses it. For a manual deploy from a laptop, use `wrangler login` instead.
+- Required reviewers: the owner, with Prevent self-review off, since the owner approves their own merges.
+- Deployment branches and tags: only `main`.
+- Environment secret `CLOUDFLARE_API_TOKEN`: a Cloudflare API token with only these permissions:
+  - Account, Workers Scripts, Edit, with Account Resources set to the account that runs the Worker.
+  - Zone, Workers Routes, Edit, with Zone Resources set to the specific zone `dustinface.me`.
+- Environment variable `CLOUDFLARE_ACCOUNT_ID`: the account ID from the account's overview page in the dashboard. Wrangler needs it to deploy from CI.
+
+To rotate the token, create a new one with the same permissions (My Profile, API Tokens, Create Token, Create Custom Token), replace the secret in `production`, and delete the old token in the dashboard. For a manual deploy from a laptop, use `wrangler login` rather than a token in the shell environment.
 
 ## Development
 
