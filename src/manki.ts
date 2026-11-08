@@ -144,13 +144,14 @@ export function isRunningProgress(body: string): boolean {
 }
 
 /**
- * Returns the progress comment `body` marked as cancelled by `login`, as Manki's `markProgressCommentCancelled` writes
- * it: the original progress folded away, and the settings block kept with the status "review cancelled" and no Cancel box.
+ * Returns the progress comment `body` marked as cancelled with `headline`, such as "Review cancelled by @alice.", as
+ * Manki's `markProgressCommentCancelled` writes it: the original progress folded away, and the settings block kept with
+ * the status "review cancelled" and no Cancel box.
  */
-export function cancelledProgress(body: string, login: string): string {
+export function cancelledProgress(body: string, headline: string): string {
   const block = SETTINGS_BLOCK.exec(body);
   const progress = (block ? body.slice(0, block.index) : body).trim();
-  const text = [`**Review cancelled by @${login}.**`, '', '<details><summary>Original progress</summary>', '', progress, '', '</details>'].join('\n');
+  const text = [`**${headline}**`, '', '<details><summary>Original progress</summary>', '', progress, '', '</details>'].join('\n');
   const cancelled = `${text}\n\n${CANCELLED_MARKER}`;
   if (!block) return cancelled;
   const boxes = block[2].split('\n').filter((line) => line && !line.includes('<!-- manki-box:cancel -->'));
@@ -163,6 +164,21 @@ export type SettingsBox = 'pause' | 'again' | 'deeper' | 'cancel' | 'draft';
 export type ReviewMode = Extract<SettingsBox, 'again' | 'deeper' | 'draft'>;
 
 export const REVIEW_MODES: readonly ReviewMode[] = ['again', 'deeper', 'draft'];
+
+/** Returns the head commit the settings block of `body` names, as Manki writes it, or null without a block. */
+export function settingsHead(body: string): string | null {
+  return SETTINGS_BLOCK.exec(body)?.[1].match(/head `([0-9a-f]+)`/)?.[1] ?? null;
+}
+
+/** Returns `body` with the status of its settings block set to `status` and the boxes in `untick` cleared. */
+export function withSettingsStatus(body: string, status: string, untick: SettingsBox[]): string {
+  const block = SETTINGS_BLOCK.exec(body);
+  if (!block) return body;
+  const lines = body.slice(block.index).split('\n');
+  const at = lines.findIndex((line) => line.startsWith(block[1]));
+  lines[at] = `${block[1]}${status}`;
+  return setBoxes(body.slice(0, block.index) + lines.join('\n'), untick.map((box) => ({ box, ticked: false })));
+}
 
 /** A box whose tick changed in an edit. */
 export interface BoxChange {
