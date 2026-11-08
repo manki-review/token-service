@@ -1103,7 +1103,8 @@ export class PrCoordinator extends DurableObject<Env> {
       if (!pr.ok) throw new Error(`reading the pull request failed with ${pr.status}`);
       head = ((await pr.json()) as PullRequestRead).head.sha;
     }
-    const list = await githubApi(checks, `${repo}/commits/${head}/check-runs?check_name=Manki&status=in_progress`);
+    // Another app's check of the same name is not Manki's, and the App could not edit it.
+    const list = await githubApi(checks, `${repo}/commits/${head}/check-runs?check_name=Manki&status=in_progress&app_id=${this.env.APP_ID}`);
     if (!list.ok) throw new Error(`listing the Manki checks failed with ${list.status}`);
     const { check_runs: runs } = await list.json() as { check_runs: Array<{ id: number }> };
     for (const run of runs) {

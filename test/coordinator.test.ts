@@ -24,6 +24,7 @@ import { HELP_REPLY } from '../src/manki';
 import { routeDelivery, type Target, type WebhookPayload } from '../src/routing';
 import {
   apiRequests,
+  APP_ID,
   coordinator,
   freezeClock,
   type GitHubStub,
@@ -712,8 +713,8 @@ function fakeGitHub(number: number) {
     issueComments: new Map<number, string>(),
     commentAuthors: new Map<number, string>(),
     commentListStatus: 200,
-    /** The in-progress `Manki` checks, and the edits made to checks. */
-    openChecks: [] as Array<{ id: number; head_sha: string }>,
+    /** The in-progress `Manki` checks, which the App created unless they name another app, and the edits made to checks. */
+    openChecks: [] as Array<{ id: number; head_sha: string; app_id?: number }>,
     checkEdits: [] as Array<{ id: number; body: Record<string, unknown> }>,
     /** The workflow files on the default branch, and the file each dispatch named. */
     workflows: { 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML } as Record<string, string>,
@@ -809,7 +810,8 @@ function fakeGitHub(number: number) {
     }
     const checksOf = url.pathname.match(new RegExp(`^${repo}/commits/([0-9a-f]+)/check-runs$`));
     if (checksOf && request.method === 'GET' && url.searchParams.get('check_name') === 'Manki' && url.searchParams.get('status') === 'in_progress') {
-      return Response.json({ check_runs: state.openChecks.filter((check) => check.head_sha === checksOf[1]) });
+      const app = url.searchParams.get('app_id');
+      return Response.json({ check_runs: state.openChecks.filter((check) => check.head_sha === checksOf[1] && (app === null || String(check.app_id ?? APP_ID) === app)) });
     }
     const check = url.pathname.match(new RegExp(`^${repo}/check-runs/(\\d+)$`));
     if (check && request.method === 'PATCH') {
@@ -1692,7 +1694,8 @@ describe('PrCoordinator dispatch', () => {
       const { pr, github, state, edit } = setup();
       await pr.send('pull_request', pr.push(SHA_1));
       await runDurableObjectAlarm(pr.stub);
-      github.openChecks = [{ id: 70, head_sha: SHA_1 }, { id: 71, head_sha: SHA_2 }];
+      // Only the App's own check on the review's head is Manki's. Another app's check of the same name stays.
+      github.openChecks = [{ id: 69, head_sha: SHA_1, app_id: 15368 }, { id: 70, head_sha: SHA_1 }, { id: 71, head_sha: SHA_2 }];
       await edit([], ['cancel'], 'alice', new Date().toISOString(), progress);
       expect(github.cancels).toEqual([9000]);
       expect((await workRows(pr.stub))[0]).toMatchObject({ status: 'skipped', conclusion: 'cancelled', note: 'cancelled by alice, cancel requested' });
