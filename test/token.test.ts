@@ -27,7 +27,6 @@ import {
   RUNTIME_ENV,
   stubGitHub,
   TEST_ENV,
-  type StubReply,
 } from './helpers';
 
 /** The env whose coordinators hold the run each request's OIDC token names. */
@@ -97,23 +96,6 @@ async function expectFailure(response: Response, status: number, error: string, 
   const [line] = logged(log, 'request_failed').filter((entry) => entry.request_id === body.request_id);
   expect(line).toMatchObject({ status, error });
   expect(line.detail).toMatch(detail);
-}
-
-const MEMORY_TOKEN = { token: 'ghs_memory', expires_at: '2026-11-05T13:30:00Z', permissions: { contents: 'write', metadata: 'read' } };
-
-/** Stubs GitHub so the review mint returns `ghs_test` and the mint for named repositories answers with `memory`. */
-function stubMemoryMint(memory: StubReply = {}): Request[] {
-  return stubGitHub({
-    api: {
-      [MINT]: async (request) => {
-        const body = await request.json() as { repositories?: string[] };
-        if (!body.repositories) {
-          return Response.json({ token: 'ghs_test', expires_at: '2026-11-05T13:00:00Z', permissions: {} }, { status: 201 });
-        }
-        return Response.json(memory.body ?? MEMORY_TOKEN, { status: memory.status ?? 201 });
-      },
-    },
-  });
 }
 
 describe('/token', () => {
@@ -278,13 +260,6 @@ describe('/token', () => {
     expect(apiRequests(requests)).toEqual([]);
   });
 
-  it('rejects a body with a string memory flag without minting', async () => {
-    const requests = stubGitHub();
-    const response = await post({ body: { owner: OWNER, repo: REPO, memory: 'true' } });
-    expect(response.status).toBe(400);
-    expect(paths(requests)).toEqual([LOOKUP]);
-  });
-
   it.each([
     ['a token signed by another key', { key: otherKeys.privateKey }],
     ['a token from another issuer', { issuer: 'https://example.com' }],
@@ -357,7 +332,7 @@ describe('/token', () => {
     stubGitHub();
     const { env: refusing, checks } = dispatchedEnv('run 9000 is not of manki.yml');
     const token = await oidcToken({ claims: { workflow_ref: `${OWNER}/${REPO}/.github/workflows/deploy.yml@refs/heads/main` } });
-    const response = await postToken({ env: refusing, token, body: { owner: OWNER, repo: REPO, memory: true } });
+    const response = await postToken({ env: refusing, token, body: { owner: OWNER, repo: REPO } });
     expect({ status: response.status, body: await response.json() }).toEqual({
       status: 403, body: { error: 'Only the run Manki dispatched gets a token: run 9000 is not of manki.yml' },
     });
@@ -400,62 +375,13 @@ describe('/token', () => {
   });
 });
 
-describe('/token memory token', () => {
-  it('mints no memory token unless the request asks for one', async () => {
-    const requests = stubMemoryMint();
-    const response = await post();
-    expect(response.status).toBe(200);
-    const body = await response.json() as Record<string, unknown>;
-    expect(body).not.toHaveProperty('memory_token');
-    expect(body).not.toHaveProperty('memory_expires_at');
-    expect(paths(requests)).toEqual(CHECKED);
-  });
-
-  it('returns a memory token next to the review token', async () => {
-    const requests = stubMemoryMint();
-    const token = await oidcToken({ claims: { check_run_id: '9002' } });
-    const response = await post({ token, body: { owner: OWNER, repo: REPO, memory: true } });
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({
-      token: 'ghs_test',
-      expires_at: '2026-11-05T13:00:00Z',
-      permissions: {},
-      memory_token: 'ghs_memory',
-      memory_expires_at: '2026-11-05T13:30:00Z',
-    });
-    expect(paths(requests)).toEqual([...CHECKED, MINT]);
-    const run = { run_id: String(DISPATCHED_RUN_ID), check_run_id: '9002' };
-    expect(handedOut()).toEqual([
-      { ...REVIEW_AUDIT, ...run, permissions: {} },
-      { ...REVIEW_AUDIT, ...run, purpose: 'memory', permissions: MEMORY_TOKEN.permissions },
-    ]);
-  });
-
-  it.each([403, 404, 422, 500])('returns the review token without a memory token when GitHub answers the memory mint with %i', async (status) => {
-    stubMemoryMint({ status, body: { message: 'There is at least one repository that does not exist or is not accessible' } });
+describe('/token memory', () => {
+  it('mints no memory token, even when the body asks for one', async () => {
+    const requests = stubGitHub();
     const response = await post({ body: { owner: OWNER, repo: REPO, memory: true } });
     expect(response.status).toBe(200);
+    expect(Object.keys(await response.json() as object).sort()).toEqual(['expires_at', 'permissions', 'token']);
+    expect(paths(requests)).toEqual(CHECKED);
     expect(handedOut().map((line) => line.purpose)).toEqual(['review']);
-    const body = await response.json() as Record<string, unknown>;
-    expect(body.token).toBe('ghs_test');
-    expect(body).not.toHaveProperty('memory_token');
-    expect(body).not.toHaveProperty('memory_expires_at');
-  });
-
-  it('skips the memory mint when the installation grants no contents', async () => {
-    const requests = stubGitHub({
-      installation: { body: { id: INSTALLATION_ID, permissions: { issues: 'write', metadata: 'read', pull_requests: 'write' } } },
-    });
-    const response = await post({ body: { owner: OWNER, repo: REPO, memory: true } });
-    expect(response.status).toBe(200);
-    expect(await response.json()).not.toHaveProperty('memory_token');
-    expect(paths(requests)).toEqual(CHECKED);
-  });
-
-  it('mints no memory token when the review mint fails', async () => {
-    const requests = failMints(422);
-    const response = await post({ body: { owner: OWNER, repo: REPO, memory: true } });
-    expect(response.status).toBe(422);
-    expect(paths(requests)).toEqual(CHECKED);
   });
 });

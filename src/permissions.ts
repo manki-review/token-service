@@ -17,9 +17,6 @@ export const MANKI_PERMISSION_CAPS: PermissionCaps = {
   security_events: 'read',
 };
 
-// The memory token writes `review-memory` and nothing else.
-export const MEMORY_PERMISSION_CAPS: PermissionCaps = { contents: 'write' };
-
 const LEVEL_RANK: Record<string, number> = { read: 1, write: 2, admin: 3 };
 
 /**

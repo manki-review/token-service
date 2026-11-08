@@ -1,4 +1,5 @@
 import { jwtVerify, createRemoteJWKSet } from 'jose';
+import { readBody } from './body';
 import type { Env } from './env';
 import { getInstallation, type Installation } from './github';
 import { failure, log } from './log';
@@ -18,11 +19,15 @@ export interface OIDCClaims {
   /** `<owner>/<repo>/<path>@<ref>` of the workflow file the run started from. */
   workflow_ref: string;
   ref: string;
+  /** `public`, `private` or `internal`. */
+  repository_visibility?: string;
   check_run_id?: string;
   [key: string]: unknown;
 }
 
 const NUMERIC_ID = /^[1-9][0-9]*$/;
+/** The largest body an OIDC endpoint reads, before it checks the token. */
+const MAX_REQUEST_BYTES = 1024 * 1024;
 
 export async function verifyGitHubOIDC(token: string, expectedRepo: string): Promise<OIDCClaims> {
   const { payload } = await jwtVerify(token, GITHUB_JWKS, {
@@ -68,9 +73,11 @@ export async function verifyWorkflowRequest(request: Request, env: Env): Promise
     return Response.json({ error: 'Authorization header with Bearer token required' }, { status: 401 });
   }
 
+  const raw = await readBody(request, MAX_REQUEST_BYTES);
+  if (raw === null) return Response.json({ error: `The body is over ${MAX_REQUEST_BYTES} bytes` }, { status: 413 });
   let parsed: Record<string, unknown> | null;
   try {
-    parsed = await request.json();
+    parsed = JSON.parse(new TextDecoder().decode(raw));
   } catch {
     return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
   }

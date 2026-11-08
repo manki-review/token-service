@@ -7,18 +7,12 @@ Workflows authenticate via [GitHub's OIDC provider](https://docs.github.com/en/a
 ## How it works
 
 1. A GitHub Actions workflow requests an OIDC token with audience `manki-api.dustinface.me`
-2. The workflow POSTs to `https://manki-api.dustinface.me/token` with the OIDC token as a Bearer token and `{ owner, repo }` in the body, plus `memory: true` to also get a memory token
+2. The workflow POSTs to `https://manki-api.dustinface.me/token` with the OIDC token as a Bearer token and `{ owner, repo }` in the body
 3. The service verifies the OIDC token against GitHub's JWKS, checks that the repository claim matches, and refuses a token issued more than 10 minutes ago
 4. It answers `429` once the token's account (the `repository_owner_id` claim) has made 120 `/token` and `/state` requests in a minute, counted together per Cloudflare location by the `ACCOUNT_RATE_LIMIT` binding. Then it looks up the App's installation on the repository and answers `404` when there is none. A lookup, found or not, is reused for a minute, so repeated calls for one repository cost no GitHub request. A failed lookup is not reused and answers `500`
 5. Only the run a PR coordinator dispatched gets a token. The OIDC token must carry `event_name`, `workflow_ref`, `ref` and `run_id`. `event_name` must be `workflow_dispatch`, and `workflow_ref` must name a workflow file of the same repository on the run's branch `ref`. The service reads the run with an `actions: read` token (logged as `run_check`) and requires a `workflow_dispatch` run started by `manki-review[bot]` whose title names the PR. That PR's coordinator must hold the run as dispatching or running, from the workflow file it dispatched, on the default branch. A dispatch answered without its run id is matched by the delivery id in the run title, and the coordinator takes the run id. Anything else gets `403` and a `token_refused` log line with the reason, so no other workflow of an allowed repository, such as a branch workflow or a `pull_request` workflow, gets a review or memory token.
 6. It creates a GitHub App JWT and requests an installation token for the requesting repository only (`repository_ids` from the OIDC `repository_id` claim). The token holds only the permissions Manki uses (see `src/permissions.ts`), each at no more than the installation grants. `actions` never goes above `read`. `contents` is capped at `write`, because GitHub requires it to resolve review threads. `checks` is capped at `write`, so a review in webhook mode can show a `Manki` check on the PR. An App or installation that grants only `checks: read` gets `read`. Like every other permission, both cover only the requesting repository.
 7. The installation token, its expiry and the permissions GitHub reports for it are returned to the workflow
-
-### Memory token
-
-With `memory: true`, the service mints a second token that holds only `contents: write` on the `review-memory` repository of the same installation account, and returns it as `memory_token` with `memory_expires_at`. Manki reads and writes review memory with it. When `review-memory` is not part of the installation, or the installation grants no `contents`, GitHub refuses the mint and the response has no memory token. The review token is returned either way.
-
-The repository name is fixed. A memory repo with any other name (`memory.repo` in `.manki.yml`) cannot get a token from this service and needs Manki's `memory_repo_token` input.
 
 ### Audit log
 
@@ -26,8 +20,8 @@ Every minted token logs one JSON line with `msg: token_minted`, never the token 
 
 | Field | Value |
 |---|---|
-| `purpose` | `review` or `memory` for `/token`, `resolve` for `/resolve`, `coordinator`, `reconciler` or `writer_check` for the Worker's own calls |
-| `repository_id`, `repository` | The repository the token is for. For a `memory` token, the requesting workflow's repository, while the token covers `review-memory` |
+| `purpose` | `review` for `/token`, `run_check` for the run check of `/token` and `/resolve`, `resolve` for `/resolve`, `memory` for the memory endpoints, `coordinator`, `reconciler` or `writer_check` for the Worker's own calls |
+| `repository_id`, `repository` | The repository the token is for. For a `memory` token, the requesting workflow's repository, while the token covers the central memory repository and never leaves the Worker |
 | `installation_id` | The App installation the token comes from |
 | `permissions` | The permissions GitHub reports for the token |
 | `run_id`, `check_run_id` | The requesting workflow's OIDC claims, where present. `/token` mints only |
@@ -96,6 +90,44 @@ The thread must be on that PR of the token's repository, and its first comment m
 
 - `200 { resolved }`, the thread's state after the change. Each change logs one `thread_resolved` line with the repository, run id, PR, thread id and `resolved`.
 - `400` for a malformed body, `401` without a bearer token, `403` for a token or workflow that is not the dispatched run (with the reason, logged as `resolve_refused`) or an installation that grants no `contents: write`, `404` for a thread that is not Manki's on the run's PR (logged as `resolve_refused`) or a repository without the App, `429` over the account's rate limit, and `500` with a `request_id` for any GitHub failure.
+
+## Memory
+
+Review memory lives in one central repository, `MEMORY_REPO` in `wrangler.toml` (`manki-review/review-memory`). The Worker reads and writes it for each repository's dispatched Manki run. No memory token leaves the Worker: it mints its own `contents: write` token for that repository alone, from the installation it finds with `GET /repos/<memory repo>/installation`, logged as `memory`.
+
+**Folders.** A repository's memory is the folder `<owner>/<repo>/`, from the OIDC `repository` claim in lower case, never from the body. A login never holds `_`, so no repository's folder can be inside `_global/`. A renamed repository keeps its memory only once its folder is moved.
+
+**Identity.** Every endpoint takes the run's OIDC token as the bearer token and a JSON body with `owner`, `repo` and `pr`, the PR or issue number of the run. The token must be for that repository, from `workflow_dispatch`, from a workflow file of the repository on a branch, as for `/token`. The coordinator of `pr` must hold the token's `run_id` as dispatching or running, from that workflow file, on the default branch. Otherwise the answer is `403` with `Only the run Manki dispatched may use memory: <reason>` and a `memory_refused` log line, before the Worker touches the memory repository.
+
+**Public repositories only.** Central memory is shared, so a private repository never uses it. A token whose `repository_visibility` claim is not `public`, such as `private`, `internal` or a missing claim, gets `403` with `Only a public repository may use memory: repository visibility is <visibility>` and a `memory_refused` log line. This check comes before the dispatched-run check.
+
+**`POST /memory/read`** with `{ owner, repo, pr }` returns `200`:
+
+```json
+{
+  "repo": { "learnings.yml": { "text": "...", "sha": "<blob sha>" }, "suppressions.yml": null, "patterns.yml": null },
+  "global": { "learnings.yml": null, "conventions.md": { "text": "...", "sha": "<blob sha>" } }
+}
+```
+
+Each file is its raw text with its blob sha, or `null` when it does not exist. `repo` holds the files of the repository's folder and `global` those of `_global/`. Nothing else is read, so `metrics/fix-rate.jsonl` is never returned.
+
+**`POST /memory/write`** with `{ owner, repo, pr, file, content, sha, message }` replaces one file of the repository's own folder.
+
+- `file`: `learnings.yml`, `suppressions.yml` or `patterns.yml`. Anything else, such as a path or a file of `_global/`, gets `400`. No run writes `_global/`.
+- `content`: the whole new text, at most 512 KB, or `413`.
+- `sha`: the blob sha the run read the file at, or `null` for a file that does not exist yet. Anything else gets `400`.
+- `message`: the commit message, at most 200 characters after control characters become spaces. The Worker adds ` (<owner>/<repo> run <run id>)`. An empty one gets `400`.
+- Returns `200` with `{ sha }`, the file's new blob sha. When the file changed since the run read it, or the run sent `null` for a file that exists, it returns `409` with `{ "error": "the file changed since it was read" }`: read again, apply the edit to the new text, and write again.
+
+**`POST /memory/append`** with `{ owner, repo, pr, file, lines, message }` appends lines to a file of the repository's own folder, creating it when missing.
+
+- `file`: `metrics/fix-rate.jsonl`. Anything else gets `400`.
+- `lines`: 1 to 10 strings, each one JSON object of at most 16 KB with no line break. The Worker writes each on its own line. Anything else gets `400`.
+- `message`: as for a write.
+- The Worker reads the file and writes it back itself, trying 3 times when another run appended meanwhile. Returns `200` with `{ sha }`, `409` when all 3 tries met a conflict, and `413` when the file would grow over 1,000,000 bytes, with a `memory_append_full` log line. Each append reads and writes the whole file, which has to fit the Free plan's CPU time, so a full file is moved aside by hand.
+
+Every endpoint answers `400` for a body without a positive integer `pr`, `413` for a body over 1 MiB (also without `Content-Length`, and for `/token` and `/state` too), `429` when the account is over its share of requests (`ACCOUNT_RATE_LIMIT`, shared with `/token` and `/state`), `404` when the App is not installed on the requesting repository, `503` when no memory repository is configured or the App is not installed on it, and `502` with `{ error, request_id }` when GitHub fails, including a write GitHub refuses for another reason than the sha. The details go to a `request_failed` log line under that request id. Redacting secrets is the caller's job: the Worker stores what it gets. Each write and append logs `memory_write` or `memory_append` with the repository, PR, run id and file.
 
 ## Reconciler
 
