@@ -130,6 +130,32 @@ export function matchSkipRule(rules: SkipRules, facts: SkipFacts): string | null
 
 /** Marks the progress comment that carries the settings boxes. */
 export const SETTINGS_MARKER = '<!-- manki-settings -->';
+/** Marks a progress comment whose review finished, and one whose run was cancelled, as Manki writes them. */
+export const REVIEW_COMPLETE_MARKER = '<!-- manki-review-complete -->';
+export const CANCELLED_MARKER = '<!-- manki-review-cancelled -->';
+
+// Manki's settings block: a rule, the status line, one line per box, the marker, and hidden markers others appended.
+const SETTINGS_BLOCK = /(?:^|\n+)---\n((?:Last reviewed `[0-9a-f]+`|Not reviewed yet) · head `[0-9a-f]+` · )[^\n]*\n((?:- \[[ xX]\] [^\n]*\n)*)<!-- manki-settings -->((?:\n<!-- [^\n]* -->)*)\s*$/;
+
+/** Whether `body` is Manki's progress comment of a review that has not ended. */
+export function isRunningProgress(body: string): boolean {
+  return body.includes('<!-- manki-bot -->') && /\*\*Review (?:started|in progress)\*\*/.test(body)
+    && !body.includes(REVIEW_COMPLETE_MARKER) && !body.includes(CANCELLED_MARKER);
+}
+
+/**
+ * Returns the progress comment `body` marked as cancelled by `login`, as Manki's `markProgressCommentCancelled` writes
+ * it: the original progress folded away, and the settings block kept with the status "review cancelled" and no Cancel box.
+ */
+export function cancelledProgress(body: string, login: string): string {
+  const block = SETTINGS_BLOCK.exec(body);
+  const progress = (block ? body.slice(0, block.index) : body).trim();
+  const text = [`**Review cancelled by @${login}.**`, '', '<details><summary>Original progress</summary>', '', progress, '', '</details>'].join('\n');
+  const cancelled = `${text}\n\n${CANCELLED_MARKER}`;
+  if (!block) return cancelled;
+  const boxes = block[2].split('\n').filter((line) => line && !line.includes('<!-- manki-box:cancel -->'));
+  return [`${cancelled}\n\n---`, `${block[1]}review cancelled`, ...boxes, `${SETTINGS_MARKER}${block[3]}`].join('\n');
+}
 
 export type SettingsBox = 'pause' | 'full' | 'deeper' | 'cancel' | 'draft' | 'force';
 
