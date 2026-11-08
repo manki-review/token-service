@@ -5,6 +5,7 @@ import {
   MIGRATIONS,
   DISPATCH_BACKOFF_MS,
   DISPATCHES_PER_HOUR,
+  CONFLICT_NOTE_MARKER,
   FINISHED_RETENTION_MS,
   IDLE_RETENTION_MS,
   OPT_IN_TTL_MS,
@@ -665,6 +666,11 @@ function fakeGitHub(number: number) {
     headRef: 'feature',
     headRepositoryId: REPOSITORY_ID,
     baseRef: 'main',
+    /** What GitHub says of the PR's mergeability on each read, the last value repeating. Null while it is not computed. */
+    mergeable: [true] as Array<boolean | null>,
+    mergeableState: 'clean',
+    /** The comments a PATCH finds deleted. */
+    deletedComments: new Set<number>(),
     /** The base branch's `.manki.yml`, or null when it has none. */
     config: null as string | null,
     configStatus: 200,
@@ -747,6 +753,9 @@ function fakeGitHub(number: number) {
         user: { login: state.author },
         head: { sha: state.head, ref: state.headRef, repo: { id: state.headRepositoryId } },
         base: { ref: state.baseRef },
+        html_url: `https://github.com/${OWNER}/${REPO}/pull/${number}`,
+        mergeable: state.mergeable.length > 1 ? state.mergeable.shift() : state.mergeable[0],
+        mergeable_state: state.mergeableState,
       });
     }
     if (route === `GET ${repo}/contents/.manki.yml`) {
@@ -781,6 +790,9 @@ function fakeGitHub(number: number) {
     }
     const issueComment = url.pathname.match(new RegExp(`^${repo}/issues/comments/(\\d+)$`));
     if (issueComment && request.method === 'GET') return Response.json({ body: state.issueComments.get(Number(issueComment[1])) });
+    if (issueComment && request.method === 'PATCH' && state.deletedComments.has(Number(issueComment[1]))) {
+      return Response.json({ message: 'Not Found' }, { status: 404 });
+    }
     if (issueComment && request.method === 'PATCH') {
       state.issueComments.set(Number(issueComment[1]), ((await request.json()) as { body: string }).body);
       return Response.json({});
@@ -1309,6 +1321,69 @@ describe('PrCoordinator dispatch', () => {
     expect(github.configReads).toHaveLength(3);
     expect(github.dispatches.at(-1)?.inputs).toMatchObject({ event: 'pull_request', head_sha: SHA_3 });
     expect((await workRows(pr.stub)).at(-1)).toMatchObject({ status: 'running' });
+  });
+
+  it('skips a review of a PR that conflicts with its base, with one note it replaces and a rebase check', async () => {
+    const pr = pullRequest();
+    const github = Object.assign(fakeGitHub(pr.number), { mergeable: [false] as Array<boolean | null>, mergeableState: 'dirty', baseRef: 'develop' });
+    const note = 'This PR conflicts with `develop`. Rebase it, and Manki reviews it then.';
+    await pr.send('pull_request', pr.push(SHA_1));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches).toEqual([]);
+    expect(github.comments).toEqual([`${note}\n\n${CONFLICT_NOTE_MARKER}`]);
+    expect(github.checkRuns).toEqual([{
+      name: 'Manki', head_sha: SHA_1, status: 'completed', conclusion: 'action_required',
+      details_url: `https://github.com/${OWNER}/${REPO}/pull/${pr.number}`, output: { title: 'Rebase needed', summary: note },
+    }]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped', conclusion: 'conflict', note: 'conflicts with develop' }]);
+    expect(logged(log, 'coordinator_finished')).toEqual(expect.arrayContaining([expect.objectContaining({ status: 'skipped', conclusion: 'conflict' })]));
+    // The cron leaves the skipped head alone, so it posts the note again only on a new push or a review request.
+    expect(await pr.stub.catchUpState(SHA_1)).toBe('handled');
+
+    // A review request on the still conflicting PR replaces the note instead of adding one.
+    github.mergeable = [null, false];
+    github.mergeableState = 'unknown';
+    await pr.send('issue_comment', pr.comment('@manki review'));
+    await runDurableObjectAlarm(pr.stub);
+    advanceClock(5_000);
+    github.mergeableState = 'dirty';
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.comments).toHaveLength(1);
+    expect(github.issueComments.get(5005)).toBe(`${note}\n\n${CONFLICT_NOTE_MARKER}`);
+    expect(github.dispatches).toEqual([]);
+
+    // Once Manki deleted the note after a review, the next skip posts it again.
+    github.deletedComments.add(5005);
+    await pr.send('pull_request', pr.push(SHA_2));
+    github.head = SHA_2;
+    github.mergeable = [false];
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.comments).toHaveLength(2);
+    expect(github.checkRuns.map((check) => check.head_sha)).toEqual([SHA_1, SHA_1, SHA_2]);
+  });
+
+  it('reviews a PR GitHub has not computed mergeability for after reading it twice more, and a clean one at once', async () => {
+    const pr = pullRequest();
+    const github = Object.assign(fakeGitHub(pr.number), { mergeable: [null], mergeableState: 'unknown' });
+    await pr.send('pull_request', pr.push(SHA_1));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches).toEqual([]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'queued', merge_checks: 1 }]);
+    advanceClock(5_000);
+    await runDurableObjectAlarm(pr.stub);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'queued', merge_checks: 2 }]);
+    advanceClock(15_000);
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches).toHaveLength(1);
+    expect(logged(log, 'coordinator_mergeability_pending')).toHaveLength(2);
+    expect(github.comments).toEqual([]);
+
+    const clean = pullRequest();
+    const cleanGitHub = fakeGitHub(clean.number);
+    await clean.send('pull_request', clean.push(SHA_1));
+    await runDurableObjectAlarm(clean.stub);
+    expect(cleanGitHub.dispatches).toHaveLength(1);
+    expect(cleanGitHub.checkRuns).toEqual([]);
   });
 
   it.each([
