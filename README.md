@@ -73,7 +73,7 @@ The coordinator keeps each PR's running state, so Manki reads it there instead o
 - `POST /state` returns `{ active, queue, last_reviewed, last_approval, pause, settings }`:
   - `active`: the items dispatching or running, with `lane`, `run_id`, `kind`, `event`, `head_sha`, `dispatched_at` and `modes`. A run finds its own item by `run_id`.
   - `queue`: the queued items, with `lane`, `kind`, `event`, `head_sha`, `enqueued_at` and `modes`.
-  - `modes`: what the settings boxes asked of a review, any of `full`, `deeper`, `draft` and `force`. Empty for any other item.
+  - `modes`: what the settings boxes asked of a review, any of `again`, `deeper` and `draft`. Empty for any other item.
   - `last_reviewed`: `{ commit, run_id, at }`, the last commit a run reported as reviewed.
   - `last_approval`: `{ commit, held, run_id, at }`. `held` marks an approval Manki held because the PR conflicts with its base, which resets the round count like any approval.
   - `pause`: `{ reason, at }` while the automatic pause the Action decided is on, such as the round cap.
