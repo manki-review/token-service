@@ -4,8 +4,8 @@ import type { Env } from './env';
 import { githubApi, hasWriteAccess, isRateLimited, type MintResult, mintRepositoryToken } from './github';
 import { log } from './log';
 import {
-  type BaseConfig, BOT_LOGIN, type BoxChange, cancelledProgress, HELP_REPLY, isRunningProgress, MANKI_LOGINS, matchSkipRule, parseConfig, settingsHead, withSettingsStatus,
-  REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes, skipRulesOf,
+  type BaseConfig, BOT_LOGIN, boxLabels, type BoxChange, cancelledProgress, HELP_REPLY, isRunningProgress, MANKI_LOGINS, matchSkipRule, parseConfig,
+  REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes, settingsHead, skipRulesOf, withSettingsStatus,
 } from './manki';
 import { type OptIn, readOptIn, type Repository } from './opt-in';
 import type { Permissions } from './permissions';
@@ -110,6 +110,12 @@ export interface WorkRow extends Record<string, string | number | null> {
 }
 
 /** The fields of `GET /repos/{owner}/{repo}/pulls/{number}` a review start reads. */
+interface IssueCommentRead {
+  body?: string;
+  created_at?: string;
+  user?: { login?: string } | null;
+}
+
 interface PullRequestRead {
   state: string;
   draft?: boolean;
@@ -953,11 +959,14 @@ export class PrCoordinator extends DurableObject<Env> {
     if (!latest || (latest.status !== 'dispatching' && !started)) return;
     const failure = response && !started ? await response.text() : '';
 
-    if (response?.status === 200) {
-      const { workflow_run_id } = await response.json() as { workflow_run_id?: number };
-      this.markRunning(latest, workflow_run_id ?? null, 'dispatched');
-    } else if (response?.status === 204) {
-      this.markRunning(latest, null, 'dispatched without run details');
+    if (started) {
+      const runId = response?.status === 200 ? (await response.json() as { workflow_run_id?: number }).workflow_run_id ?? null : null;
+      this.markRunning(latest, runId, runId === null ? 'dispatched without run details' : 'dispatched');
+      if (latest.kind === 'review' && modesOf(latest).length > 0) {
+        await this.showStarting(latest, target).catch((error: unknown) => {
+          log('coordinator_starting_status_failed', { ...this.logFields(), work_id: item.id, error: error instanceof Error ? error.message : String(error) });
+        });
+      }
     } else if (response === null || response.status >= 500 || response.status === 429 || isRateLimited(response, failure)) {
       if (attempts > DISPATCH_BACKOFF_MS.length) {
         this.finish(item.id, 'failed', `dispatch failed ${attempts} times, last with ${response?.status ?? 'a network error'}`);
@@ -974,6 +983,25 @@ export class PrCoordinator extends DurableObject<Env> {
       this.sql.exec(`DELETE FROM meta WHERE key = 'opt_in'`);
       this.finish(item.id, 'failed', `dispatch refused with ${response.status}: ${failure.slice(0, 200)}`);
     }
+  }
+
+  /**
+   * Shows on the settings comment of a review asked for by a box that the review is starting, since its run takes a
+   * minute before it edits the comment. A comment that is not Manki's settings comment is left alone.
+   */
+  private async showStarting(item: WorkRow, target: Target): Promise<void> {
+    const token = await this.token({ issues: 'write', pull_requests: 'write' });
+    if (token === null || item.object_id === null) return;
+    const path = `/repos/${target.owner}/${target.repo}/issues/comments/${item.object_id}`;
+    const read = await githubApi(token, path);
+    if (!read.ok) throw new Error(`reading the settings comment failed with ${read.status}`);
+    const { body, user } = await read.json() as IssueCommentRead;
+    if (!MANKI_LOGINS.includes(user?.login ?? '')) return;
+    const labels = boxLabels(body ?? '', modesOf(item));
+    const starting = withSettingsStatus(body ?? '', `${labels.join(' and ') || 'Review'} requested by @${item.sender}, starting…`, []);
+    if (starting === body) return;
+    const response = await githubApi(token, path, { method: 'PATCH', body: { body: starting } });
+    if (!response.ok) throw new Error(`showing the review as starting failed with ${response.status}`);
   }
 
   /**
@@ -1176,21 +1204,25 @@ export class PrCoordinator extends DurableObject<Env> {
   /** Returns the progress comment of the cancelled review, or null when Manki has none that is still running. */
   private async runningProgress(token: string, item: WorkRow, running: WorkRow, target: Target): Promise<{ id: number; body: string } | null> {
     const repo = `/repos/${target.owner}/${target.repo}`;
+    // Only a comment posted since the run started can be its own. An older one still in progress is from a run that died.
+    // The first attempt bounds the start, since a run adopted after a lost dispatch response started before its adoption.
+    const since = (running.first_attempt_at ?? running.dispatched_at ?? Date.now()) - MINUTE;
+    const isOwn = (comment: IssueCommentRead) =>
+      !!comment.body && isRunningProgress(comment.body) && Date.parse(comment.created_at ?? '') >= since;
     if (item.object_id !== null) {
       const read = await githubApi(token, `${repo}/issues/comments/${item.object_id}`);
       if (read.ok) {
-        const { body } = await read.json() as { body?: string };
-        if (body && isRunningProgress(body)) return { id: item.object_id, body };
+        const comment = await read.json() as IssueCommentRead;
+        if (isOwn(comment)) return { id: item.object_id, body: comment.body! };
       } else if (read.status !== 404) {
         throw new Error(`reading the settings comment failed with ${read.status}`);
       }
     }
-    // Only comments edited since the run started can belong to it. GitHub lists them oldest first.
-    const since = new Date((running.dispatched_at ?? Date.now()) - MINUTE).toISOString();
-    const list = await githubApi(token, `${repo}/issues/${target.number}/comments?since=${since}&per_page=100`);
+    // GitHub lists the comments edited since the run started, oldest first.
+    const list = await githubApi(token, `${repo}/issues/${target.number}/comments?since=${new Date(since).toISOString()}&per_page=100`);
     if (!list.ok) throw new Error(`listing the PR comments failed with ${list.status}`);
-    const comments = await list.json() as Array<{ id: number; body?: string; user?: { login?: string } | null }>;
-    const newest = comments.reverse().find((c) => MANKI_LOGINS.includes(c.user?.login ?? '') && !!c.body && isRunningProgress(c.body));
+    const comments = await list.json() as Array<IssueCommentRead & { id: number }>;
+    const newest = comments.reverse().find((c) => MANKI_LOGINS.includes(c.user?.login ?? '') && isOwn(c));
     return newest ? { id: newest.id, body: newest.body! } : null;
   }
 
