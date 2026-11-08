@@ -17,7 +17,7 @@ export const MANKI_COMMENT_MARKER = '<!-- manki';
 export const HELP_REPLY = [
   '| Command | What it does |',
   '|---|---|',
-  '| `/manki review` | Reviews the head commit unless Manki already has a complete review of it. Tick Full review in the settings block to review it again |',
+  '| `/manki review` | Reviews the head commit unless Manki already has a complete review of it. Tick Review again in the settings block to review it again |',
   '| `/manki explain [topic]` | Explains something about this PR |',
   '| `/manki check` | Checks for open blocking threads and approves when there are none |',
   '| `/manki dismiss [finding]` | Dismisses a finding |',
@@ -157,12 +157,12 @@ export function cancelledProgress(body: string, login: string): string {
   return [`${cancelled}\n\n---`, `${block[1]}review cancelled`, ...boxes, `${SETTINGS_MARKER}${block[3]}`].join('\n');
 }
 
-export type SettingsBox = 'pause' | 'full' | 'deeper' | 'cancel' | 'draft' | 'force';
+export type SettingsBox = 'pause' | 'again' | 'deeper' | 'cancel' | 'draft';
 
 /** The boxes that ask for one review, as the `modes` of that review. */
-export type ReviewMode = Extract<SettingsBox, 'full' | 'deeper' | 'draft' | 'force'>;
+export type ReviewMode = Extract<SettingsBox, 'again' | 'deeper' | 'draft'>;
 
-export const REVIEW_MODES: readonly ReviewMode[] = ['full', 'deeper', 'draft', 'force'];
+export const REVIEW_MODES: readonly ReviewMode[] = ['again', 'deeper', 'draft'];
 
 /** A box whose tick changed in an edit. */
 export interface BoxChange {
@@ -171,7 +171,7 @@ export interface BoxChange {
 }
 
 // A box is a task list line that ends with its hidden id, so the label can change without touching the Worker.
-const BOX_LINE = /^([ \t]*[-*] \[)([ xX])(\] .*<!-- manki-box:(pause|full|deeper|cancel|draft|force) -->[ \t]*)$/gm;
+const BOX_LINE = /^([ \t]*[-*] \[)([ xX])(\] .*<!-- manki-box:(pause|again|deeper|cancel|draft) -->[ \t]*)$/gm;
 
 function boxStates(body: string): Map<SettingsBox, boolean> {
   const states = new Map<SettingsBox, boolean>();

@@ -20,7 +20,7 @@ import {
 } from './payloads';
 
 /** A compact form of the route: `ignore`, `<lane>:<kind>`, `close`, `close+merged`, `seen`, `reopen` or `run_completed`. */
-const SETTINGS_COMMENT = '- [ ] Pause automatic reviews <!-- manki-box:pause -->\n- [ ] Full review <!-- manki-box:full -->\n<!-- manki-settings -->';
+const SETTINGS_COMMENT = '- [ ] Pause automatic reviews <!-- manki-box:pause -->\n- [ ] Review again <!-- manki-box:again -->\n<!-- manki-settings -->';
 const FINDING_COMMENT = '**Off by one**\n\n- [ ] Create an issue for this <!-- manki-box:issue:src/a.ts:3:3:Off-by-one -->\n\n<!-- manki-finding: {} -->';
 const TICKED_FINDING = FINDING_COMMENT.replace('[ ] Create', '[x] Create');
 
@@ -283,12 +283,22 @@ describe('routeDelivery', () => {
   });
 
   it('names the boxes a settings edit ticked or unticked, and counts the editor as no writer until looked up', () => {
-    const before = SETTINGS_COMMENT.replace('[ ] Full', '[x] Full');
+    const before = SETTINGS_COMMENT.replace('[ ] Review again', '[x] Review again');
     const after = SETTINGS_COMMENT.replace('[ ] Pause', '[X] Pause');
     expect(routeDelivery('issue_comment', issueCommentEvent(after, { action: 'edited', author: MANKI_AUTHOR, previousBody: before }))).toMatchObject({
       type: 'work',
-      work: { lane: 'settings', kind: 'settings', event: 'issue_comment.edited', writer: false, acknowledge: false, boxes: [{ box: 'pause', ticked: true }, { box: 'full', ticked: false }] },
+      work: { lane: 'settings', kind: 'settings', event: 'issue_comment.edited', writer: false, acknowledge: false, boxes: [{ box: 'pause', ticked: true }, { box: 'again', ticked: false }] },
     });
+    const deeper = '- [ ] Review again, deeper (two reviewers, higher effort) <!-- manki-box:deeper -->\n<!-- manki-settings -->';
+    expect(routeDelivery('issue_comment', issueCommentEvent(deeper.replace('[ ]', '[x]'), { action: 'edited', author: MANKI_AUTHOR, previousBody: deeper }))).toMatchObject({
+      type: 'work', work: { boxes: [{ box: 'deeper', ticked: true }] },
+    });
+    // The removed Full and Force review boxes are no boxes any more, so ticking one changes nothing.
+    for (const old of ['full', 'force']) {
+      const body = `- [ ] Old box <!-- manki-box:${old} -->\n<!-- manki-settings -->`;
+      const route = routeDelivery('issue_comment', issueCommentEvent(body.replace('[ ]', '[x]'), { action: 'edited', author: MANKI_AUTHOR, previousBody: body }));
+      expect(route.type === 'work' ? route.work.boxes ?? [] : []).toEqual([]);
+    }
   });
 
   it('fills the merge work and the run end', () => {
