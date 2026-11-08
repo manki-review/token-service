@@ -57,6 +57,10 @@ export const UNTRUSTED_DISPATCHES_PER_HOUR = 5;
 const TOKEN_EXPIRY_MARGIN_MS = 5 * MINUTE;
 /** How long a looked-up write access is reused for the same login. */
 const WRITER_CACHE_MS = 5 * MINUTE;
+/** How long a review waits before each new read of a PR whose mergeability GitHub has not computed yet. */
+const MERGEABILITY_RETRY_MS = [5_000, 15_000];
+/** Marks the Worker's note that a review waits for a rebase. Manki removes it once a review posts. */
+export const CONFLICT_NOTE_MARKER = '<!-- manki-conflict-note -->';
 const NOT_STARTED = new Set(['queued', 'requested', 'waiting', 'pending']);
 /** A larger `.manki.yml` is not parsed for skip rules, as it costs too much CPU in an alarm. */
 const MAX_CONFIG_BYTES = 64 * 1024;
@@ -99,12 +103,18 @@ export interface WorkRow extends Record<string, string | number | null> {
   workflow: string | null;
   /** For a queued review, when a thread reply first went ahead of it. */
   passed_at: number | null;
+  /** How often a review read the PR again because GitHub had not computed its mergeability. */
+  merge_checks: number;
 }
 
 /** The fields of `GET /repos/{owner}/{repo}/pulls/{number}` a review start reads. */
 interface PullRequestRead {
   state: string;
   draft?: boolean;
+  html_url?: string;
+  /** Null while GitHub has not computed it yet. */
+  mergeable?: boolean | null;
+  mergeable_state?: string;
   labels?: Array<{ name: string }>;
   user?: { login?: string } | null;
   head: { sha: string; ref: string; repo?: { id?: number } | null };
@@ -216,6 +226,7 @@ export const MIGRATIONS = [
   `ALTER TABLE work ADD COLUMN modes TEXT;
    ALTER TABLE work ADD COLUMN boxes TEXT;`,
   `ALTER TABLE work ADD COLUMN passed_at INTEGER;`,
+  `ALTER TABLE work ADD COLUMN merge_checks INTEGER NOT NULL DEFAULT 0;`,
 ];
 
 const ACTIVE = `status IN ('dispatching', 'running')`;
@@ -387,7 +398,8 @@ export class PrCoordinator extends DurableObject<Env> {
     const rows = this.sql.exec<{ status: WorkStatus; conclusion: string | null }>(
       `SELECT status, conclusion FROM work WHERE kind = 'review' AND head_sha = ?`, head,
     ).toArray();
-    if (rows.some((row) => (row.status === 'done' && row.conclusion === 'success') || (row.status === 'skipped' && (row.conclusion === 'skipped' || row.conclusion === 'cancelled')))) return 'handled';
+    const skipped = ['skipped', 'cancelled', 'conflict'];
+    if (rows.some((row) => (row.status === 'done' && row.conclusion === 'success') || (row.status === 'skipped' && skipped.includes(row.conclusion ?? '')))) return 'handled';
     if (rows.some((row) => row.status === 'queued' || row.status === 'dispatching' || row.status === 'running')) return 'pending';
     return null;
   }
@@ -1132,7 +1144,62 @@ export class PrCoordinator extends DurableObject<Env> {
         return false;
       }
     }
+    // A review of a PR that conflicts with its base would only end in a held approval, so none starts until a rebase.
+    if (item.attempts === 0) {
+      const conflict = pr.mergeable === false || pr.mergeable_state === 'dirty';
+      if (!conflict && pr.mergeable === null && item.merge_checks < MERGEABILITY_RETRY_MS.length) {
+        // GitHub computes mergeability once the PR is read, so the review waits briefly and reads it again.
+        this.sql.exec(
+          `UPDATE work SET status = 'queued', lease_until = NULL, check_at = ?, merge_checks = merge_checks + 1 WHERE id = ?`,
+          Date.now() + MERGEABILITY_RETRY_MS[item.merge_checks], item.id,
+        );
+        log('coordinator_mergeability_pending', { ...this.logFields(), work_id: item.id, merge_checks: item.merge_checks + 1 });
+        return false;
+      }
+      if (conflict) {
+        await this.reportConflict(pr, target);
+        if (this.isDispatching(item.id)) this.finish(item.id, 'skipped', `conflicts with ${pr.base.ref}`, 'conflict');
+        return false;
+      }
+    }
     return true;
+  }
+
+  /**
+   * Tells the PR's author that its review waits for a rebase: one Manki note, which replaces the note an earlier skip
+   * posted, and a `Manki` check on the head that asks for the rebase.
+   */
+  private async reportConflict(pr: PullRequestRead, target: Target): Promise<void> {
+    const text = `This PR conflicts with \`${pr.base.ref}\`. Rebase it, and Manki reviews it then.`;
+    const token = await this.token({ issues: 'write' });
+    if (token !== null) {
+      const body = `${text}\n\n${CONFLICT_NOTE_MARKER}`;
+      const noteId = this.getMeta<number>('conflict_note');
+      const edited = noteId === null ? null
+        : await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/comments/${noteId}`, { method: 'PATCH', body: { body } });
+      // Manki deletes the note once a review posts, so a note that is gone is posted again.
+      if (edited === null || edited.status === 404) {
+        const posted = await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/${target.number}/comments`, { method: 'POST', body: { body } });
+        if (!posted.ok) throw new Error(`posting the conflict note failed with ${posted.status}`);
+        this.setMeta('conflict_note', ((await posted.json()) as { id: number }).id);
+      } else if (!edited.ok) {
+        throw new Error(`updating the conflict note failed with ${edited.status}`);
+      }
+    }
+    const checks = await this.token({ checks: 'write' });
+    if (checks === null) return;
+    const response = await githubApi(checks, `/repos/${target.owner}/${target.repo}/check-runs`, {
+      method: 'POST',
+      body: {
+        name: 'Manki',
+        head_sha: pr.head.sha,
+        status: 'completed',
+        conclusion: 'action_required',
+        ...(pr.html_url && { details_url: pr.html_url }),
+        output: { title: 'Rebase needed', summary: text },
+      },
+    });
+    if (!response.ok) throw new Error(`creating the rebase check failed with ${response.status}`);
   }
 
   /**
