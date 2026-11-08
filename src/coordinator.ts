@@ -1046,9 +1046,12 @@ export class PrCoordinator extends DurableObject<Env> {
       const reviewing = running.head_sha ?? (progress && settingsHead(progress.body));
       if (!reviewing) return this.requestReview(item, mode);
       if (head.startsWith(reviewing)) {
-        if (progress) {
-          const body = withSettingsStatus(progress.body, `already reviewing \`${head.slice(0, 7)}\``, ['again']);
-          const edited = await githubApi(token, `${repo}/issues/comments/${progress.id}`, { method: 'PATCH', body: { body } });
+        // The box may be ticked on another settings comment than the running review's, which then gets unticked too.
+        const ticked = item.object_id !== null && item.object_id !== progress?.id ? await this.readComment(token, repo, item.object_id) : null;
+        for (const comment of [progress, ticked]) {
+          if (!comment) continue;
+          const body = withSettingsStatus(comment.body, `already reviewing \`${head.slice(0, 7)}\``, ['again']);
+          const edited = await githubApi(token, `${repo}/issues/comments/${comment.id}`, { method: 'PATCH', body: { body } });
           if (!edited.ok) throw new Error(`showing the running review failed with ${edited.status}`);
         }
         return `already reviewing ${head.slice(0, 7)}`;
@@ -1056,6 +1059,15 @@ export class PrCoordinator extends DurableObject<Env> {
     }
     const replaced = await this.cancelReview(item, at, mode === 'deeper' ? 'a deeper review' : 'a review of the new commits');
     return `${replaced}, ${this.requestReview(item, mode)}`;
+  }
+
+  /** Returns comment `id` of `repo`, or null when it is gone. */
+  private async readComment(token: string, repo: string, id: number): Promise<{ id: number; body: string } | null> {
+    const read = await githubApi(token, `${repo}/issues/comments/${id}`);
+    if (read.status === 404) return null;
+    if (!read.ok) throw new Error(`reading the settings comment failed with ${read.status}`);
+    const { body } = await read.json() as { body?: string };
+    return body ? { id, body } : null;
   }
 
   /** Returns the review running since before the edit at `at`, so a late edit cannot reach a newer run. */

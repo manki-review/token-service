@@ -1757,6 +1757,13 @@ describe('PrCoordinator dispatch', () => {
       expect(github.issueComments.get(SETTINGS)).toBe(running('already reviewing `1111111`')());
       expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'done', note: 'already reviewing 1111111' });
       expect(await state()).toMatchObject({ active: [{ kind: 'review', run_id: 9000 }], queue: [] });
+      // A box ticked on an ended review's comment is unticked there too, next to the running review's comment.
+      const ended = (status: string) => (ticked: string[] = []) => running(status)(ticked).replace('**Review in progress**', '**Review complete**\n<!-- manki-review-complete -->');
+      github.issueComments.set(1400, reviewing());
+      await edit([], ['again'], 'alice', new Date().toISOString(), ended('up to date'));
+      expect(github.issueComments.get(SETTINGS)).toBe(ended('already reviewing `1111111`')());
+      expect(github.issueComments.get(1400)).toBe(running('already reviewing `1111111`')());
+      github.issueComments.delete(1400);
 
       // Once the head moved, Review again replaces the review with one of the new head.
       github.head = SHA_2;
@@ -1774,7 +1781,7 @@ describe('PrCoordinator dispatch', () => {
       expect(github.issueComments.get(SETTINGS)).toBe(replaced('Review replaced by a deeper review requested by @alice.', 'deeper'));
       expect(await state()).toMatchObject({ active: [{ kind: 'review', run_id: 9002, modes: ['deeper'] }] });
       expect((await workRows(pr.stub)).filter((row) => row.kind === 'settings').map((row) => row.note).slice(-2))
-        .toEqual(['replacing work 1 requested, again review work 4', 'replacing work 4 requested, deeper review work 6']);
+        .toEqual(['replacing work 1 requested, again review work 5', 'replacing work 5 requested, deeper review work 7']);
     });
 
     it('falls back to Manki\'s newest running progress comment on a cancel, and skips the comment cleanly when there is none', async () => {
