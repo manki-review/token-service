@@ -712,6 +712,8 @@ function fakeGitHub(number: number) {
     /** Manki's comments by id, which a revert reads and edits, the author of any comment not Manki's, and the status of a list. */
     issueComments: new Map<number, string>(),
     commentAuthors: new Map<number, string>(),
+    /** When a comment was posted, by default at the request. */
+    commentCreated: new Map<number, string>(),
     commentListStatus: 200,
     /** The in-progress `Manki` checks, which the App created unless they name another app, and the edits made to checks. */
     openChecks: [] as Array<{ id: number; head_sha: string; app_id?: number }>,
@@ -795,7 +797,11 @@ function fakeGitHub(number: number) {
       return Response.json({ total_count: state.listedRuns.length, workflow_runs: state.listedRuns });
     }
     const issueComment = url.pathname.match(new RegExp(`^${repo}/issues/comments/(\\d+)$`));
-    if (issueComment && request.method === 'GET') return Response.json({ body: state.issueComments.get(Number(issueComment[1])) });
+    if (issueComment && request.method === 'GET') {
+      const id = Number(issueComment[1]);
+      const created_at = state.commentCreated.get(id) ?? new Date().toISOString();
+      return Response.json({ body: state.issueComments.get(id), created_at, user: { login: state.commentAuthors.get(id) ?? 'manki-review[bot]' } });
+    }
     if (issueComment && request.method === 'PATCH' && state.deletedComments.has(Number(issueComment[1]))) {
       return Response.json({ message: 'Not Found' }, { status: 404 });
     }
@@ -806,7 +812,9 @@ function fakeGitHub(number: number) {
     if (route === `GET ${repo}/issues/${number}/comments`) {
       if (state.commentListStatus !== 200) return Response.json({ message: 'no' }, { status: state.commentListStatus });
       return Response.json([...state.issueComments].sort(([a], [b]) => a - b)
-        .map(([id, body]) => ({ id, body, user: { login: state.commentAuthors.get(id) ?? 'manki-review[bot]' } })));
+        .map(([id, body]) => ({
+          id, body, created_at: state.commentCreated.get(id) ?? new Date().toISOString(), user: { login: state.commentAuthors.get(id) ?? 'manki-review[bot]' },
+        })));
     }
     const checksOf = url.pathname.match(new RegExp(`^${repo}/commits/([0-9a-f]+)/check-runs$`));
     if (checksOf && request.method === 'GET' && url.searchParams.get('check_name') === 'Manki' && url.searchParams.get('status') === 'in_progress') {
@@ -1595,14 +1603,15 @@ describe('PrCoordinator dispatch', () => {
       ...(['pause', 'again', 'deeper', 'cancel', 'draft'] as const).map((box) => `- [${ticked.includes(box) ? 'x' : ' '}] ${box} <!-- manki-box:${box} -->`),
       '<!-- manki-settings -->', '<!-- manki-bot -->'].join('\n');
     /** A running review's progress comment as Manki writes it, with a hidden marker another writer appended. */
-    const progress = (ticked: string[] = []) => ['**Review in progress**', '', '**Planner**', '<!-- manki-bot -->', '', '---',
-      'Last reviewed `1111111` · head `1111111` · review running',
-      ...(['pause', 'cancel'] as const).map((box) => `- [${ticked.includes(box) ? 'x' : ' '}] ${box} <!-- manki-box:${box} -->`),
-      '<!-- manki-settings -->', '<!-- manki-answered:7 -->'].join('\n');
+    const LABELS = { pause: 'Pause automatic reviews', deeper: 'Deeper review', cancel: 'Cancel this review', draft: 'Review this draft' };
+    const boxLines = (ticked: string[], shown = Object.keys(LABELS) as Array<keyof typeof LABELS>) =>
+      shown.map((box) => `- [${ticked.includes(box) ? 'x' : ' '}] ${LABELS[box]} <!-- manki-box:${box} -->`);
+    const progress = (ticked: string[] = [], status = 'review running') => ['**Review in progress**', '', '**Planner**', '<!-- manki-bot -->', '', '---',
+      `Last reviewed \`1111111\` · head \`1111111\` · ${status}`, ...boxLines(ticked), '<!-- manki-settings -->', '<!-- manki-answered:7 -->'].join('\n');
     /** `progress` once `login` cancelled the review: the progress folded away and the block kept without its Cancel box. */
     const cancelled = (login: string) => [`**Review cancelled by @${login}.**`, '', '<details><summary>Original progress</summary>', '',
       '**Review in progress**', '', '**Planner**', '<!-- manki-bot -->', '', '</details>', '', '<!-- manki-review-cancelled -->', '', '---',
-      'Last reviewed `1111111` · head `1111111` · review cancelled', '- [ ] pause <!-- manki-box:pause -->',
+      'Last reviewed `1111111` · head `1111111` · review cancelled', ...boxLines([], ['pause', 'deeper', 'draft']),
       '<!-- manki-settings -->', '<!-- manki-answered:7 -->'].join('\n');
     const cancelledCheck = (id: number, login: string) => ({
       id, body: { status: 'completed', conclusion: 'cancelled', output: { title: 'Review cancelled', summary: `Review cancelled by @${login}.` } },
@@ -1741,10 +1750,13 @@ describe('PrCoordinator dispatch', () => {
         `Last reviewed \`1111111\` · head \`1111111\` · ${status}`,
         ...(['pause', 'again', 'deeper', 'cancel'] as const).map((box) => `- [${ticked.includes(box) ? 'x' : ' '}] ${box} <!-- manki-box:${box} -->`),
         '<!-- manki-settings -->'].join('\n');
-      /** `running` once the review was replaced, as `headline` says: the progress folded away, the block kept without Cancel. */
+      /**
+       * `running` once the review was replaced, as `headline` says: the progress folded away, the block kept without Cancel.
+       * The status says the box's review is starting once its run is dispatched.
+       */
       const replaced = (headline: string, ticked: string) => [`**${headline}**`, '', '<details><summary>Original progress</summary>', '',
         '**Review in progress**', '<!-- manki-bot -->', '', '</details>', '', '<!-- manki-review-cancelled -->', '', '---',
-        'Last reviewed `1111111` · head `1111111` · review cancelled',
+        `Last reviewed \`1111111\` · head \`1111111\` · ${ticked} requested by @alice, starting…`,
         ...(['pause', 'again', 'deeper'] as const).map((box) => `- [${box === ticked ? 'x' : ' '}] ${box} <!-- manki-box:${box} -->`),
         '<!-- manki-settings -->'].join('\n');
       const reviewing = running('review running');
@@ -1784,6 +1796,36 @@ describe('PrCoordinator dispatch', () => {
         .toEqual(['replacing work 1 requested, again review work 5', 'replacing work 5 requested, deeper review work 7']);
     });
 
+    it('shows a review asked for by a box as starting once its run is dispatched, on Manki\'s settings comment only', async () => {
+      const { pr, github, edit } = setup();
+      // Both boxes ticked in one edit ask for one review, named by their labels.
+      await edit([], ['deeper', 'draft'], 'alice', new Date().toISOString(), progress);
+      expect(github.dispatches).toHaveLength(1);
+      expect(github.issueComments.get(SETTINGS)).toBe(progress(['deeper', 'draft'], 'Deeper review and Review this draft requested by @alice, starting…'));
+      await pr.stub.runCompleted(key('d-deeper'), 9000, 'success');
+
+      // A dispatch GitHub fails shows nothing until the retry starts the run.
+      github.dispatchStatuses = [500];
+      await edit([], ['deeper'], 'alice', new Date().toISOString(), progress);
+      expect(github.issueComments.get(SETTINGS)).toBe(progress(['deeper']));
+      advanceClock(DISPATCH_BACKOFF_MS[0]);
+      await runDurableObjectAlarm(pr.stub);
+      expect(github.dispatches).toHaveLength(3);
+      expect(github.issueComments.get(SETTINGS)).toBe(progress(['deeper'], 'Deeper review requested by @alice, starting…'));
+      await pr.stub.runCompleted(key('d-retry'), 9001, 'success');
+
+      // Someone else's comment, or a status edit GitHub fails, changes nothing, and the review still runs.
+      github.commentAuthors.set(SETTINGS, 'mallory');
+      await edit([], ['deeper'], 'alice', new Date().toISOString(), progress);
+      expect(github.issueComments.get(SETTINGS)).toBe(progress(['deeper']));
+      github.commentAuthors.delete(SETTINGS);
+      await pr.stub.runCompleted(key('d-other'), 9002, 'success');
+      github.deletedComments.add(SETTINGS);
+      await edit([], ['deeper'], 'alice', new Date().toISOString(), progress);
+      expect(github.issueComments.get(SETTINGS)).toBe(progress(['deeper']));
+      expect((await workRows(pr.stub)).filter((row) => row.kind === 'review').map((row) => row.status)).toEqual(['done', 'done', 'done', 'running']);
+    });
+
     it('falls back to Manki\'s newest running progress comment on a cancel, and skips the comment cleanly when there is none', async () => {
       const { pr, github, edit } = setup();
       await pr.send('pull_request', pr.push(SHA_1));
@@ -1817,6 +1859,16 @@ describe('PrCoordinator dispatch', () => {
       expect(github.cancels).toEqual([9000, 9001, 9002]);
       expect(github.checkEdits.slice(2)).toEqual([cancelledCheck(72, 'alice')]);
       expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'done', note: 'cancel of work 5 requested' });
+
+      // A comment still in progress from before the run is a dead run's, so the running review's comment is marked instead.
+      github.commentListStatus = 200;
+      await pr.send('issue_comment', pr.comment('@manki review once more'));
+      await runDurableObjectAlarm(pr.stub);
+      github.issueComments.set(1402, progress());
+      github.commentCreated.set(SETTINGS, new Date(Date.now() - 60 * MINUTE).toISOString());
+      await edit([], ['cancel'], 'alice', new Date().toISOString(), progress);
+      expect(github.issueComments.get(SETTINGS)).toBe(progress(['cancel']));
+      expect(github.issueComments.get(1402)).toBe(cancelled('alice'));
     });
 
     it('puts back the boxes as they apply after someone without write access changed them, looking them up once', async () => {

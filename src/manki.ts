@@ -158,6 +158,12 @@ export function cancelledProgress(body: string, headline: string): string {
   return [`${cancelled}\n\n---`, `${block[1]}review cancelled`, ...boxes, `${SETTINGS_MARKER}${block[3]}`].join('\n');
 }
 
+/** Returns the labels the settings block of `body` shows for `boxes`, in that order. A box it does not show is left out. */
+export function boxLabels(body: string, boxes: readonly string[]): string[] {
+  const lines = SETTINGS_BLOCK.exec(body)?.[2] ?? '';
+  return boxes.flatMap((box) => new RegExp(`^[ \\t]*[-*] \\[[ xX]\\] (.+?) <!-- manki-box:${box} -->`, 'm').exec(lines)?.[1] ?? []);
+}
+
 export type SettingsBox = 'pause' | 'again' | 'deeper' | 'cancel' | 'draft';
 
 /** The boxes that ask for one review, as the `modes` of that review. */
