@@ -1496,16 +1496,28 @@ export class PrCoordinator extends DurableObject<Env> {
     }
     // Past the deadline the run is cancelled even when it could not be read, since only a cancel frees the lane.
     if (now - dispatchedAt > RUN_DEADLINE_MS) {
-      await this.cancel(item, target, 'no end of the run seen in time');
+      if (await this.cancel(item, target, 'no end of the run seen in time')) {
+        await this.reportTimedOut(item, target, `no end of the run was seen within ${RUN_DEADLINE_MS / MINUTE} minutes`);
+      }
       return;
     }
     if (!run) return;
     const startedAt = run.run_started_at ? Date.parse(run.run_started_at) : dispatchedAt;
+    // A run that never started posted no progress comment or check, so only a run that started has any to end.
     if (NOT_STARTED.has(run.status) && now - dispatchedAt > QUEUED_RUN_TIMEOUT_MS) {
       await this.cancel(item, target, 'run never started', item.requeues === 0);
     } else if (!NOT_STARTED.has(run.status) && now - startedAt > RUNNING_RUN_TIMEOUT_MS) {
-      await this.cancel(item, target, 'run went past its timeout');
+      if (await this.cancel(item, target, 'run went past its timeout')) {
+        await this.reportTimedOut(item, target, `it ran longer than ${RUNNING_RUN_TIMEOUT_MS / MINUTE} minutes`);
+      }
     }
+  }
+
+  /** Ends the progress comment and check of a review whose run the poll cancelled, saying `why`. */
+  private async reportTimedOut(item: WorkRow, target: Target, why: string): Promise<void> {
+    if (item.kind !== 'review') return;
+    // The review's own comment id names the comment that asked for it, which can be someone else's, so only Manki's are searched.
+    await this.reportStopped(item, target, null, 'Review stopped', `Review stopped: ${why}.`);
   }
 
   /** Records a poll that reached GitHub, so the next one comes after the normal interval. */
