@@ -1592,7 +1592,7 @@ describe('PrCoordinator dispatch', () => {
   describe('settings boxes', () => {
     const SETTINGS = 1500;
     const boxes = (ticked: string[] = []) => ['Last reviewed `1111111` · head `1111111` · up to date', '',
-      ...(['pause', 'full', 'deeper', 'cancel', 'draft', 'force'] as const).map((box) => `- [${ticked.includes(box) ? 'x' : ' '}] ${box} <!-- manki-box:${box} -->`),
+      ...(['pause', 'again', 'deeper', 'cancel', 'draft'] as const).map((box) => `- [${ticked.includes(box) ? 'x' : ' '}] ${box} <!-- manki-box:${box} -->`),
       '<!-- manki-settings -->', '<!-- manki-bot -->'].join('\n');
     /** A running review's progress comment as Manki writes it, with a hidden marker another writer appended. */
     const progress = (ticked: string[] = []) => ['**Review in progress**', '', '**Planner**', '<!-- manki-bot -->', '', '---',
@@ -1637,10 +1637,10 @@ describe('PrCoordinator dispatch', () => {
       await runDurableObjectAlarm(pr.stub);
       expect(github.dispatches).toEqual([]);
       expect((await workRows(pr.stub)).at(-1)).toMatchObject({ status: 'skipped', note: 'pull request is paused' });
-      await edit(['pause'], ['pause', 'force']);
+      await edit(['pause'], ['pause', 'again']);
       expect(github.dispatches.at(-1)?.inputs).toMatchObject({ event: 'issue_comment', action: 'edited', comment_id: String(SETTINGS) });
-      expect(await state()).toMatchObject({ active: [{ kind: 'review', run_id: 9000, modes: ['force'] }], settings: { paused: true } });
-      await pr.stub.runCompleted(key('d-force'), 9000, 'success');
+      expect(await state()).toMatchObject({ active: [{ kind: 'review', run_id: 9000, modes: ['again'] }], settings: { paused: true } });
+      await pr.stub.runCompleted(key('d-again'), 9000, 'success');
 
       await edit(['pause'], []);
       expect(await state()).toMatchObject({ settings: { paused: false } });
@@ -1648,7 +1648,7 @@ describe('PrCoordinator dispatch', () => {
       await pr.send('pull_request', pr.push(SHA_2));
       await runDurableObjectAlarm(pr.stub);
       expect(github.dispatches.at(-1)?.inputs).toMatchObject({ event: 'pull_request', head_sha: SHA_2 });
-      expect((await workRows(pr.stub)).filter((row) => row.kind === 'settings').map((row) => row.note)).toEqual(['paused', 'force review work 4', 'resumed']);
+      expect((await workRows(pr.stub)).filter((row) => row.kind === 'settings').map((row) => row.note)).toEqual(['paused', 'again review work 4', 'resumed']);
     });
 
     it('turns a queued push review into one review with every mode ticked, which a pause cannot drop', async () => {
@@ -1660,23 +1660,23 @@ describe('PrCoordinator dispatch', () => {
         });
         await pr.send('issue_comment', { ...payload, comment: { ...payload.comment!, id: SETTINGS } });
       };
-      await tick([], ['full']);
-      await tick(['full'], ['full', 'deeper']);
-      await tick(['full', 'deeper'], ['full', 'deeper', 'pause']);
+      await tick([], ['again']);
+      await tick(['again'], ['again', 'deeper']);
+      await tick(['again', 'deeper'], ['again', 'deeper', 'pause']);
       // The settings lane takes one edit per alarm while the state lane waits for the box review.
       await runInDurableObject(pr.stub, async (_instance, ctx) => {
         ctx.storage.sql.exec(`UPDATE work SET check_at = ? WHERE kind = 'review'`, Date.now() + MINUTE);
       });
       for (let i = 0; i < 3; i++) await runDurableObjectAlarm(pr.stub);
       expect(await state()).toMatchObject({
-        queue: [{ kind: 'review', event: 'issue_comment.edited', head_sha: SHA_1, modes: ['full', 'deeper'] }],
+        queue: [{ kind: 'review', event: 'issue_comment.edited', head_sha: SHA_1, modes: ['again', 'deeper'] }],
         settings: { paused: true },
       });
       advanceClock(MINUTE);
       await runDurableObjectAlarm(pr.stub);
       expect(github.dispatches).toHaveLength(1);
       expect(github.dispatches[0].inputs).toMatchObject({ event: 'issue_comment', action: 'edited', comment_id: String(SETTINGS) });
-      expect(await state()).toMatchObject({ active: [{ kind: 'review', run_id: 9000, modes: ['full', 'deeper'] }] });
+      expect(await state()).toMatchObject({ active: [{ kind: 'review', run_id: 9000, modes: ['again', 'deeper'] }] });
     });
 
     it('reviews a draft once on a Review this draft tick, while its pushes start nothing', async () => {
@@ -1734,6 +1734,56 @@ describe('PrCoordinator dispatch', () => {
       expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'done', note: 'no review to cancel' });
     });
 
+    it('replaces a running review on Deeper review, and on Review again only once the head moved', async () => {
+      const { pr, github, state, edit } = setup();
+      /** A running review's progress comment with the review boxes, and the status line `status`. */
+      const running = (status: string) => (ticked: string[] = []) => ['**Review in progress**', '<!-- manki-bot -->', '', '---',
+        `Last reviewed \`1111111\` · head \`1111111\` · ${status}`,
+        ...(['pause', 'again', 'deeper', 'cancel'] as const).map((box) => `- [${ticked.includes(box) ? 'x' : ' '}] ${box} <!-- manki-box:${box} -->`),
+        '<!-- manki-settings -->'].join('\n');
+      /** `running` once the review was replaced, as `headline` says: the progress folded away, the block kept without Cancel. */
+      const replaced = (headline: string, ticked: string) => [`**${headline}**`, '', '<details><summary>Original progress</summary>', '',
+        '**Review in progress**', '<!-- manki-bot -->', '', '</details>', '', '<!-- manki-review-cancelled -->', '', '---',
+        'Last reviewed `1111111` · head `1111111` · review cancelled',
+        ...(['pause', 'again', 'deeper'] as const).map((box) => `- [${box === ticked ? 'x' : ' '}] ${box} <!-- manki-box:${box} -->`),
+        '<!-- manki-settings -->'].join('\n');
+      const reviewing = running('review running');
+      await pr.send('pull_request', pr.push(SHA_1));
+      await runDurableObjectAlarm(pr.stub);
+
+      // On the head it is already reviewing, Review again leaves the review running and says so.
+      await edit([], ['again'], 'alice', new Date().toISOString(), reviewing);
+      expect(github.cancels).toEqual([]);
+      expect(github.issueComments.get(SETTINGS)).toBe(running('already reviewing `1111111`')());
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'done', note: 'already reviewing 1111111' });
+      expect(await state()).toMatchObject({ active: [{ kind: 'review', run_id: 9000 }], queue: [] });
+      // A box ticked on an ended review's comment is unticked there too, next to the running review's comment.
+      const ended = (status: string) => (ticked: string[] = []) => running(status)(ticked).replace('**Review in progress**', '**Review complete**\n<!-- manki-review-complete -->');
+      github.issueComments.set(1400, reviewing());
+      await edit([], ['again'], 'alice', new Date().toISOString(), ended('up to date'));
+      expect(github.issueComments.get(SETTINGS)).toBe(ended('already reviewing `1111111`')());
+      expect(github.issueComments.get(1400)).toBe(running('already reviewing `1111111`')());
+      github.issueComments.delete(1400);
+
+      // Once the head moved, Review again replaces the review with one of the new head.
+      github.head = SHA_2;
+      github.openChecks = [{ id: 70, head_sha: SHA_1 }];
+      await edit([], ['again'], 'alice', new Date().toISOString(), reviewing);
+      expect(github.cancels).toEqual([9000]);
+      const newCommits = 'Review replaced by a review of the new commits requested by @alice.';
+      expect(github.issueComments.get(SETTINGS)).toBe(replaced(newCommits, 'again'));
+      expect(github.checkEdits).toEqual([{ id: 70, body: { status: 'completed', conclusion: 'cancelled', output: { title: 'Review cancelled', summary: newCommits } } }]);
+      expect(await state()).toMatchObject({ active: [{ kind: 'review', run_id: 9001, modes: ['again'] }] });
+
+      // Deeper review replaces the running review right away, on any head.
+      await edit([], ['deeper'], 'alice', new Date().toISOString(), reviewing);
+      expect(github.cancels).toEqual([9000, 9001]);
+      expect(github.issueComments.get(SETTINGS)).toBe(replaced('Review replaced by a deeper review requested by @alice.', 'deeper'));
+      expect(await state()).toMatchObject({ active: [{ kind: 'review', run_id: 9002, modes: ['deeper'] }] });
+      expect((await workRows(pr.stub)).filter((row) => row.kind === 'settings').map((row) => row.note).slice(-2))
+        .toEqual(['replacing work 1 requested, again review work 5', 'replacing work 5 requested, deeper review work 7']);
+    });
+
     it('falls back to Manki\'s newest running progress comment on a cancel, and skips the comment cleanly when there is none', async () => {
       const { pr, github, edit } = setup();
       await pr.send('pull_request', pr.push(SHA_1));
@@ -1771,7 +1821,7 @@ describe('PrCoordinator dispatch', () => {
 
     it('puts back the boxes as they apply after someone without write access changed them, looking them up once', async () => {
       const { pr, github, state, edit } = setup();
-      await edit([], ['pause', 'full'], 'mallory');
+      await edit([], ['pause', 'again'], 'mallory');
       expect(github.issueComments.get(SETTINGS)).toBe(boxes([]));
       expect(await state()).toMatchObject({ queue: [], active: [], settings: { paused: false } });
       expect((await workRows(pr.stub)).map((row) => [row.kind, row.status, row.note])).toEqual([['settings', 'skipped', 'commenter has no write access']]);
@@ -1791,11 +1841,11 @@ describe('PrCoordinator dispatch', () => {
     it('ignores a Pause change older than the last one applied, such as a late redelivery, and still applies its other boxes', async () => {
       const { pr, github, state, edit } = setup();
       await edit(['pause'], [], 'alice', '2030-01-01T00:00:02Z');
-      await edit([], ['pause', 'full'], 'alice', '2030-01-01T00:00:01Z');
+      await edit([], ['pause', 'again'], 'alice', '2030-01-01T00:00:01Z');
       expect(await state()).toMatchObject({ settings: { paused: false } });
       expect(github.dispatches).toHaveLength(1);
       expect((await workRows(pr.stub)).filter((row) => row.kind === 'settings').map((row) => row.note))
-        .toEqual(['nothing changed', 'pause older than the last pause change, full review work 3']);
+        .toEqual(['nothing changed', 'pause older than the last pause change, again review work 3']);
     });
   });
 

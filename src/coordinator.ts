@@ -4,7 +4,7 @@ import type { Env } from './env';
 import { githubApi, hasWriteAccess, isRateLimited, type MintResult, mintRepositoryToken } from './github';
 import { log } from './log';
 import {
-  type BaseConfig, BOT_LOGIN, type BoxChange, cancelledProgress, HELP_REPLY, isRunningProgress, MANKI_LOGINS, matchSkipRule, parseConfig,
+  type BaseConfig, BOT_LOGIN, type BoxChange, cancelledProgress, HELP_REPLY, isRunningProgress, MANKI_LOGINS, matchSkipRule, parseConfig, settingsHead, withSettingsStatus,
   REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes, skipRulesOf,
 } from './manki';
 import { type OptIn, readOptIn, type Repository } from './opt-in';
@@ -1016,12 +1016,65 @@ export class PrCoordinator extends DurableObject<Env> {
         this.setMeta('pr_state', { ...state, settings: { paused: ticked } });
         effects.push(ticked ? 'paused' : 'resumed');
       } else if (ticked && (REVIEW_MODES as readonly string[]).includes(box)) {
-        effects.push(this.requestReview(item, box as ReviewMode));
+        effects.push(await this.reviewBox(item, box as ReviewMode, at));
       } else if (ticked && box === 'cancel') {
         effects.push(await this.cancelReview(item, at));
       }
     }
     if (this.isDispatching(item.id)) this.finish(item.id, 'done', effects.join(', ') || 'nothing changed');
+  }
+
+  /**
+   * Handles a tick of a review box. While a review runs, Deeper review replaces it with a deeper one on the current
+   * commit, and Review again replaces it only when the PR's head moved since it started. On the same head Review again
+   * leaves it running and says so in the status line. Without a running review, or when its head is unknown, the box
+   * asks for one review as before.
+   */
+  private async reviewBox(item: WorkRow, mode: ReviewMode, at: number): Promise<string> {
+    const running = mode === 'draft' ? undefined : this.runningReview(at);
+    if (!running) return this.requestReview(item, mode);
+    if (mode === 'again') {
+      const target = await this.verifiedTarget();
+      if (!target) throw new Error('the repository could not be read');
+      const token = await this.token({ issues: 'write', pull_requests: 'write' });
+      if (token === null) return this.requestReview(item, mode);
+      const repo = `/repos/${target.owner}/${target.repo}`;
+      const pr = await githubApi(token, `${repo}/pulls/${target.number}`);
+      if (!pr.ok) throw new Error(`reading the pull request failed with ${pr.status}`);
+      const head = ((await pr.json()) as PullRequestRead).head.sha;
+      const progress = await this.runningProgress(token, item, running, target);
+      const reviewing = running.head_sha ?? (progress && settingsHead(progress.body));
+      if (!reviewing) return this.requestReview(item, mode);
+      if (head.startsWith(reviewing)) {
+        // The box may be ticked on another settings comment than the running review's, which then gets unticked too.
+        const ticked = item.object_id !== null && item.object_id !== progress?.id ? await this.readComment(token, repo, item.object_id) : null;
+        for (const comment of [progress, ticked]) {
+          if (!comment) continue;
+          const body = withSettingsStatus(comment.body, `already reviewing \`${head.slice(0, 7)}\``, ['again']);
+          const edited = await githubApi(token, `${repo}/issues/comments/${comment.id}`, { method: 'PATCH', body: { body } });
+          if (!edited.ok) throw new Error(`showing the running review failed with ${edited.status}`);
+        }
+        return `already reviewing ${head.slice(0, 7)}`;
+      }
+    }
+    const replaced = await this.cancelReview(item, at, mode === 'deeper' ? 'a deeper review' : 'a review of the new commits');
+    return `${replaced}, ${this.requestReview(item, mode)}`;
+  }
+
+  /** Returns comment `id` of `repo`, or null when it is gone. */
+  private async readComment(token: string, repo: string, id: number): Promise<{ id: number; body: string } | null> {
+    const read = await githubApi(token, `${repo}/issues/comments/${id}`);
+    if (read.status === 404) return null;
+    if (!read.ok) throw new Error(`reading the settings comment failed with ${read.status}`);
+    const { body } = await read.json() as { body?: string };
+    return body ? { id, body } : null;
+  }
+
+  /** Returns the review running since before the edit at `at`, so a late edit cannot reach a newer run. */
+  private runningReview(at: number): WorkRow | undefined {
+    return this.sql.exec<WorkRow>(
+      `SELECT * FROM work WHERE kind = 'review' AND status = 'running' AND run_id IS NOT NULL AND dispatched_at <= ?`, at || Date.now(),
+    ).toArray()[0];
   }
 
   /**
@@ -1051,16 +1104,16 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /**
    * Cancels the running review, if it started before the edit at `at`, so a late Cancel cannot hit a newer run. A review
-   * not yet running, or one GitHub gave no run id, cannot be cancelled.
+   * not yet running, or one GitHub gave no run id, cannot be cancelled. With `replacement`, such as "a deeper review", the
+   * comment and check say the review was replaced by it instead of cancelled.
    */
-  private async cancelReview(item: WorkRow, at: number): Promise<string> {
-    const running = this.sql.exec<WorkRow>(
-      `SELECT * FROM work WHERE kind = 'review' AND status = 'running' AND run_id IS NOT NULL AND dispatched_at <= ?`, at || Date.now(),
-    ).toArray()[0];
+  private async cancelReview(item: WorkRow, at: number, replacement?: string): Promise<string> {
+    const running = this.runningReview(at);
     if (!running) return 'no review to cancel';
     const target = await this.verifiedTarget();
     if (!target) throw new Error('the repository could not be read');
-    if (!(await this.cancel(running, target, `cancelled by ${item.sender}`, false, ['skipped', 'cancelled']))) {
+    const reason = replacement ? `replaced by ${item.sender}` : `cancelled by ${item.sender}`;
+    if (!(await this.cancel(running, target, reason, false, ['skipped', 'cancelled']))) {
       throw new Error(`cancelling the run of work ${running.id} failed`);
     }
     const ended = this.row(running.id);
@@ -1069,17 +1122,18 @@ export class PrCoordinator extends DurableObject<Env> {
       const failed = (part: string) => (error: unknown) => {
         log('coordinator_cancel_report_failed', { ...this.logFields(), work_id: running.id, part, error: error instanceof Error ? error.message : String(error) });
       };
-      await this.markCommentCancelled(item, running, target).catch(failed('comment'));
-      await this.markCheckCancelled(item, running, target).catch(failed('check'));
+      const headline = replacement ? `Review replaced by ${replacement} requested by @${item.sender}.` : `Review cancelled by @${item.sender}.`;
+      await this.markCommentCancelled(item, running, target, headline).catch(failed('comment'));
+      await this.markCheckCancelled(running, target, headline).catch(failed('check'));
     }
-    return `cancel of work ${running.id} requested`;
+    return `${replacement ? 'replacing' : 'cancel of'} work ${running.id} requested`;
   }
 
   /**
-   * Marks the progress comment of the cancelled review as cancelled by the sender of `item`. The comment is the one whose
-   * Cancel box was ticked, or else Manki's newest progress comment of a review that has not ended. Without one, it does nothing.
+   * Marks the progress comment of the cancelled review as cancelled, with `headline`. The comment is the one whose box was
+   * ticked, or else Manki's newest progress comment of a review that has not ended. Without one, it does nothing.
    */
-  private async markCommentCancelled(item: WorkRow, running: WorkRow, target: Target): Promise<void> {
+  private async markCommentCancelled(item: WorkRow, running: WorkRow, target: Target, headline: string): Promise<void> {
     const token = await this.token({ issues: 'write', pull_requests: 'write' });
     if (token === null) return;
     const comment = await this.runningProgress(token, item, running, target);
@@ -1088,12 +1142,12 @@ export class PrCoordinator extends DurableObject<Env> {
       return;
     }
     const path = `/repos/${target.owner}/${target.repo}/issues/comments/${comment.id}`;
-    const response = await githubApi(token, path, { method: 'PATCH', body: { body: cancelledProgress(comment.body, item.sender) } });
+    const response = await githubApi(token, path, { method: 'PATCH', body: { body: cancelledProgress(comment.body, headline) } });
     if (!response.ok) throw new Error(`marking the progress comment cancelled failed with ${response.status}`);
   }
 
-  /** Completes the in-progress `Manki` checks on the cancelled review's head as cancelled by the sender of `item`. */
-  private async markCheckCancelled(item: WorkRow, running: WorkRow, target: Target): Promise<void> {
+  /** Completes the in-progress `Manki` checks on the cancelled review's head as cancelled, with `headline` as the summary. */
+  private async markCheckCancelled(running: WorkRow, target: Target, headline: string): Promise<void> {
     const repo = `/repos/${target.owner}/${target.repo}`;
     const checks = await this.token({ checks: 'write' });
     if (checks === null) return;
@@ -1110,7 +1164,7 @@ export class PrCoordinator extends DurableObject<Env> {
     for (const run of runs) {
       const response = await githubApi(checks, `${repo}/check-runs/${run.id}`, {
         method: 'PATCH',
-        body: { status: 'completed', conclusion: 'cancelled', output: { title: 'Review cancelled', summary: `Review cancelled by @${item.sender}.` } },
+        body: { status: 'completed', conclusion: 'cancelled', output: { title: 'Review cancelled', summary: headline } },
       });
       if (!response.ok) throw new Error(`completing the Manki check failed with ${response.status}`);
     }

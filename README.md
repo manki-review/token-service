@@ -50,18 +50,17 @@ Manki's progress comment carries the settings boxes, and the Worker applies thei
 
 ```
 - [ ] Pause automatic reviews <!-- manki-box:pause -->
-- [ ] Full review <!-- manki-box:full -->
+- [ ] Review again <!-- manki-box:again -->
 - [ ] Deeper review <!-- manki-box:deeper -->
 - [ ] Cancel this review <!-- manki-box:cancel -->
 - [ ] Review this draft <!-- manki-box:draft -->
-- [ ] Force review <!-- manki-box:force -->
 <!-- manki-settings -->
 ```
 
 An `issue_comment.edited` delivery on a comment by one of Manki's logins that holds `<!-- manki-settings -->` goes to the settings lane. Only boxes whose tick differs between `changes.body.from` and the new body count, and Manki's own edits are dropped as a bot's. The editor's write access is looked up as for any comment, and reused for 5 minutes per login. Someone without it gets the changed boxes put back and changes nothing. A writer's change applies at once:
 
 - **Pause** sets `settings.paused` until a writer unticks it. While it is set, automatic reviews end skipped as for the reported `pause`. A Pause change from an edit older than the last one applied, by the comment's `updated_at`, is ignored, so a late redelivery cannot undo a newer one.
-- **Full review**, **Deeper review**, **Review this draft** and **Force review** each ask for one review with that mode. The mode joins a review a writer already queued. A queued push review becomes the box's review, so a pause, a skip rule or a draft cannot drop it. Otherwise a review of the edited comment is queued. The run reads its modes from `/state`, never from the dispatch inputs, and the box clears when the Action renders the comment again.
+- **Review again**, **Deeper review** and **Review this draft** each ask for one review with that mode. The mode joins a review a writer already queued. A queued push review becomes the box's review, so a pause, a skip rule or a draft cannot drop it. Otherwise a review of the edited comment is queued. The run reads its modes from `/state`, never from the dispatch inputs, and the box clears when the Action renders the comment again. While a review runs, **Deeper review** cancels it and asks for the deeper review on the current commit. **Review again** leaves a running review of the PR's current head alone, unticks itself and sets the status line to "already reviewing `<sha>`". When the head moved since that review started, it cancels it and asks for a review of the new head. A review cancelled this way shows in its progress comment and check as replaced, such as "Review replaced by a deeper review requested by @alice."
 - **Cancel** cancels the running review with the coordinator's `actions: write` token. A cancel GitHub fails is tried again. Its item ends `skipped` with conclusion `cancelled`, and the cron does not review that head again. The run's post step can no longer mint a token, so the Worker ends what the run showed. It rewrites the progress comment to "Review cancelled by @<login>." with the old progress folded away, keeps the settings block with the status "review cancelled" and no Cancel box, and marks it `<!-- manki-review-cancelled -->` as Manki does. That comment is the ticked one while its review has not ended, or else Manki's newest such comment edited since the run started. It also completes each in-progress `Manki` check the App created on the review's head as `cancelled`. A failure in either is logged and leaves the cancel standing. With no review running, it changes nothing.
 - Unticking any box but Pause changes nothing.
 
@@ -74,7 +73,7 @@ The coordinator keeps each PR's running state, so Manki reads it there instead o
 - `POST /state` returns `{ active, queue, last_reviewed, last_approval, pause, settings }`:
   - `active`: the items dispatching or running, with `lane`, `run_id`, `kind`, `event`, `head_sha`, `dispatched_at` and `modes`. A run finds its own item by `run_id`.
   - `queue`: the queued items, with `lane`, `kind`, `event`, `head_sha`, `enqueued_at` and `modes`.
-  - `modes`: what the settings boxes asked of a review, any of `full`, `deeper`, `draft` and `force`. Empty for any other item.
+  - `modes`: what the settings boxes asked of a review, any of `again`, `deeper` and `draft`. Empty for any other item.
   - `last_reviewed`: `{ commit, run_id, at }`, the last commit a run reported as reviewed.
   - `last_approval`: `{ commit, held, run_id, at }`. `held` marks an approval Manki held because the PR conflicts with its base, which resets the round count like any approval.
   - `pause`: `{ reason, at }` while the automatic pause the Action decided is on, such as the round cap.

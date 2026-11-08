@@ -17,7 +17,7 @@ export const MANKI_COMMENT_MARKER = '<!-- manki';
 export const HELP_REPLY = [
   '| Command | What it does |',
   '|---|---|',
-  '| `/manki review` | Reviews the head commit unless Manki already has a complete review of it. Tick Full review in the settings block to review it again |',
+  '| `/manki review` | Reviews the head commit unless Manki already has a complete review of it. Tick Review again in the settings block to review it again |',
   '| `/manki explain [topic]` | Explains something about this PR |',
   '| `/manki check` | Checks for open blocking threads and approves when there are none |',
   '| `/manki dismiss [finding]` | Dismisses a finding |',
@@ -144,25 +144,41 @@ export function isRunningProgress(body: string): boolean {
 }
 
 /**
- * Returns the progress comment `body` marked as cancelled by `login`, as Manki's `markProgressCommentCancelled` writes
- * it: the original progress folded away, and the settings block kept with the status "review cancelled" and no Cancel box.
+ * Returns the progress comment `body` marked as cancelled with `headline`, such as "Review cancelled by @alice.", as
+ * Manki's `markProgressCommentCancelled` writes it: the original progress folded away, and the settings block kept with
+ * the status "review cancelled" and no Cancel box.
  */
-export function cancelledProgress(body: string, login: string): string {
+export function cancelledProgress(body: string, headline: string): string {
   const block = SETTINGS_BLOCK.exec(body);
   const progress = (block ? body.slice(0, block.index) : body).trim();
-  const text = [`**Review cancelled by @${login}.**`, '', '<details><summary>Original progress</summary>', '', progress, '', '</details>'].join('\n');
+  const text = [`**${headline}**`, '', '<details><summary>Original progress</summary>', '', progress, '', '</details>'].join('\n');
   const cancelled = `${text}\n\n${CANCELLED_MARKER}`;
   if (!block) return cancelled;
   const boxes = block[2].split('\n').filter((line) => line && !line.includes('<!-- manki-box:cancel -->'));
   return [`${cancelled}\n\n---`, `${block[1]}review cancelled`, ...boxes, `${SETTINGS_MARKER}${block[3]}`].join('\n');
 }
 
-export type SettingsBox = 'pause' | 'full' | 'deeper' | 'cancel' | 'draft' | 'force';
+export type SettingsBox = 'pause' | 'again' | 'deeper' | 'cancel' | 'draft';
 
 /** The boxes that ask for one review, as the `modes` of that review. */
-export type ReviewMode = Extract<SettingsBox, 'full' | 'deeper' | 'draft' | 'force'>;
+export type ReviewMode = Extract<SettingsBox, 'again' | 'deeper' | 'draft'>;
 
-export const REVIEW_MODES: readonly ReviewMode[] = ['full', 'deeper', 'draft', 'force'];
+export const REVIEW_MODES: readonly ReviewMode[] = ['again', 'deeper', 'draft'];
+
+/** Returns the head commit the settings block of `body` names, as Manki writes it, or null without a block. */
+export function settingsHead(body: string): string | null {
+  return SETTINGS_BLOCK.exec(body)?.[1].match(/head `([0-9a-f]+)`/)?.[1] ?? null;
+}
+
+/** Returns `body` with the status of its settings block set to `status` and the boxes in `untick` cleared. */
+export function withSettingsStatus(body: string, status: string, untick: SettingsBox[]): string {
+  const block = SETTINGS_BLOCK.exec(body);
+  if (!block) return body;
+  const lines = body.slice(block.index).split('\n');
+  const at = lines.findIndex((line) => line.startsWith(block[1]));
+  lines[at] = `${block[1]}${status}`;
+  return setBoxes(body.slice(0, block.index) + lines.join('\n'), untick.map((box) => ({ box, ticked: false })));
+}
 
 /** A box whose tick changed in an edit. */
 export interface BoxChange {
@@ -171,7 +187,7 @@ export interface BoxChange {
 }
 
 // A box is a task list line that ends with its hidden id, so the label can change without touching the Worker.
-const BOX_LINE = /^([ \t]*[-*] \[)([ xX])(\] .*<!-- manki-box:(pause|full|deeper|cancel|draft|force) -->[ \t]*)$/gm;
+const BOX_LINE = /^([ \t]*[-*] \[)([ xX])(\] .*<!-- manki-box:(pause|again|deeper|cancel|draft) -->[ \t]*)$/gm;
 
 function boxStates(body: string): Map<SettingsBox, boolean> {
   const states = new Map<SettingsBox, boolean>();
