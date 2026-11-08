@@ -21,6 +21,13 @@ import {
 
 /** A compact form of the route: `ignore`, `<lane>:<kind>`, `close`, `close+merged`, `seen`, `reopen` or `run_completed`. */
 const SETTINGS_COMMENT = '- [ ] Pause automatic reviews <!-- manki-box:pause -->\n- [ ] Full review <!-- manki-box:full -->\n<!-- manki-settings -->';
+const FINDING_COMMENT = '**Off by one**\n\n- [ ] Create an issue for this <!-- manki-box:issue:src/a.ts:3:3:Off-by-one -->\n\n<!-- manki-finding: {} -->';
+const TICKED_FINDING = FINDING_COMMENT.replace('[ ] Create', '[x] Create');
+
+/** An edit of Manki's finding comment from `before` to `after`, by a writer. */
+function findingEdit(after: string, before?: string, author = MANKI_AUTHOR): WebhookPayload {
+  return { ...reviewCommentEvent(after, { user: author }, 'edited'), ...(before !== undefined && { changes: { body: { from: before } } }) };
+}
 
 function verdict(route: Route): string {
   switch (route.type) {
@@ -92,6 +99,11 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['a review comment by a bot', 'pull_request_review_comment', reviewCommentEvent('@manki hi', { user: ACTIONS_AUTHOR }), 'ignore'],
   ['a Manki finding comment', 'pull_request_review_comment', reviewCommentEvent('<!-- manki-finding --> @manki', { user: { login: 'alice', type: 'User' } }), 'ignore'],
   ['an edited review comment', 'pull_request_review_comment', reviewCommentEvent('@manki hi', {}, 'edited'), 'ignore'],
+  ['a ticked issue box in a Manki finding', 'pull_request_review_comment', findingEdit(TICKED_FINDING, FINDING_COMMENT), 'state:thread'],
+  ['an unticked issue box in a Manki finding', 'pull_request_review_comment', findingEdit(FINDING_COMMENT, TICKED_FINDING), 'ignore'],
+  ['an edit of a Manki finding that ticks no box', 'pull_request_review_comment', findingEdit(`${FINDING_COMMENT}\nmore`, FINDING_COMMENT), 'ignore'],
+  ['a Manki finding edit without the earlier body', 'pull_request_review_comment', findingEdit(TICKED_FINDING), 'ignore'],
+  ['a ticked issue box in a copy by someone else', 'pull_request_review_comment', findingEdit(TICKED_FINDING, FINDING_COMMENT, { login: 'mallory', type: 'User' }), 'ignore'],
   ['a review comment on a fork PR', 'pull_request_review_comment', reviewCommentEvent('@manki hi', {}, 'created', { head: { sha: HEAD_SHA, repo: { full_name: 'mallory/manki' } } }), 'ignore'],
 
   // issue_comment on a PR
@@ -241,6 +253,8 @@ describe('routeDelivery', () => {
     ['an outsider\'s review', 'pull_request_review', reviewEvent('submitted', { author_association: 'NONE' }), false, true],
     ['a dismissed review', 'pull_request_review', reviewEvent('dismissed', { author_association: 'NONE' }), true, false],
     ['a push', 'pull_request', pullRequestEvent('synchronize'), true, false],
+    // The coordinator looks up the editor of Manki's comment, as for a settings edit.
+    ['a tick in Manki\'s finding', 'pull_request_review_comment', findingEdit(TICKED_FINDING, FINDING_COMMENT), false, false],
   ])('marks %s as a writer or not, and whether to look the sender up', (_case, event, payload, writer, checkWriter) => {
     const route = routeDelivery(event, payload);
     expect(route.type === 'work' && { writer: route.work.writer, checkWriter: route.work.checkWriter }).toEqual({ writer, checkWriter });
