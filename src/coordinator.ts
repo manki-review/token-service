@@ -1202,7 +1202,8 @@ export class PrCoordinator extends DurableObject<Env> {
   private async runningProgress(token: string, item: WorkRow, running: WorkRow, target: Target): Promise<{ id: number; body: string } | null> {
     const repo = `/repos/${target.owner}/${target.repo}`;
     // Only a comment posted since the run started can be its own. An older one still in progress is from a run that died.
-    const since = (running.dispatched_at ?? Date.now()) - MINUTE;
+    // The first attempt bounds the start, since a run adopted after a lost dispatch response started before its adoption.
+    const since = (running.first_attempt_at ?? running.dispatched_at ?? Date.now()) - MINUTE;
     const isOwn = (comment: IssueCommentRead) =>
       !!comment.body && isRunningProgress(comment.body) && Date.parse(comment.created_at ?? '') >= since;
     if (item.object_id !== null) {

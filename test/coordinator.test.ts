@@ -1869,6 +1869,25 @@ describe('PrCoordinator dispatch', () => {
       await edit([], ['cancel'], 'alice', new Date().toISOString(), progress);
       expect(github.issueComments.get(SETTINGS)).toBe(progress(['cancel']));
       expect(github.issueComments.get(1402)).toBe(cancelled('alice'));
+
+      // A run adopted minutes after its dispatch response was lost started at the first attempt, so its comment is still its own.
+      github.head = SHA_2;
+      github.dispatchStatuses = [502, 502];
+      await pr.send('pull_request', pr.push(SHA_2), 'd-lost');
+      await runDurableObjectAlarm(pr.stub);
+      github.issueComments.set(1403, progress());
+      github.commentCreated.set(1403, new Date().toISOString());
+      advanceClock(DISPATCH_BACKOFF_MS[0]);
+      await runDurableObjectAlarm(pr.stub);
+      const title = `Manki pull_request.synchronize on #${pr.number} (d-lost)`;
+      github.listedRuns = [{ id: 7003, display_title: title, created_at: new Date().toISOString(), actor: { login: 'manki-review[bot]' } }];
+      github.runs.set(7003, { status: 'in_progress', event: 'workflow_dispatch', display_title: title, actor: { login: 'manki-review[bot]' } });
+      advanceClock(DISPATCH_BACKOFF_MS[1]);
+      await runDurableObjectAlarm(pr.stub);
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ status: 'running', run_id: 7003, note: 'recovered the run of an earlier attempt' });
+      await edit([], ['cancel'], 'alice', new Date().toISOString(), progress);
+      expect(github.cancels.at(-1)).toBe(7003);
+      expect(github.issueComments.get(1403)).toBe(cancelled('alice'));
     });
 
     it('puts back the boxes as they apply after someone without write access changed them, looking them up once', async () => {
