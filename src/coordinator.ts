@@ -1073,7 +1073,7 @@ export class PrCoordinator extends DurableObject<Env> {
       const pr = await githubApi(token, `${repo}/pulls/${target.number}`);
       if (!pr.ok) throw new Error(`reading the pull request failed with ${pr.status}`);
       const head = ((await pr.json()) as PullRequestRead).head.sha;
-      const progress = await this.runningProgress(token, item, running, target);
+      const progress = await this.runningProgress(token, item.object_id, running, target);
       const reviewing = running.run_head ?? (progress && settingsHead(progress.body));
       if (!reviewing) return this.requestReview(item, mode);
       if (head.startsWith(reviewing)) {
@@ -1149,25 +1149,32 @@ export class PrCoordinator extends DurableObject<Env> {
     }
     const ended = this.row(running.id);
     if (ended?.status === 'skipped' && ended.conclusion === 'cancelled') {
-      // The run's own post step can no longer mint a token, so the Worker ends its progress comment and check instead.
-      const failed = (part: string) => (error: unknown) => {
-        log('coordinator_cancel_report_failed', { ...this.logFields(), work_id: running.id, part, error: error instanceof Error ? error.message : String(error) });
-      };
       const headline = replacement ? `Review replaced by ${replacement} requested by @${item.sender}.` : `Review cancelled by @${item.sender}.`;
-      await this.markCommentCancelled(item, running, target, headline).catch(failed('comment'));
-      await this.markCheckCancelled(running, target, headline).catch(failed('check'));
+      await this.reportStopped(running, target, item.object_id, 'Review cancelled', headline);
     }
     return `${replacement ? 'replacing' : 'cancel of'} work ${running.id} requested`;
   }
 
   /**
-   * Marks the progress comment of the cancelled review as cancelled, with `headline`. The comment is the one whose box was
-   * ticked, or else Manki's newest progress comment of a review that has not ended. Without one, it does nothing.
+   * Ends the progress comment and the `Manki` check of a review whose run the Worker cancelled, with `headline`. The
+   * run's own post step can no longer mint a token, so it cannot end them itself. A failure is logged.
    */
-  private async markCommentCancelled(item: WorkRow, running: WorkRow, target: Target, headline: string): Promise<void> {
+  private async reportStopped(running: WorkRow, target: Target, ticked: number | null, title: string, headline: string): Promise<void> {
+    const failed = (part: string) => (error: unknown) => {
+      log('coordinator_cancel_report_failed', { ...this.logFields(), work_id: running.id, part, error: error instanceof Error ? error.message : String(error) });
+    };
+    await this.markCommentCancelled(ticked, running, target, headline).catch(failed('comment'));
+    await this.markCheckCancelled(running, target, title, headline).catch(failed('check'));
+  }
+
+  /**
+   * Marks the progress comment of the cancelled review as cancelled, with `headline`. The comment is `ticked`, the one
+   * whose box was ticked, or else Manki's newest progress comment of a review that has not ended. Without one, it does nothing.
+   */
+  private async markCommentCancelled(ticked: number | null, running: WorkRow, target: Target, headline: string): Promise<void> {
     const token = await this.token({ issues: 'write', pull_requests: 'write' });
     if (token === null) return;
-    const comment = await this.runningProgress(token, item, running, target);
+    const comment = await this.runningProgress(token, ticked, running, target);
     if (comment === null) {
       log('coordinator_cancel_no_comment', { ...this.logFields(), work_id: running.id });
       return;
@@ -1177,8 +1184,8 @@ export class PrCoordinator extends DurableObject<Env> {
     if (!response.ok) throw new Error(`marking the progress comment cancelled failed with ${response.status}`);
   }
 
-  /** Completes the in-progress `Manki` checks on the cancelled review's head as cancelled, with `headline` as the summary. */
-  private async markCheckCancelled(running: WorkRow, target: Target, headline: string): Promise<void> {
+  /** Completes the in-progress `Manki` checks on the cancelled review's head as cancelled, with `title` and `headline`. */
+  private async markCheckCancelled(running: WorkRow, target: Target, title: string, headline: string): Promise<void> {
     const repo = `/repos/${target.owner}/${target.repo}`;
     const checks = await this.token({ checks: 'write' });
     if (checks === null) return;
@@ -1195,25 +1202,25 @@ export class PrCoordinator extends DurableObject<Env> {
     for (const run of runs) {
       const response = await githubApi(checks, `${repo}/check-runs/${run.id}`, {
         method: 'PATCH',
-        body: { status: 'completed', conclusion: 'cancelled', output: { title: 'Review cancelled', summary: headline } },
+        body: { status: 'completed', conclusion: 'cancelled', output: { title, summary: headline } },
       });
       if (!response.ok) throw new Error(`completing the Manki check failed with ${response.status}`);
     }
   }
 
   /** Returns the progress comment of the cancelled review, or null when Manki has none that is still running. */
-  private async runningProgress(token: string, item: WorkRow, running: WorkRow, target: Target): Promise<{ id: number; body: string } | null> {
+  private async runningProgress(token: string, ticked: number | null, running: WorkRow, target: Target): Promise<{ id: number; body: string } | null> {
     const repo = `/repos/${target.owner}/${target.repo}`;
     // Only a comment posted since the run started can be its own. An older one still in progress is from a run that died.
     // The first attempt bounds the start, since a run adopted after a lost dispatch response started before its adoption.
     const since = (running.first_attempt_at ?? running.dispatched_at ?? Date.now()) - MINUTE;
     const isOwn = (comment: IssueCommentRead) =>
       !!comment.body && isRunningProgress(comment.body) && Date.parse(comment.created_at ?? '') >= since;
-    if (item.object_id !== null) {
-      const read = await githubApi(token, `${repo}/issues/comments/${item.object_id}`);
+    if (ticked !== null) {
+      const read = await githubApi(token, `${repo}/issues/comments/${ticked}`);
       if (read.ok) {
         const comment = await read.json() as IssueCommentRead;
-        if (isOwn(comment)) return { id: item.object_id, body: comment.body! };
+        if (isOwn(comment)) return { id: ticked, body: comment.body! };
       } else if (read.status !== 404) {
         throw new Error(`reading the settings comment failed with ${read.status}`);
       }
@@ -1489,16 +1496,28 @@ export class PrCoordinator extends DurableObject<Env> {
     }
     // Past the deadline the run is cancelled even when it could not be read, since only a cancel frees the lane.
     if (now - dispatchedAt > RUN_DEADLINE_MS) {
-      await this.cancel(item, target, 'no end of the run seen in time');
+      if (await this.cancel(item, target, 'no end of the run seen in time')) {
+        await this.reportTimedOut(item, target, `no end of the run was seen within ${RUN_DEADLINE_MS / MINUTE} minutes`);
+      }
       return;
     }
     if (!run) return;
     const startedAt = run.run_started_at ? Date.parse(run.run_started_at) : dispatchedAt;
+    // A run that never started posted no progress comment or check, so only a run that started has any to end.
     if (NOT_STARTED.has(run.status) && now - dispatchedAt > QUEUED_RUN_TIMEOUT_MS) {
       await this.cancel(item, target, 'run never started', item.requeues === 0);
     } else if (!NOT_STARTED.has(run.status) && now - startedAt > RUNNING_RUN_TIMEOUT_MS) {
-      await this.cancel(item, target, 'run went past its timeout');
+      if (await this.cancel(item, target, 'run went past its timeout')) {
+        await this.reportTimedOut(item, target, `it ran longer than ${RUNNING_RUN_TIMEOUT_MS / MINUTE} minutes`);
+      }
     }
+  }
+
+  /** Ends the progress comment and check of a review whose run the poll cancelled, saying `why`. */
+  private async reportTimedOut(item: WorkRow, target: Target, why: string): Promise<void> {
+    if (item.kind !== 'review') return;
+    // The review's own comment id names the comment that asked for it, which can be someone else's, so only Manki's are searched.
+    await this.reportStopped(item, target, null, 'Review stopped', `Review stopped: ${why}.`);
   }
 
   /** Records a poll that reached GitHub, so the next one comes after the normal interval. */

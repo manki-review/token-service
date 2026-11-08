@@ -1979,16 +1979,42 @@ describe('PrCoordinator dispatch', () => {
     ]);
   });
 
-  it('cancels a run that went past its timeout', async () => {
+  it('cancels a run that went past its timeout, and ends its progress comment and check', async () => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
     await pr.send('pull_request', pr.push(SHA_1));
     await runDurableObjectAlarm(pr.stub);
     github.runs.set(9000, { status: 'in_progress', run_started_at: new Date().toISOString() });
+    // The run's progress comment and check. The post step of a run the Worker cancelled can no longer end them.
+    const progress = '**Review in progress**\n<!-- manki-bot -->';
+    github.issueComments.set(1400, progress);
+    github.commentCreated.set(1400, new Date().toISOString());
+    github.openChecks = [{ id: 70, head_sha: SHA_1 }];
     advanceClock(RUNNING_RUN_TIMEOUT_MS + 1);
     await runDurableObjectAlarm(pr.stub);
     expect(github.cancels).toEqual([9000]);
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'timed_out', note: 'run went past its timeout, cancel requested' }]);
+    const headline = 'Review stopped: it ran longer than 40 minutes.';
+    expect(github.issueComments.get(1400)).toBe(
+      `**${headline}**\n\n<details><summary>Original progress</summary>\n\n${progress}\n\n</details>\n\n<!-- manki-review-cancelled -->`,
+    );
+    expect(github.checkEdits).toEqual([
+      { id: 70, body: { status: 'completed', conclusion: 'cancelled', output: { title: 'Review stopped', summary: headline } } },
+    ]);
+
+    // A run cancelled at the deadline, because its end was never seen, says that instead.
+    github.head = SHA_2;
+    await pr.send('pull_request', pr.push(SHA_2));
+    await runDurableObjectAlarm(pr.stub);
+    github.issueComments.set(1401, progress);
+    github.commentCreated.set(1401, new Date().toISOString());
+    github.openChecks = [{ id: 71, head_sha: SHA_2 }];
+    github.runReadStatus = 500;
+    advanceClock(RUN_DEADLINE_MS + 1);
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.cancels).toEqual([9000, 9001]);
+    expect(github.issueComments.get(1401)).toContain('**Review stopped: no end of the run was seen within 75 minutes.**');
+    expect(github.checkEdits.at(-1)).toMatchObject({ id: 71, body: { output: { title: 'Review stopped' } } });
   });
 
   it('retries a failed dispatch after a backoff and adopts the run of an attempt whose response was lost', async () => {
@@ -2295,6 +2321,7 @@ describe('PrCoordinator dispatch', () => {
     await runDurableObjectAlarm(pr.stub);
     github.runReadStatus = 500;
     github.cancelStatuses = [500];
+    github.openChecks = [{ id: 70, head_sha: SHA_1 }];
     advanceClock(RUN_DEADLINE_MS - MINUTE);
     await runDurableObjectAlarm(pr.stub);
     expect(github.cancels).toEqual([]);
@@ -2306,6 +2333,8 @@ describe('PrCoordinator dispatch', () => {
     await runDurableObjectAlarm(pr.stub);
     expect(github.cancels).toEqual([9000, 9000]);
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'timed_out', note: 'no end of the run seen in time, cancel requested' }, { status: 'running' }]);
+    // A run other than a review has no progress comment or check to end.
+    expect(github.checkEdits).toEqual([]);
   });
 
   it('ends a run past the deadline once it is seen completed', async () => {
