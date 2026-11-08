@@ -1,6 +1,6 @@
 import { readBody } from './body';
 import { allowedAccounts, type Env } from './env';
-import { hasWriteAccess, mintRepositoryToken } from './github';
+import { githubGraphql, hasWriteAccess, mintRepositoryToken } from './github';
 import { eventsPerHour } from './limiter';
 import { log } from './log';
 import { routeDelivery, type Route, type Target, type Work, type WebhookPayload } from './routing';
@@ -13,18 +13,21 @@ const DELIVERY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 const WRITER_CACHE_MS = 5 * 60_000;
 const MAX_CACHED_WRITERS = 10_000;
 const writers = new Map<string, { writer: boolean; until: number }>();
-/** The `metadata: read` tokens of the lookups, by installation and repository. Kept in memory only, never logged. */
+/** The read-only tokens of the lookups, by installation and repository. Kept in memory only, never logged. */
 const lookupTokens = new Map<string, { token: string; expiresAt: number }>();
 /** A token is minted again this long before it expires, so a lookup never uses one that runs out midway. */
 const TOKEN_MARGIN_MS = 5 * 60_000;
 
-/** Returns a `metadata: read` token for the target's repository, minting one only when none is held or it nears expiry. */
+/**
+ * Returns a token for the target's repository that reads permissions, and pull requests for an editor lookup, minting
+ * one only when none is held or it nears expiry.
+ */
 async function lookupToken(env: Env, target: Target): Promise<string> {
   const key = `${target.installationId}:${target.repositoryId}`;
   const held = lookupTokens.get(key);
   if (held && held.expiresAt - TOKEN_MARGIN_MS > Date.now()) return held.token;
   const repository = `${target.owner}/${target.repo}`;
-  const mint = await mintRepositoryToken(env, target.installationId, target.repositoryId, { metadata: 'read' }, { purpose: 'writer_check', repository });
+  const mint = await mintRepositoryToken(env, target.installationId, target.repositoryId, { metadata: 'read', pull_requests: 'read' }, { purpose: 'writer_check', repository });
   if (!mint.ok) throw new Error(`the token mint failed with ${mint.status}`);
   if (lookupTokens.size >= MAX_CACHED_WRITERS) lookupTokens.clear();
   lookupTokens.set(key, { token: mint.token, expiresAt: mint.expiresAt });
@@ -49,6 +52,21 @@ async function isWriter(env: Env, target: Target, login: string): Promise<boolea
     log('webhook_writer_check_failed', { repository_id: target.repositoryId, sender: login, error: String(error) });
     return false;
   }
+}
+
+/**
+ * Names the last editor of an edited review as the work's sender, since GitHub sends the review's author. Returns
+ * `null` when the editor is unknown or a bot, such as Manki rewriting its own review. Throws when the lookup fails.
+ */
+async function editedWork(env: Env, target: Target, work: Work): Promise<Work | null> {
+  if (!work.editorOf) return work;
+  const { node } = await githubGraphql<{ node: { editor: { login: string; __typename: string } | null } | null }>(
+    await lookupToken(env, target),
+    'query($id: ID!) { node(id: $id) { ... on PullRequestReview { editor { login __typename } } } }',
+    { id: work.editorOf },
+  );
+  const editor = node?.editor;
+  return editor && editor.__typename !== 'Bot' ? { ...work, sender: editor.login } : null;
 }
 
 /** Settles `writer` with a lookup when the payload cannot. A writer is a repository user, so the work is trusted too. */
@@ -129,7 +147,17 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
   let route: Route = routed.type !== 'ignore' && !allowedAccounts(env).has(routed.target.ownerId)
     ? { type: 'ignore', reason: `account ${routed.target.ownerId} is not in WEBHOOK_ACCOUNTS` }
     : routed;
-  if (route.type === 'work') route = { ...route, work: await checkedWork(env, route.target, route.work) };
+  if (route.type === 'work') {
+    let edited: Work | null;
+    try {
+      edited = await editedWork(env, route.target, route.work);
+    } catch (error) {
+      // The tick would be lost, so the delivery fails and can be delivered again, as for a coordinator failure.
+      log('webhook_editor_lookup_failed', { delivery, repository_id: route.target.repositoryId, error: String(error) });
+      return Response.json({ error: 'Could not read the review\'s editor' }, { status: 500 });
+    }
+    route = edited ? { ...route, work: await checkedWork(env, route.target, edited) } : { type: 'ignore', reason: 'the review\'s editor is unknown or a bot' };
+  }
   // One installation may store only so many deliveries from people without write access an hour, so a flood from it
   // cannot use up the quota either, and outsiders only use up their own share. A close or a run's end is never capped.
   // Only a writer can edit Manki's settings comment, so its edits are exempt although the editor is looked up later.

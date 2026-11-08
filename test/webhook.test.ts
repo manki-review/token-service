@@ -179,6 +179,47 @@ describe('/webhook', () => {
     expect(await workRows(coordinator(REPOSITORY_ID, number))).toMatchObject([{ sender: login, writer, trusted }]);
   });
 
+  it.each<[string, { login: string; __typename: string } | null, string, number | null]>([
+    ['a writer', { login: 'box-writer', __typename: 'User' }, 'write', 1],
+    ['an editor without write access', { login: 'box-reader', __typename: 'User' }, 'read', 0],
+    ['Manki itself', { login: 'manki-review', __typename: 'Bot' }, 'write', null],
+    ['an unknown editor', null, 'write', null],
+  ])('names the last editor of Manki\'s review as the sender of a box tick by %s', async (_case, editor, permission, writer) => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const graphql = vi.fn(async () => Response.json({ data: { node: { editor } } }));
+    stubGitHub({ permissions: editor ? { [editor.login]: permission } : {}, api: { 'POST /graphql': graphql } });
+    // Numbers of their own, apart from the lookups above and below.
+    const number = 70 + [null, 'box-writer', 'box-reader', 'manki-review'].indexOf(editor?.login ?? null);
+    const box = '- [ ] Create an issue for this <!-- manki-box:issue:src/a.ts:3:Off-by-one -->';
+    // GitHub sends an edit of a review with the review's author as the sender.
+    const payload = {
+      ...reviewEvent('edited', { user: MANKI_AUTHOR, node_id: 'PRR_tick', body: box.replace('[ ]', '[x]') }, { number }),
+      sender: MANKI_AUTHOR,
+      changes: { body: { from: box } },
+    };
+
+    expect((await postWebhook({ event: 'pull_request_review', payload })).status).toBe(202);
+
+    expect(graphql).toHaveBeenCalledTimes(1);
+    expect(await workRows(coordinator(REPOSITORY_ID, number))).toMatchObject(writer === null ? [] : [{ sender: editor?.login, writer, event: 'pull_request_review.edited' }]);
+  });
+
+  it('fails the delivery of a box tick in Manki\'s review when the editor lookup fails, so it can be delivered again', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    stubGitHub({ api: { 'POST /graphql': { status: 502, body: { message: 'Bad gateway' } } } });
+    const box = '- [ ] Create an issue for this <!-- manki-box:issue:src/a.ts:3:Off-by-one -->';
+    const payload = {
+      ...reviewEvent('edited', { user: MANKI_AUTHOR, node_id: 'PRR_fail', body: box.replace('[ ]', '[x]') }, { number: 75 }),
+      sender: MANKI_AUTHOR,
+      changes: { body: { from: box } },
+    };
+
+    expect((await postWebhook({ event: 'pull_request_review', payload })).status).toBe(500);
+
+    expect(logged(log, 'webhook_editor_lookup_failed')).toHaveLength(1);
+    expect(await workRows(coordinator(REPOSITORY_ID, 75))).toEqual([]);
+  });
+
   it('looks up no owner, reuses an answer and its token, and reads a failed lookup as no write access', async () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const login = newLogin();

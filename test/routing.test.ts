@@ -24,6 +24,15 @@ const SETTINGS_COMMENT = '- [ ] Pause automatic reviews <!-- manki-box:pause -->
 const FINDING_COMMENT = '**Off by one**\n\n- [ ] Create an issue for this <!-- manki-box:issue:src/a.ts:3:3:Off-by-one -->\n\n<!-- manki-finding: {} -->';
 const TICKED_FINDING = FINDING_COMMENT.replace('[ ] Create', '[x] Create');
 
+/** An edit of Manki's review body from `before` to `after`. GitHub names the review's author, Manki, as the sender. */
+function reviewEdit(after: string, before?: string, review: Record<string, unknown> = {}): WebhookPayload {
+  return {
+    ...reviewEvent('edited', { user: MANKI_AUTHOR, body: after, node_id: 'PRR_1', ...review }),
+    sender: MANKI_AUTHOR,
+    ...(before !== undefined && { changes: { body: { from: before } } }),
+  };
+}
+
 /** An edit of Manki's finding comment from `before` to `after`, by a writer. */
 function findingEdit(after: string, before?: string, author = MANKI_AUTHOR): WebhookPayload {
   return { ...reviewCommentEvent(after, { user: author }, 'edited'), ...(before !== undefined && { changes: { body: { from: before } } }) };
@@ -73,6 +82,12 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['a submitted review', 'pull_request_review', reviewEvent('submitted'), 'state:review_state'],
   ['a dismissed review', 'pull_request_review', reviewEvent('dismissed'), 'state:review_state'],
   ['an edited review', 'pull_request_review', reviewEvent('edited'), 'ignore'],
+  ['a ticked issue box in Manki\'s review', 'pull_request_review', reviewEdit(TICKED_FINDING, FINDING_COMMENT), 'state:thread'],
+  ['Manki\'s rewrite of its review that ticks no box', 'pull_request_review', reviewEdit(`${FINDING_COMMENT}\nheld`, FINDING_COMMENT), 'ignore'],
+  ['an unticked issue box in Manki\'s review', 'pull_request_review', reviewEdit(FINDING_COMMENT, TICKED_FINDING), 'ignore'],
+  ['a Manki review edit without the earlier body', 'pull_request_review', reviewEdit(TICKED_FINDING), 'ignore'],
+  ['a ticked box in Manki\'s review without its node id', 'pull_request_review', reviewEdit(TICKED_FINDING, FINDING_COMMENT, { node_id: undefined }), 'ignore'],
+  ['a ticked box in Manki\'s review on a fork PR', 'pull_request_review', { ...reviewEdit(TICKED_FINDING, FINDING_COMMENT), pull_request: forkPullRequestEvent('x').pull_request }, 'ignore'],
   ['a review by a bot', 'pull_request_review', reviewEvent('submitted', { user: MANKI_AUTHOR }), 'ignore'],
   ['a review on a stale commit', 'pull_request_review', reviewEvent('submitted', { commit_id: 'b'.repeat(40) }), 'ignore'],
   ['a review on a fork PR', 'pull_request_review', { ...reviewEvent('submitted'), pull_request: forkPullRequestEvent('x').pull_request }, 'ignore'],
@@ -258,6 +273,13 @@ describe('routeDelivery', () => {
   ])('marks %s as a writer or not, and whether to look the sender up', (_case, event, payload, writer, checkWriter) => {
     const route = routeDelivery(event, payload);
     expect(route.type === 'work' && { writer: route.work.writer, checkWriter: route.work.checkWriter }).toEqual({ writer, checkWriter });
+  });
+
+  it('leaves the sender of a tick in Manki\'s review to the editor lookup', () => {
+    const route = routeDelivery('pull_request_review', reviewEdit(TICKED_FINDING, FINDING_COMMENT));
+    expect(route.type === 'work' && route.work).toMatchObject({
+      event: 'pull_request_review.edited', objectId: REVIEW_ID, sender: '', editorOf: 'PRR_1', writer: false, checkWriter: true, acknowledge: false,
+    });
   });
 
   it('names the boxes a settings edit ticked or unticked, and counts the editor as no writer until looked up', () => {

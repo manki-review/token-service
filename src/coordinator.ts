@@ -979,7 +979,7 @@ export class PrCoordinator extends DurableObject<Env> {
    */
   private async senderMayAsk(item: WorkRow): Promise<boolean> {
     const asked = item.event.startsWith('issue_comment.') || item.event.startsWith('pull_request_review_comment.')
-      || item.event === 'pull_request_review.submitted';
+      || item.event === 'pull_request_review.submitted' || item.event === 'pull_request_review.edited';
     if (item.writer || !asked) return true;
     if (!item.sender) return false;
     const cached = this.writers.get(item.sender);

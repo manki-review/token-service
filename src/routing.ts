@@ -93,6 +93,11 @@ export interface Work {
   boxes?: BoxChange[];
   /** For a settings edit, when the comment was edited, so a late delivery cannot undo a newer edit. */
   editedAt?: number;
+  /**
+   * The node id of an edited review whose last editor is the sender. GitHub names the review's author as the sender of
+   * the edit, so the editor is looked up before the work counts.
+   */
+  editorOf?: string;
 }
 
 export type Route =
@@ -136,7 +141,7 @@ export interface WebhookPayload {
     created_at?: string;
     updated_at?: string;
   };
-  review?: { id?: number; commit_id?: string; user?: User; author_association?: string };
+  review?: { id?: number; node_id?: string; body?: string; commit_id?: string; user?: User; author_association?: string };
   /** What an `edited` action changed, with the earlier body. */
   changes?: { body?: { from?: string } };
   workflow_run?: { id?: number; event?: string; path?: string; display_title?: string; conclusion?: string | null };
@@ -256,6 +261,11 @@ export function routeDelivery(event: string, payload: WebhookPayload, now = Date
     return { type: 'close', target, merged: recordsFixRate ? work('state', 'merged', payload, event) : null, at };
   }
 
+  // A tick in Manki's own review arrives with Manki as the sender, so it is routed before bot events are dropped.
+  if (event === 'pull_request_review' && payload.action === 'edited' && MANKI_LOGINS.includes(payload.review?.user?.login ?? '')) {
+    return routeReviewBoxTick(target, payload);
+  }
+
   // Manki skips a bot's push. The coordinator still records the head, so the cron does not review it later.
   if (isBot(payload.sender)) {
     const headSha = payload.pull_request?.head?.sha;
@@ -301,6 +311,22 @@ function routeReview(target: Target, payload: WebhookPayload): Route {
   const headSha = payload.pull_request?.head?.sha;
   if (review?.commit_id && headSha && review.commit_id !== headSha) return ignore('review is for a stale commit');
   return { type: 'work', target, work: work('state', 'review_state', payload, 'pull_request_review', review?.id ?? null) };
+}
+
+/**
+ * Routes an edit of Manki's review that ticks a finding's issue box. The sender is left to the editor lookup, and the
+ * editor must have write access. Manki's own rewrite of its review ticks no box, so it is dropped here.
+ */
+function routeReviewBoxTick(target: Target, payload: WebhookPayload): Route {
+  const before = payload.changes?.body?.from;
+  if (before === undefined || tickedIssueBoxes(before, payload.review?.body ?? '').length === 0) return ignore('no issue box ticked');
+  if (isForkHead(payload)) return ignore('head is on a fork');
+  const nodeId = payload.review?.node_id;
+  if (!nodeId) return ignore('review lacks its node id');
+  return { type: 'work', target, work: {
+    ...work('state', 'thread', payload, 'pull_request_review', payload.review?.id ?? null),
+    sender: '', acknowledge: false, writer: false, checkWriter: true, editorOf: nodeId,
+  } };
 }
 
 /**
