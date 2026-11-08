@@ -1362,6 +1362,20 @@ describe('PrCoordinator dispatch', () => {
     expect(github.checkRuns.map((check) => check.head_sha)).toEqual([SHA_1, SHA_1, SHA_2]);
   });
 
+  it('still skips a conflicting PR when posting the note failed once, since no dispatch was tried', async () => {
+    const pr = pullRequest();
+    const github = Object.assign(fakeGitHub(pr.number), { mergeable: [false] as Array<boolean | null>, mergeableState: 'dirty', commentStatus: 502 });
+    await pr.send('pull_request', pr.push(SHA_1));
+    await runDurableObjectAlarm(pr.stub);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'dispatching', attempts: 0, errors: 1 }]);
+    github.commentStatus = 201;
+    advanceClock(backoff(0));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches).toEqual([]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped', conclusion: 'conflict' }]);
+    expect(github.mints).toContainEqual({ permissions: { issues: 'write' }, repository_ids: [REPOSITORY_ID] });
+  });
+
   it('reviews a PR GitHub has not computed mergeability for after reading it twice more, and a clean one at once', async () => {
     const pr = pullRequest();
     const github = Object.assign(fakeGitHub(pr.number), { mergeable: [null], mergeableState: 'unknown' });

@@ -1171,7 +1171,7 @@ export class PrCoordinator extends DurableObject<Env> {
    */
   private async reportConflict(pr: PullRequestRead, target: Target): Promise<void> {
     const text = `This PR conflicts with \`${pr.base.ref}\`. Rebase it, and Manki reviews it then.`;
-    const token = await this.token({ issues: 'write', pull_requests: 'write' });
+    const token = await this.token({ issues: 'write' });
     if (token !== null) {
       const body = `${text}\n\n${CONFLICT_NOTE_MARKER}`;
       const noteId = this.getMeta<number>('conflict_note');
