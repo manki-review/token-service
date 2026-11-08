@@ -3,6 +3,14 @@ name: Deploy
 on:
   push:
     branches: [main]
+    # Only what goes into the Worker, so a docs or config change asks for no deploy.
+    paths:
+      - 'src/**'
+      - 'wrangler.toml'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - '.github/workflows/deploy.yml'
   workflow_dispatch:
 
 permissions:

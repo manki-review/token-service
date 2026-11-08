@@ -190,7 +190,7 @@ To rotate the webhook secret, put the current one into `WEBHOOK_SECRET_PREVIOUS`
 
 ## Deployment
 
-`.github/workflows/deploy.yml` deploys the Worker with [`cloudflare/wrangler-action`](https://github.com/cloudflare/wrangler-action) on every push to `main` and on a manual run (`workflow_dispatch`). It runs the same tests as CI first. The deploy job runs in the `production` environment, so it waits for the owner's approval, and only that job can read the Cloudflare API token.
+`.github/workflows/deploy.yml` deploys the Worker with [`cloudflare/wrangler-action`](https://github.com/cloudflare/wrangler-action) on a manual run (`workflow_dispatch`) and on a push to `main` that changes what goes into the Worker: `src/`, `wrangler.toml`, `package.json`, `package-lock.json`, `tsconfig.json` or the workflow itself. A push that changes only other files, such as the README, `.manki.yml` or the tests, deploys nothing. It runs the same tests as CI first. The deploy job runs in the `production` environment, so it waits for the owner's approval, and only that job can read the Cloudflare API token.
 
 GitHub never holds the App key or the webhook secret. The Worker secrets above stay set by hand with `wrangler secret put`, and a deploy keeps them.
 
