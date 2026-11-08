@@ -73,6 +73,8 @@ export interface WorkRow extends Record<string, string | number | null> {
   kind: Work['kind'];
   event: string;
   head_sha: string | null;
+  /** The PR head when the review's run was last dispatched, whatever started it. */
+  run_head: string | null;
   object_id: number | null;
   sender: string;
   delivery: string;
@@ -227,6 +229,7 @@ export const MIGRATIONS = [
    ALTER TABLE work ADD COLUMN boxes TEXT;`,
   `ALTER TABLE work ADD COLUMN passed_at INTEGER;`,
   `ALTER TABLE work ADD COLUMN merge_checks INTEGER NOT NULL DEFAULT 0;`,
+  `ALTER TABLE work ADD COLUMN run_head TEXT;`,
 ];
 
 const ACTIVE = `status IN ('dispatching', 'running')`;
@@ -1043,7 +1046,7 @@ export class PrCoordinator extends DurableObject<Env> {
       if (!pr.ok) throw new Error(`reading the pull request failed with ${pr.status}`);
       const head = ((await pr.json()) as PullRequestRead).head.sha;
       const progress = await this.runningProgress(token, item, running, target);
-      const reviewing = running.head_sha ?? (progress && settingsHead(progress.body));
+      const reviewing = running.run_head ?? (progress && settingsHead(progress.body));
       if (!reviewing) return this.requestReview(item, mode);
       if (head.startsWith(reviewing)) {
         // The box may be ticked on another settings comment than the running review's, which then gets unticked too.
@@ -1151,7 +1154,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const repo = `/repos/${target.owner}/${target.repo}`;
     const checks = await this.token({ checks: 'write' });
     if (checks === null) return;
-    let head = running.head_sha;
+    let head = running.run_head;
     if (head === null) {
       const pr = await githubApi(checks, `${repo}/pulls/${target.number}`);
       if (!pr.ok) throw new Error(`reading the pull request failed with ${pr.status}`);
@@ -1287,6 +1290,7 @@ export class PrCoordinator extends DurableObject<Env> {
         return false;
       }
     }
+    this.sql.exec('UPDATE work SET run_head = ? WHERE id = ?', pr.head.sha, item.id);
     return true;
   }
 
