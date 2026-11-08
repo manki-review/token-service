@@ -289,7 +289,7 @@ describe('routeDelivery', () => {
       type: 'work',
       work: { lane: 'settings', kind: 'settings', event: 'issue_comment.edited', writer: false, acknowledge: false, boxes: [{ box: 'pause', ticked: true }, { box: 'again', ticked: false }] },
     });
-    const deeper = '- [ ] Review again, deeper (two reviewers, higher effort) <!-- manki-box:deeper -->\n<!-- manki-settings -->';
+    const deeper = '- [ ] Deeper review <!-- manki-box:deeper -->\n<!-- manki-settings -->';
     expect(routeDelivery('issue_comment', issueCommentEvent(deeper.replace('[ ]', '[x]'), { action: 'edited', author: MANKI_AUTHOR, previousBody: deeper }))).toMatchObject({
       type: 'work', work: { boxes: [{ box: 'deeper', ticked: true }] },
     });
