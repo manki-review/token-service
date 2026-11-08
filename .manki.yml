@@ -15,6 +15,10 @@ instructions: |
     gets deleted, and Free-plan request and subrequest limits
   - Secrets or tokens reaching responses or logs
 
+# Manki calls the Worker's endpoints and runs on the workflow runs the Worker dispatches.
+related_repos:
+  - { repo: manki-review/manki, kind: consumer, paths: [src/, action.yml, docs/] }
+
 # Read from the base branch only, so a PR cannot weaken its own review.
 review:
   classes:
