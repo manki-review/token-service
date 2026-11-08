@@ -188,6 +188,24 @@ The client ID is not secret, so `APP_CLIENT_ID` can also go into `[vars]` in `wr
 
 To rotate the webhook secret, put the current one into `WEBHOOK_SECRET_PREVIOUS`, then the new one into `WEBHOOK_SECRET` and the App's settings, and delete `WEBHOOK_SECRET_PREVIOUS` once deliveries verify under the new one.
 
+## Deployment
+
+`.github/workflows/deploy.yml` deploys the Worker with [`cloudflare/wrangler-action`](https://github.com/cloudflare/wrangler-action) on every push to `main` and on a manual run (`workflow_dispatch`). It runs the same tests as CI first. The deploy job runs in the `production` environment, so it waits for the owner's approval, and only that job can read the Cloudflare API token.
+
+GitHub never holds the App key or the webhook secret. The Worker secrets above stay set by hand with `wrangler secret put`, and a deploy keeps them.
+
+The `production` environment is set up in the repository settings:
+
+- Required reviewers: the owner, with Prevent self-review off, since the owner approves their own merges.
+- Deployment branches and tags: only `main`.
+- Environment secret `CLOUDFLARE_API_TOKEN`: a Cloudflare API token with only these permissions:
+  - Account, Workers Scripts, Edit, with Account Resources set to the account that runs the Worker.
+  - Zone, Workers Routes, Edit, with Zone Resources set to the specific zone `dustinface.me`.
+  - Zone, Zone, Read, on the same zone. Wrangler looks up the zone of the route in `wrangler.toml` by its name.
+- Environment variable `CLOUDFLARE_ACCOUNT_ID`: the account ID from the account's overview page in the dashboard. Wrangler needs it to deploy from CI.
+
+To rotate the token, create a new one with the same permissions (My Profile, API Tokens, Create Token, Create Custom Token), replace the secret in `production`, and delete the old token in the dashboard. For a manual deploy from a laptop, use `wrangler login` rather than a token in the shell environment.
+
 ## Development
 
 ```sh
@@ -195,5 +213,5 @@ npm install
 npm run dev        # local dev server
 npm run typecheck  # type-check the Worker and the tests
 npm test           # run the tests
-npm run deploy     # deploy to Cloudflare
+npm run deploy     # deploy by hand, outside the workflow
 ```
