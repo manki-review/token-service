@@ -1775,10 +1775,15 @@ describe('PrCoordinator dispatch', () => {
       expect(github.checkEdits).toEqual([{ id: 70, body: { status: 'completed', conclusion: 'cancelled', output: { title: 'Review cancelled', summary: newCommits } } }]);
       expect(await state()).toMatchObject({ active: [{ kind: 'review', run_id: 9001, modes: ['again'] }] });
 
-      // Deeper review replaces the running review right away, on any head.
+      // Deeper review replaces the running review right away, on any head. The replaced review came from a box, and its
+      // check on the head it reviews is completed even after the PR moved on.
+      github.head = SHA_3;
+      github.openChecks = [{ id: 71, head_sha: SHA_2 }];
       await edit([], ['deeper'], 'alice', new Date().toISOString(), reviewing);
       expect(github.cancels).toEqual([9000, 9001]);
-      expect(github.issueComments.get(SETTINGS)).toBe(replaced('Review replaced by a deeper review requested by @alice.', 'deeper'));
+      const deeper = 'Review replaced by a deeper review requested by @alice.';
+      expect(github.issueComments.get(SETTINGS)).toBe(replaced(deeper, 'deeper'));
+      expect(github.checkEdits.at(-1)).toEqual({ id: 71, body: { status: 'completed', conclusion: 'cancelled', output: { title: 'Review cancelled', summary: deeper } } });
       expect(await state()).toMatchObject({ active: [{ kind: 'review', run_id: 9002, modes: ['deeper'] }] });
       expect((await workRows(pr.stub)).filter((row) => row.kind === 'settings').map((row) => row.note).slice(-2))
         .toEqual(['replacing work 1 requested, again review work 5', 'replacing work 5 requested, deeper review work 7']);
