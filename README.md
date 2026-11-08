@@ -99,6 +99,8 @@ Review memory lives in one central repository, `MEMORY_REPO` in `wrangler.toml` 
 
 **Identity.** Every endpoint takes the run's OIDC token as the bearer token and a JSON body with `owner`, `repo` and `pr`, the PR or issue number of the run. The token must be for that repository, from `workflow_dispatch`, from a workflow file of the repository on a branch, as for `/token`. The coordinator of `pr` must hold the token's `run_id` as dispatching or running, from that workflow file, on the default branch. Otherwise the answer is `403` with `Only the run Manki dispatched may use memory: <reason>` and a `memory_refused` log line, before the Worker touches the memory repository.
 
+**Public repositories only.** Central memory is shared, so a private repository never uses it. A token whose `repository_visibility` claim is not `public`, such as `private`, `internal` or a missing claim, gets `403` with `Only a public repository may use memory: repository visibility is <visibility>` and a `memory_refused` log line. This check comes before the dispatched-run check.
+
 **`POST /memory/read`** with `{ owner, repo, pr }` returns `200`:
 
 ```json

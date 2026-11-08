@@ -19,6 +19,8 @@ export interface OIDCClaims {
   /** `<owner>/<repo>/<path>@<ref>` of the workflow file the run started from. */
   workflow_ref: string;
   ref: string;
+  /** `public`, `private` or `internal`. */
+  repository_visibility?: string;
   check_run_id?: string;
   [key: string]: unknown;
 }

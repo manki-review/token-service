@@ -209,13 +209,18 @@ describe('/memory', () => {
     expect(apiRequests(requests)).toEqual([]);
   });
 
+  const NOT_DISPATCHED = 'Only the run Manki dispatched may use memory';
+  const NOT_PUBLIC = 'Only a public repository may use memory';
   it.each([
-    ['a pull_request workflow', { event_name: 'pull_request' }, null, 'event pull_request is not workflow_dispatch'],
-    ['a run its coordinator does not hold', {}, 'run 9000 is not active on this PR', 'run 9000 is not active on this PR'],
-  ])('refuses %s before it touches the memory repository', async (_case, claims, refusal, reason) => {
+    ['a pull_request workflow', { event_name: 'pull_request' }, null, NOT_DISPATCHED, 'event pull_request is not workflow_dispatch'],
+    ['a run its coordinator does not hold', {}, 'run 9000 is not active on this PR', NOT_DISPATCHED, 'run 9000 is not active on this PR'],
+    ['a private repository', { repository_visibility: 'private' }, null, NOT_PUBLIC, 'repository visibility is private'],
+    ['an internal repository', { repository_visibility: 'internal' }, null, NOT_PUBLIC, 'repository visibility is internal'],
+    ['a token without a visibility claim', { repository_visibility: undefined }, null, NOT_PUBLIC, 'repository visibility is missing'],
+  ])('refuses %s before it touches the memory repository', async (_case, claims, refusal, error, reason) => {
     const { requests } = fakeMemory();
     const { env: refusing, checks } = dispatchedEnv(refusal);
-    expect(await call('read', {}, { env: refusing, claims })).toEqual({ status: 403, body: { error: `Only the run Manki dispatched may use memory: ${reason}` } });
+    expect(await call('read', {}, { env: refusing, claims })).toEqual({ status: 403, body: { error: `${error}: ${reason}` } });
     // Only the requesting repository's installation is looked up, as for every OIDC endpoint.
     expect(apiRequests(requests).map((request) => new URL(request.url).pathname)).toEqual([`/repos/${OWNER}/${REPO}/installation`]);
     expect(checks).toEqual(refusal === null ? [] : [[`${REPOSITORY_ID}:7`, DISPATCHED_RUN_ID, null, 'manki.yml', 'refs/heads/main']]);

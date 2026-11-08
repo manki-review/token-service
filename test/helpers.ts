@@ -112,6 +112,7 @@ export async function oidcToken(options: OidcTokenOptions = {}): Promise<string>
     event_name: 'workflow_dispatch',
     workflow_ref: `${OWNER}/${REPO}/.github/workflows/manki.yml@refs/heads/main`,
     ref: 'refs/heads/main',
+    repository_visibility: 'public',
     ...options.claims,
   })
     .setProtectedHeader({ alg: 'RS256', kid: OIDC_KID })

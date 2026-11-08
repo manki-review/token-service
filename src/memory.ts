@@ -130,15 +130,20 @@ export async function handleMemory(request: Request, env: Env, operation: Memory
   const repository = env.MEMORY_REPO;
   if (!repository || !/^[^/]+\/[^/]+$/.test(repository)) return bad('no memory repository is configured', 503);
 
+  const audit = { repository: claims.repository, pr: body.pr, run_id: claims.run_id, operation };
+  const refuse = (error: string, reason: string) => {
+    log('memory_refused', { ...audit, reason });
+    return bad(`${error}: ${reason}`, 403);
+  };
+  // Central memory is shared, so a private repository's code must never reach it.
+  if (claims.repository_visibility !== 'public') {
+    return refuse('Only a public repository may use memory', `repository visibility is ${claims.repository_visibility ?? 'missing'}`);
+  }
   const workflow = dispatchedWorkflow(claims);
   const refused = typeof workflow === 'string'
     ? workflow
     : await env.PR_COORDINATOR.getByName(`${claims.repository_id}:${body.pr}`).refuseRun(Number(claims.run_id), null, workflow.file, workflow.ref);
-  const audit = { repository: claims.repository, pr: body.pr, run_id: claims.run_id, operation };
-  if (refused !== null) {
-    log('memory_refused', { ...audit, reason: refused });
-    return bad(`Only the run Manki dispatched may use memory: ${refused}`, 403);
-  }
+  if (refused !== null) return refuse('Only the run Manki dispatched may use memory', refused);
   // A folder is `<login>/<repo>`, and a login never holds `_`, so no repository's folder can be inside `_global`.
   const folder = claims.repository.toLowerCase();
 
