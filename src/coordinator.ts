@@ -64,6 +64,7 @@ export const CONFLICT_NOTE_MARKER = '<!-- manki-conflict-note -->';
 const NOT_STARTED = new Set(['queued', 'requested', 'waiting', 'pending']);
 /** A larger `.manki.yml` is not parsed for skip rules, as it costs too much CPU in an alarm. */
 const MAX_CONFIG_BYTES = 64 * 1024;
+const PAUSED_NOTE = 'pull request is paused';
 
 export type WorkStatus = 'queued' | 'dispatching' | 'running' | 'done' | 'failed' | 'timed_out' | 'dropped' | 'skipped';
 
@@ -217,11 +218,10 @@ const SETTINGS_COMMENT_READS = 5;
 
 /** Returns why a push waits out the pause, from the reported `reason` and the Pause box, and what reviews it. */
 function pausedSummary(reason: string | null, paused: boolean): string {
-  const box = paused ? ' by the **Pause automatic reviews** box on Manki\'s settings comment' : '';
-  // While the Action's pause holds, unticking Pause alone leaves later pushes paused.
-  const resume = paused && reason === null ? ', or untick Pause so later pushes are reviewed' : '';
-  return `${reason ? `${reason} ` : ''}Automatic review is paused${box}, so this commit waits. `
-    + `Tick **Review again** on Manki's settings comment to review it${resume}.`;
+  const box = paused ? ' by the **Pause automatic reviews** box' : '';
+  // While the Action's pause holds, unticking Pause alone reviews nothing.
+  const how = paused && reason === null ? 'Tick **Review again** or untick **Pause automatic reviews**' : 'Tick **Review again**';
+  return `${reason ? `${reason} ` : ''}Automatic review is paused${box}, so this commit waits. ${how} on Manki's settings comment to review it.`;
 }
 
 // Each entry runs once, in order. Append new entries; never edit a shipped one.
@@ -1069,7 +1069,7 @@ export class PrCoordinator extends DurableObject<Env> {
         const state = this.reported();
         if (state.settings.paused === ticked) continue;
         this.setMeta('pr_state', { ...state, settings: { paused: ticked } });
-        effects.push(ticked ? 'paused' : 'resumed');
+        effects.push(ticked ? 'paused' : state.pause === null ? this.resume(item) : 'resumed');
       } else if (ticked && (REVIEW_MODES as readonly string[]).includes(box)) {
         effects.push(await this.reviewBox(item, box as ReviewMode, at));
       } else if (ticked && box === 'cancel') {
@@ -1077,6 +1077,20 @@ export class PrCoordinator extends DurableObject<Env> {
       }
     }
     if (this.isDispatching(item.id)) this.finish(item.id, 'done', effects.join(', ') || 'nothing changed');
+  }
+
+  /**
+   * Lifts the Pause box. When the newest review is a push the pause skipped, nothing reviewed the PR since, so one
+   * review of that push is queued as if it had just arrived.
+   */
+  private resume(item: WorkRow): string {
+    const [newest] = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE kind = 'review' ORDER BY id DESC LIMIT 1`).toArray();
+    if (newest?.status !== 'skipped' || newest.note !== PAUSED_NOTE) return 'resumed';
+    const work: Work = {
+      lane: 'state', kind: 'review', event: newest.event, headSha: newest.head_sha, objectId: null, sender: '',
+      trusted: true, acknowledge: false, writer: true,
+    };
+    return `resumed, ${this.enqueue(work, item.delivery, Date.now())}`;
   }
 
   /**
@@ -1338,7 +1352,7 @@ export class PrCoordinator extends DurableObject<Env> {
       const { pause, settings } = this.reported();
       if (first && (pause !== null || settings.paused)) {
         await this.reportPaused(pr, target);
-        if (this.isDispatching(item.id)) this.finish(item.id, 'skipped', 'pull request is paused');
+        if (this.isDispatching(item.id)) this.finish(item.id, 'skipped', PAUSED_NOTE);
         return false;
       }
     }

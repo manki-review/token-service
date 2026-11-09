@@ -61,6 +61,7 @@ const SHA_1 = '1'.repeat(40);
 const SHA_2 = '2'.repeat(40);
 const SHA_3 = '3'.repeat(40);
 const SHA_4 = '4'.repeat(40);
+const SHA_5 = '5'.repeat(40);
 const MINUTE = 60_000;
 const DAY = 24 * 60 * MINUTE;
 
@@ -1731,8 +1732,8 @@ describe('PrCoordinator dispatch', () => {
         name: 'Manki', head_sha: SHA_1, status: 'completed', conclusion: 'action_required', details_url: `https://github.com/${OWNER}/${REPO}/pull/${pr.number}`,
         output: {
           title: 'Automatic review paused',
-          summary: "Automatic review is paused by the **Pause automatic reviews** box on Manki's settings comment, so this commit waits. "
-            + "Tick **Review again** on Manki's settings comment to review it, or untick Pause so later pushes are reviewed.",
+          summary: 'Automatic review is paused by the **Pause automatic reviews** box, so this commit waits. '
+            + "Tick **Review again** or untick **Pause automatic reviews** on Manki's settings comment to review it.",
         },
       }]);
       expect(github.issueComments.get(1400)).toBe(notice(`automatic review paused, \`${SHA_1.slice(0, 7)}\` waits`));
@@ -1759,8 +1760,40 @@ describe('PrCoordinator dispatch', () => {
       await pr.send('pull_request', pr.push(SHA_2));
       await runDurableObjectAlarm(pr.stub);
       expect(github.dispatches.at(-1)?.inputs).toMatchObject({ event: 'pull_request', head_sha: SHA_2 });
-      expect(github.checkRuns.map((check) => check.head_sha)).toEqual([SHA_1, SHA_4]);
-      expect((await workRows(pr.stub)).filter((row) => row.kind === 'settings').map((row) => row.note)).toEqual(['paused', 'again review work 6', 'resumed']);
+      await pr.stub.runCompleted(key('d-push'), 9001, 'success');
+
+      // Unticking Pause reviews the push the pause skipped once, as if it had just arrived.
+      await edit([], ['pause']);
+      github.head = SHA_3;
+      await pr.send('pull_request', pr.push(SHA_3));
+      await runDurableObjectAlarm(pr.stub);
+      expect(github.dispatches).toHaveLength(2);
+      await edit(['pause'], []);
+      expect(github.dispatches).toHaveLength(3);
+      expect(github.dispatches.at(-1)?.inputs).toMatchObject({ event: 'pull_request', action: 'synchronize', head_sha: SHA_3 });
+
+      // While the Action's own pause holds, unticking the box reviews nothing, and the check names both.
+      const token = await oidcToken({ claims: { repository_id: String(REPOSITORY_ID), run_id: '9002' } });
+      const report = await postToken({ path: '/state/report', token, body: { owner: OWNER, repo: REPO, pr: pr.number, pause: { reason: 'Round cap reached.' } } });
+      expect(report.status).toBe(200);
+      await pr.stub.runCompleted(key('d-resumed'), 9002, 'success');
+      await edit([], ['pause']);
+      github.head = SHA_5;
+      await pr.send('pull_request', pr.push(SHA_5));
+      await runDurableObjectAlarm(pr.stub);
+      expect(github.checkRuns.at(-1)?.output).toEqual({
+        title: 'Automatic review paused',
+        summary: 'Round cap reached. Automatic review is paused by the **Pause automatic reviews** box, so this commit waits. '
+          + "Tick **Review again** on Manki's settings comment to review it.",
+      });
+      await edit(['pause'], []);
+      expect(github.dispatches).toHaveLength(3);
+      expect(await state()).toMatchObject({ queue: [], active: [], settings: { paused: false } });
+
+      expect(github.checkRuns.map((check) => check.head_sha)).toEqual([SHA_1, SHA_4, SHA_3, SHA_5]);
+      expect((await workRows(pr.stub)).filter((row) => row.kind === 'settings').map((row) => row.note)).toEqual([
+        'paused', 'again review work 6', 'resumed', 'paused', 'resumed, queued work 12', 'paused', 'resumed',
+      ]);
     });
 
     it('turns a queued push review into one review with every mode ticked, which a pause cannot drop', async () => {
