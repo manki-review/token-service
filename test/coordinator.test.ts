@@ -684,6 +684,8 @@ function fakeGitHub(number: number) {
     configReads: [] as string[],
     checkRuns: [] as Array<Record<string, unknown>>,
     checkRunStatus: 201,
+    /** Runs while a check-run creation is in flight, before GitHub answers it. */
+    onCheckRun: null as (() => void) | null,
     /** Replies the next dispatches get, in order. Afterwards 200 with a new run id. */
     dispatchStatuses: [] as Reply[],
     /** Statuses the next cancels answer with, in order. Afterwards 202. */
@@ -790,6 +792,7 @@ function fakeGitHub(number: number) {
       return Response.json({ type: 'file', encoding: 'base64', size: state.config.length, content });
     }
     if (route === `POST ${repo}/check-runs`) {
+      state.onCheckRun?.();
       if (state.checkRunStatus !== 201) return Response.json({ message: 'no' }, { status: state.checkRunStatus });
       state.checkRuns.push(await request.json() as Record<string, unknown>);
       return Response.json({ id: 1 }, { status: 201 });
@@ -1804,6 +1807,24 @@ describe('PrCoordinator dispatch', () => {
       expect((await workRows(pr.stub)).filter((row) => row.kind === 'settings').map((row) => row.note)).toEqual([
         'paused', 'resumed', 'paused', 'again review work 8', 'resumed', 'paused', 'resumed, queued work 15', 'paused', 'resumed',
       ]);
+    });
+
+    it('lets a push review go on when Pause is lifted while its paused check posts', async () => {
+      const { pr, github, state, edit } = setup();
+      await edit([], ['pause']);
+      // The settings lane can apply an untick in the same alarm while the state lane waits on the paused check. That
+      // untick sees the push review in flight and queues no review of its own.
+      const storage = await runInDurableObject(pr.stub, (_instance, ctx) => ctx.storage);
+      github.onCheckRun = () => {
+        storage.sql.exec(`UPDATE meta SET value = json_set(value, '$.settings.paused', json('false')) WHERE key = 'pr_state'`);
+      };
+      await pr.send('pull_request', pr.push(SHA_1));
+      await runDurableObjectAlarm(pr.stub);
+      expect(github.checkRuns).toMatchObject([{ head_sha: SHA_1, conclusion: 'action_required' }]);
+      expect(await state()).toMatchObject({ settings: { paused: false } });
+      expect(github.dispatches).toHaveLength(1);
+      expect(github.dispatches[0].inputs).toMatchObject({ event: 'pull_request', head_sha: SHA_1 });
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'review', head_sha: SHA_1, status: 'running' });
     });
 
     it('turns a queued push review into one review with every mode ticked, which a pause cannot drop', async () => {
