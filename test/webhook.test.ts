@@ -179,17 +179,23 @@ describe('/webhook', () => {
     expect(await workRows(coordinator(REPOSITORY_ID, number))).toMatchObject([{ sender: login, writer, trusted }]);
   });
 
-  it.each<[string, { login: string; __typename: string } | null, string, number | null]>([
-    ['a writer', { login: 'box-writer', __typename: 'User' }, 'write', 1],
-    ['an editor without write access', { login: 'box-reader', __typename: 'User' }, 'read', 0],
-    ['Manki itself', { login: 'manki-review', __typename: 'Bot' }, 'write', null],
-    ['an unknown editor', null, 'write', null],
-  ])('names the last editor of Manki\'s review as the sender of a box tick by %s', async (_case, editor, permission, writer) => {
+  const WRITER = { login: 'box-writer', __typename: 'User' };
+  const READER = { login: 'box-reader', __typename: 'User' };
+  const MANKI = { login: 'manki-review', __typename: 'Bot' };
+  // Each edit history lists the newest edit first, as GitHub does.
+  // Each case has a PR number of its own, apart from the lookups above and below.
+  it.each<[string, Array<{ login: string; __typename: string } | null>, string | null, number | null, number]>([
+    ['a writer, the only editor', [WRITER, WRITER], 'box-writer', 1, 120],
+    ['an editor without write access', [READER], 'box-reader', 0, 121],
+    ['a writer, after whom Manki rewrote the review', [MANKI, WRITER, MANKI], 'box-writer', 1, 122],
+    ['the newest of two people, after whom Manki rewrote the review', [MANKI, READER, WRITER], 'box-reader', 0, 123],
+    ['Manki alone', [MANKI, MANKI], null, null, 124],
+    ['an unknown editor', [null], null, null, 125],
+  ])('names the newest person who edited Manki\'s review as the sender of a box tick by %s', async (_case, edits, sender, writer, number) => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
-    const graphql = vi.fn(async () => Response.json({ data: { node: { editor } } }));
-    stubGitHub({ permissions: editor ? { [editor.login]: permission } : {}, api: { 'POST /graphql': graphql } });
-    // Numbers of their own, apart from the lookups above and below.
-    const number = 70 + [null, 'box-writer', 'box-reader', 'manki-review'].indexOf(editor?.login ?? null);
+    const node = { editor: edits[0], userContentEdits: { nodes: edits.map((editor) => ({ editor })) } };
+    const graphql = vi.fn(async () => Response.json({ data: { node } }));
+    stubGitHub({ permissions: { 'box-writer': 'write', 'box-reader': 'read' }, api: { 'POST /graphql': graphql } });
     const box = '- [ ] Create an issue for this <!-- manki-box:issue:src/a.ts:3:Off-by-one -->';
     // GitHub sends an edit of a review with the review's author as the sender.
     const payload = {
@@ -201,7 +207,7 @@ describe('/webhook', () => {
     expect((await postWebhook({ event: 'pull_request_review', payload })).status).toBe(202);
 
     expect(graphql).toHaveBeenCalledTimes(1);
-    expect(await workRows(coordinator(REPOSITORY_ID, number))).toMatchObject(writer === null ? [] : [{ sender: editor?.login, writer, event: 'pull_request_review.edited' }]);
+    expect(await workRows(coordinator(REPOSITORY_ID, number))).toMatchObject(writer === null ? [] : [{ sender, writer, event: 'pull_request_review.edited' }]);
   });
 
   it('fails the delivery of a box tick in Manki\'s review when the editor lookup fails, so it can be delivered again', async () => {

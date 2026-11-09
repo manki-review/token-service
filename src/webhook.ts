@@ -54,18 +54,28 @@ async function isWriter(env: Env, target: Target, login: string): Promise<boolea
   }
 }
 
+interface Editor {
+  login: string;
+  __typename: string;
+}
+
 /**
- * Names the last editor of an edited review as the work's sender, since GitHub sends the review's author. Returns
- * `null` when the editor is unknown or a bot, such as Manki rewriting its own review. Throws when the lookup fails.
+ * Names the newest person who edited an edited review as the work's sender, since GitHub sends the review's author.
+ * Manki can rewrite its review right after a tick, so the last editor is often Manki. Without an edit by a person the
+ * last editor counts. Returns `null` when that editor is unknown or a bot. Throws when the lookup fails.
  */
 async function editedWork(env: Env, target: Target, work: Work): Promise<Work | null> {
   if (!work.editorOf) return work;
-  const { node } = await githubGraphql<{ node: { editor: { login: string; __typename: string } | null } | null }>(
+  const { node } = await githubGraphql<{
+    node: { editor: Editor | null; userContentEdits: { nodes: Array<{ editor: Editor | null } | null> | null } | null } | null;
+  }>(
     await lookupToken(env, target),
-    'query($id: ID!) { node(id: $id) { ... on PullRequestReview { editor { login __typename } } } }',
+    // GitHub lists the edits newest first.
+    'query($id: ID!) { node(id: $id) { ... on PullRequestReview { editor { login __typename } userContentEdits(first: 100) { nodes { editor { login __typename } } } } } }',
     { id: work.editorOf },
   );
-  const editor = node?.editor;
+  const person = node?.userContentEdits?.nodes?.find((edit) => edit?.editor && edit.editor.__typename !== 'Bot')?.editor;
+  const editor = person ?? node?.editor;
   return editor && editor.__typename !== 'Bot' ? { ...work, sender: editor.login } : null;
 }
 
