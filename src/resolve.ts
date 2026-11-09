@@ -1,7 +1,7 @@
 import type { Env } from './env';
 import { githubApi, githubGraphql, mintRepositoryToken } from './github';
 import { failure, log } from './log';
-import { MANKI_LOGINS } from './manki';
+import { isMankiLogin } from './manki';
 import { verifyWorkflowRequest } from './oidc';
 import { checkDispatchedRun } from './run-check';
 
@@ -45,11 +45,6 @@ async function readThread(token: string, id: string): Promise<ThreadNode | null>
     throw new Error(`GraphQL error: ${result.errors.map((error) => error.message).join('; ')}`);
   }
   return result.data?.node ?? null;
-}
-
-/** Whether a GraphQL login is one of Manki's. GraphQL names a bot `<slug>`, while REST and webhooks use `<slug>[bot]`. */
-function isMankiLogin(login: string | undefined): boolean {
-  return login !== undefined && MANKI_LOGINS.includes(`${login}[bot]`);
 }
 
 /**
