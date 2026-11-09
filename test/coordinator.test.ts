@@ -715,7 +715,7 @@ function fakeGitHub(number: number) {
     /** Each login's permission on the repository. Anyone else reads as `read`. */
     permissions: {} as Record<string, string>,
     permissionReads: [] as string[],
-    /** Manki's comments by id, which a revert reads and edits, the author of any comment not Manki's, and the status of a list. */
+    /** Manki's comments by id, which a revert reads and edits, the author of any comment not Manki's, and the status of the GraphQL list. */
     issueComments: new Map<number, string>(),
     commentAuthors: new Map<number, string>(),
     /** When a comment was posted, by default at the request. */
@@ -759,7 +759,9 @@ function fakeGitHub(number: number) {
       if (query.includes('comments(last: 100)')) {
         if (state.commentListStatus !== 200) return Response.json({ message: 'no' }, { status: state.commentListStatus });
         const nodes = [...state.issueComments.keys()].sort((a, b) => a - b).slice(-100).map((id) => ({
-          databaseId: id, author: { login: (state.commentAuthors.get(id) ?? 'manki-review[bot]').replace(/\[bot\]$/, '') },
+          fullDatabaseId: String(id),
+          createdAt: state.commentCreated.get(id) ?? new Date().toISOString(),
+          author: { login: (state.commentAuthors.get(id) ?? 'manki-review[bot]').replace(/\[bot\]$/, '') },
         }));
         return Response.json({ data: { repository: { pullRequest: { comments: { nodes } } } } });
       }
@@ -823,13 +825,6 @@ function fakeGitHub(number: number) {
     if (issueComment && request.method === 'PATCH') {
       state.issueComments.set(Number(issueComment[1]), ((await request.json()) as { body: string }).body);
       return Response.json({});
-    }
-    if (route === `GET ${repo}/issues/${number}/comments`) {
-      if (state.commentListStatus !== 200) return Response.json({ message: 'no' }, { status: state.commentListStatus });
-      return Response.json([...state.issueComments].sort(([a], [b]) => a - b)
-        .map(([id, body]) => ({
-          id, body, created_at: state.commentCreated.get(id) ?? new Date().toISOString(), user: { login: state.commentAuthors.get(id) ?? 'manki-review[bot]' },
-        })));
     }
     const checksOf = url.pathname.match(new RegExp(`^${repo}/commits/([0-9a-f]+)/check-runs$`));
     if (checksOf && request.method === 'GET' && url.searchParams.get('check_name') === 'Manki' && url.searchParams.get('status') === 'in_progress') {
@@ -1133,7 +1128,9 @@ describe('PrCoordinator dispatch', () => {
     const notice = (status: string) => ['Round cap reached. Automatic review is paused.', '<!-- manki-bot -->', '', '---',
       `Last reviewed \`${SHA_1.slice(0, 7)}\` · head \`${SHA_1.slice(0, 7)}\` · ${status}`,
       '- [ ] Pause automatic reviews <!-- manki-box:pause -->', '<!-- manki-settings -->'].join('\n');
-    github.issueComments.set(1500, notice('automatic review paused'));
+    // Comment ids have passed 2^31, which the GraphQL `databaseId` cannot hold.
+    const settingsId = 6_737_561_759;
+    github.issueComments.set(settingsId, notice('automatic review paused'));
     Object.assign(github, { head: SHA_2, checkRunStatus: 502 });
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches).toHaveLength(1);
@@ -1141,7 +1138,7 @@ describe('PrCoordinator dispatch', () => {
     expect(logged(log, 'coordinator_paused_report_failed')).toMatchObject([
       { head_sha: SHA_2, part: 'check', error: 'creating the Automatic review paused check failed with 502' },
     ]);
-    expect(github.issueComments.get(1500)).toBe(notice(`automatic review paused, \`${SHA_2.slice(0, 7)}\` waits`));
+    expect(github.issueComments.get(settingsId)).toBe(notice(`automatic review paused, \`${SHA_2.slice(0, 7)}\` waits`));
     github.checkRunStatus = 201;
     const pausedCheck = {
       name: 'Manki', head_sha: SHA_2, status: 'completed', conclusion: 'action_required', details_url: `https://github.com/${OWNER}/${REPO}/pull/${pr.number}`,

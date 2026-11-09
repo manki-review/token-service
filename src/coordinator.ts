@@ -205,16 +205,18 @@ const modesOf = (row: WorkRow): ReviewMode[] => (row.modes === null ? [] : JSON.
 // the query leaves out the bodies, which can each hold 64 KB.
 const RECENT_COMMENTS_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
-    pullRequest(number: $number) { comments(last: 100) { nodes { databaseId author { login } } } }
+    pullRequest(number: $number) { comments(last: 100) { nodes { fullDatabaseId createdAt author { login } } } }
   }
 }`;
 
 interface RecentCommentsResponse {
-  repository: { pullRequest: { comments: { nodes: Array<{ databaseId: number; author: { login: string } | null }> } } | null } | null;
+  repository: {
+    pullRequest: { comments: { nodes: Array<{ fullDatabaseId: string | null; createdAt: string; author: { login: string } | null }> } } | null;
+  } | null;
 }
 
-/** How many of Manki's newest comments are read to find its settings comment, which answers and notes can follow. */
-const SETTINGS_COMMENT_READS = 5;
+/** How many of Manki's newest comments are read to find the one sought, since answers and notes can follow it. */
+const MANKI_COMMENT_READS = 5;
 
 /** Returns why a push waits out the pause, from the reported `reason` and the Pause box, and what reviews it. */
 function pausedSummary(reason: string | null, paused: boolean): string {
@@ -1270,12 +1272,27 @@ export class PrCoordinator extends DurableObject<Env> {
         throw new Error(`reading the settings comment failed with ${read.status}`);
       }
     }
-    // GitHub lists the comments edited since the run started, oldest first.
-    const list = await githubApi(token, `${repo}/issues/${target.number}/comments?since=${new Date(since).toISOString()}&per_page=100`);
-    if (!list.ok) throw new Error(`listing the PR comments failed with ${list.status}`);
-    const comments = await list.json() as Array<IssueCommentRead & { id: number }>;
-    const newest = comments.reverse().find((c) => MANKI_LOGINS.includes(c.user?.login ?? '') && isOwn(c));
-    return newest ? { id: newest.id, body: newest.body! } : null;
+    return this.newestMankiComment(token, target, isRunningProgress, since);
+  }
+
+  /**
+   * Returns Manki's newest comment posted since `since` whose body `matches`, among the PR's newest 100 comments, or
+   * null. Anyone can comment, so the list leaves out the bodies, and only Manki's newest few are read.
+   */
+  private async newestMankiComment(
+    token: string, target: Target, matches: (body: string) => boolean, since = 0,
+  ): Promise<{ id: number; body: string } | null> {
+    const repo = `/repos/${target.owner}/${target.repo}`;
+    const data = await githubGraphql<RecentCommentsResponse>(token, RECENT_COMMENTS_QUERY, {
+      owner: target.owner, name: target.repo, number: target.number,
+    });
+    const mankis = (data.repository?.pullRequest?.comments.nodes ?? [])
+      .filter((c) => c.fullDatabaseId !== null && isMankiGraphqlLogin(c.author?.login) && Date.parse(c.createdAt) >= since);
+    for (const { fullDatabaseId } of mankis.reverse().slice(0, MANKI_COMMENT_READS)) {
+      const comment = await this.readComment(token, repo, Number(fullDatabaseId));
+      if (comment && matches(comment.body)) return comment;
+    }
+    return null;
   }
 
   /** Puts back the boxes someone without write access changed: Pause as it applies, and every other box unticked. */
@@ -1476,20 +1493,12 @@ export class PrCoordinator extends DurableObject<Env> {
   private async showPaused(head: string, target: Target): Promise<void> {
     const token = await this.token({ issues: 'write', pull_requests: 'write' });
     if (token === null) return;
-    const repo = `/repos/${target.owner}/${target.repo}`;
-    const data = await githubGraphql<RecentCommentsResponse>(token, RECENT_COMMENTS_QUERY, {
-      owner: target.owner, name: target.repo, number: target.number,
-    });
-    const mankis = (data.repository?.pullRequest?.comments.nodes ?? []).filter((c) => isMankiGraphqlLogin(c.author?.login));
-    for (const { databaseId } of mankis.reverse().slice(0, SETTINGS_COMMENT_READS)) {
-      const comment = await this.readComment(token, repo, databaseId);
-      if (!comment || settingsHead(comment.body) === null) continue;
-      const body = withSettingsStatus(comment.body, `automatic review paused, \`${head.slice(0, 7)}\` waits`, []);
-      if (body === comment.body) return;
-      const response = await githubApi(token, `${repo}/issues/comments/${databaseId}`, { method: 'PATCH', body: { body } });
-      if (!response.ok) throw new Error(`showing the paused push failed with ${response.status}`);
-      return;
-    }
+    const settings = await this.newestMankiComment(token, target, (body) => settingsHead(body) !== null);
+    if (!settings) return;
+    const body = withSettingsStatus(settings.body, `automatic review paused, \`${head.slice(0, 7)}\` waits`, []);
+    if (body === settings.body) return;
+    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/comments/${settings.id}`, { method: 'PATCH', body: { body } });
+    if (!response.ok) throw new Error(`showing the paused push failed with ${response.status}`);
   }
 
   /** Creates a completed `Manki` check on `head`. Without `checks: write` on the installation, it creates none. */
