@@ -1083,7 +1083,8 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /**
    * Lifts the Pause box. When no review ran or waits since the last push the pause skipped, one review of that push is
-   * queued as if it had just arrived. A later review that started no run, such as an outsider's request, does not count.
+   * queued as if it had just arrived. A later review that started no run, or waits for its sender's write access, does
+   * not count, since the lookup can still drop it.
    */
   private resume(item: WorkRow): string {
     const [waiting] = this.sql.exec<WorkRow>(
@@ -1091,7 +1092,8 @@ export class PrCoordinator extends DurableObject<Env> {
     ).toArray();
     if (!waiting) return 'resumed';
     const since = this.sql.exec(
-      `SELECT 1 FROM work WHERE kind = 'review' AND id > ? AND (status IN ('queued', 'dispatching', 'running', 'done', 'failed') OR conclusion = 'cancelled')`,
+      `SELECT 1 FROM work WHERE kind = 'review' AND id > ?
+         AND (status IN ('running', 'done', 'failed') OR (status IN ('queued', 'dispatching') AND writer = 1) OR conclusion = 'cancelled')`,
       waiting.id,
     ).toArray();
     if (since.length > 0) return 'resumed';

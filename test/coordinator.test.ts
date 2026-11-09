@@ -1765,12 +1765,12 @@ describe('PrCoordinator dispatch', () => {
       github.head = SHA_3;
       await pr.send('pull_request', pr.push(SHA_3));
       await runDurableObjectAlarm(pr.stub);
+      expect(github.dispatches).toHaveLength(2);
       const outsider = { login: 'mallory', type: 'User' };
       await pr.send('issue_comment', issueCommentEvent('@manki review', { number: pr.number, association: 'NONE', author: outsider, sender: outsider }));
-      await runDurableObjectAlarm(pr.stub);
-      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'review', status: 'skipped', note: 'commenter has no write access' });
-      expect(github.dispatches).toHaveLength(2);
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'review', status: 'queued', writer: 0 });
       await edit(['pause'], []);
+      expect((await workRows(pr.stub)).find((row) => row.sender === 'mallory')).toMatchObject({ status: 'skipped', note: 'commenter has no write access' });
       expect(github.dispatches).toHaveLength(3);
       expect(github.dispatches.at(-1)?.inputs).toMatchObject({ event: 'pull_request', action: 'synchronize', head_sha: SHA_3 });
 
