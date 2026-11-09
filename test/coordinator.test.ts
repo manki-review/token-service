@@ -1745,6 +1745,10 @@ describe('PrCoordinator dispatch', () => {
       await runDurableObjectAlarm(pr.stub);
       expect((await workRows(pr.stub)).at(-1)).toMatchObject({ head_sha: SHA_4, status: 'skipped', conclusion: 'skipped' });
       expect(github.checkRuns.map((check) => [check.head_sha, check.conclusion])).toEqual([[SHA_1, 'action_required'], [SHA_4, 'skipped']]);
+      // The skip rule handled the newer push, so unticking Pause has no waiting push to review.
+      await edit(['pause'], []);
+      await edit([], ['pause']);
+      expect(github.dispatches).toEqual([]);
       Object.assign(github, { config: null, labels: [] });
       await edit(['pause'], ['pause', 'again']);
       expect(github.dispatches.at(-1)?.inputs).toMatchObject({ event: 'issue_comment', action: 'edited', comment_id: String(SETTINGS) });
@@ -1794,7 +1798,7 @@ describe('PrCoordinator dispatch', () => {
 
       expect(github.checkRuns.map((check) => check.head_sha)).toEqual([SHA_1, SHA_4, SHA_3, SHA_5]);
       expect((await workRows(pr.stub)).filter((row) => row.kind === 'settings').map((row) => row.note)).toEqual([
-        'paused', 'again review work 6', 'resumed', 'paused', 'resumed, queued work 13', 'paused', 'resumed',
+        'paused', 'resumed', 'paused', 'again review work 8', 'resumed', 'paused', 'resumed, queued work 15', 'paused', 'resumed',
       ]);
     });
 
