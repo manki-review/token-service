@@ -3,7 +3,7 @@ import { createAppJWT } from './app-jwt';
 import { allowedAccounts, type Env } from './env';
 import { githubApi, githubGraphql, isRateLimited, mintRepositoryToken } from './github';
 import { log } from './log';
-import { BOT_LOGIN } from './manki';
+import { BOT_LOGIN, BOT_MARKER } from './manki';
 import { STALE_COMMENT_MS, type Target } from './routing';
 
 const MINUTE = 60_000;
@@ -60,14 +60,14 @@ interface PullSummary {
   base: { repo: { full_name: string } };
 }
 
-const REVIEWS_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
+const REVIEWS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $author: String!) {
   repository(owner: $owner, name: $name) {
-    pullRequest(number: $number) { reviews(last: 100) { nodes { author { login } commit { oid } } } }
+    pullRequest(number: $number) { reviews(last: 100, author: $author) { nodes { commit { oid } body } } }
   }
 }`;
 
 interface ReviewsResponse {
-  repository: { pullRequest: { reviews: { nodes: Array<{ author: { login: string } | null; commit: { oid: string } | null }> } } | null } | null;
+  repository: { pullRequest: { reviews: { nodes: Array<{ commit: { oid: string } | null; body: string }> } } | null } | null;
 }
 
 /** Counts the GitHub calls of one pass. */
@@ -406,10 +406,12 @@ export class Reconciler extends DurableObject<Env> {
       // A review still queued or running is asked about again, so one that fails is caught up on a later pass.
       if (state !== 'needed') continue;
       if (!budget.take()) return false;
-      const data = await githubGraphql<ReviewsResponse>(mint.token, REVIEWS_QUERY, { owner: repo.owner, name: repo.repo, number: pull.number });
-      // GraphQL names a bot `<slug>`, while REST and webhooks use `<slug>[bot]`.
+      const data = await githubGraphql<ReviewsResponse>(mint.token, REVIEWS_QUERY, {
+        owner: repo.owner, name: repo.repo, number: pull.number, author: BOT_LOGIN,
+      });
+      // Manki's thread replies are reviews of the head too, so only one with Manki's review body counts.
       const reviewed = data.repository?.pullRequest?.reviews.nodes.some((review) =>
-        `${review.author?.login}[bot]` === BOT_LOGIN && review.commit?.oid === pull.head.sha);
+        review.commit?.oid === pull.head.sha && review.body.includes(BOT_MARKER));
       if (reviewed) {
         this.markChecked(repo, pull);
         continue;

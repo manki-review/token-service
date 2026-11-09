@@ -8,6 +8,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { RUN_DEADLINE_MS } from '../src/coordinator';
+import { BOT_MARKER } from '../src/manki';
 import {
   CATCH_UP_WINDOW_MS,
   MAX_DELIVERY_PAGES,
@@ -68,7 +69,7 @@ function fakeGitHub() {
     redelivered: [] as number[],
     pulls: new Map<string, Pull[]>(),
     /** Reviews as GraphQL returns them, keyed `<repo>#<number>`. */
-    reviews: new Map<string, Array<{ author: string; oid: string }>>(),
+    reviews: new Map<string, Array<{ author: string; oid: string; body?: string }>>(),
     pullsStatus: new Map<string, number>(),
     graphqlCalls: 0,
     calls: 0,
@@ -141,11 +142,12 @@ function fakeGitHub() {
       return Response.json({ id, name: id === 4242 ? 'manki' : `repo-${id}`, owner: { login: OWNER, id: OWNER_ID }, default_branch: 'main' });
     }
     if (route === 'POST /graphql') {
-      const { query, variables } = await request.json() as { query: string; variables: { name: string; number: number } };
+      const { query, variables } = await request.json() as { query: string; variables: { name: string; number: number; author: string } };
       if (query.includes('reviews')) {
         state.graphqlCalls++;
-        const reviews = state.reviews.get(`${variables.name}#${variables.number}`) ?? [];
-        const nodes = reviews.map((review) => ({ author: { login: review.author }, commit: { oid: review.oid } }));
+        // GraphQL filters by the REST login, `<slug>[bot]` for a bot. A review given no body gets Manki's review body.
+        const reviews = (state.reviews.get(`${variables.name}#${variables.number}`) ?? []).filter((review) => `${review.author}[bot]` === variables.author);
+        const nodes = reviews.map((review) => ({ commit: { oid: review.oid }, body: review.body ?? `Changes requested.\n${BOT_MARKER}` }));
         return Response.json({ data: { repository: { pullRequest: { reviews: { nodes } } } } });
       }
       return Response.json(workflowsReply({ 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML }).body);
@@ -619,10 +621,11 @@ describe('Reconciler catch-up', () => {
   });
 
   it.each([
-    ['another author', [{ author: 'alice', oid: SHA_1 }]],
-    ['an older commit', [{ author: 'manki-review', oid: SHA_2 }]],
-    ['another bot', [{ author: 'acme-review', oid: SHA_1 }]],
-  ])('catches up a head whose only review is by %s', async (_case, reviews) => {
+    ['by another author', [{ author: 'alice', oid: SHA_1 }]],
+    ['of an older commit', [{ author: 'manki-review', oid: SHA_2 }]],
+    ['by another bot', [{ author: 'acme-review', oid: SHA_1 }]],
+    ['a thread reply of Manki\'s', [{ author: 'manki-review', oid: SHA_1, body: '' }]],
+  ])('catches up a head whose only review is %s', async (_case, reviews) => {
     const { stub, repo } = setup();
     const target = repo();
     await stub.recordOptIn(target, true);
