@@ -3,6 +3,7 @@ import { allowedAccounts, type Env } from './env';
 import { githubGraphql, hasWriteAccess, mintRepositoryToken } from './github';
 import { eventsPerHour } from './limiter';
 import { log } from './log';
+import { isMankiLogin } from './manki';
 import { routeDelivery, type Route, type Target, type Work, type WebhookPayload } from './routing';
 import { sha256Hex, verifyWebhookSignature } from './signature';
 
@@ -60,9 +61,10 @@ interface Editor {
 }
 
 /**
- * Names the newest person who edited an edited review as the work's sender, since GitHub sends the review's author.
- * Manki can rewrite its review right after a tick, so the last editor is often Manki. Without an edit by a person the
- * last editor counts. Returns `null` when that editor is unknown or a bot. Throws when the lookup fails.
+ * Names the newest editor of an edited review other than Manki as the work's sender, since GitHub sends the review's
+ * author. Manki can rewrite its review right after a tick, so the last editor is often Manki. Only Manki's own edits
+ * are skipped, so a newer edit by another bot still drops the work. Without another editor the last editor counts.
+ * Returns `null` when that editor is unknown or a bot. Throws when the lookup fails.
  */
 async function editedWork(env: Env, target: Target, work: Work): Promise<Work | null> {
   if (!work.editorOf) return work;
@@ -74,8 +76,8 @@ async function editedWork(env: Env, target: Target, work: Work): Promise<Work | 
     'query($id: ID!) { node(id: $id) { ... on PullRequestReview { editor { login __typename } userContentEdits(first: 100) { nodes { editor { login __typename } } } } } }',
     { id: work.editorOf },
   );
-  const person = node?.userContentEdits?.nodes?.find((edit) => edit?.editor && edit.editor.__typename !== 'Bot')?.editor;
-  const editor = person ?? node?.editor;
+  const other = node?.userContentEdits?.nodes?.find((edit) => edit?.editor && !(edit.editor.__typename === 'Bot' && isMankiLogin(edit.editor.login)))?.editor;
+  const editor = other ?? node?.editor;
   return editor && editor.__typename !== 'Bot' ? { ...work, sender: editor.login } : null;
 }
 

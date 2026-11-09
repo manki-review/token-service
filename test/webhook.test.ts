@@ -182,6 +182,7 @@ describe('/webhook', () => {
   const WRITER = { login: 'box-writer', __typename: 'User' };
   const READER = { login: 'box-reader', __typename: 'User' };
   const MANKI = { login: 'manki-review', __typename: 'Bot' };
+  const OTHER_BOT = { login: 'acme-bot', __typename: 'Bot' };
   // Each edit history lists the newest edit first, as GitHub does.
   // Each case has a PR number of its own, apart from the lookups above and below.
   it.each<[string, Array<{ login: string; __typename: string } | null>, string | null, number | null, number]>([
@@ -190,6 +191,8 @@ describe('/webhook', () => {
     ['a writer, after whom Manki rewrote the review', [MANKI, WRITER, MANKI], 'box-writer', 1, 122],
     ['the newest of two people, after whom Manki rewrote the review', [MANKI, READER, WRITER], 'box-reader', 0, 123],
     ['Manki alone', [MANKI, MANKI], null, null, 124],
+    // A tick by another bot is dropped, not credited to a person who edited the review earlier.
+    ['another bot after a writer', [MANKI, OTHER_BOT, WRITER], null, null, 126],
     ['an unknown editor', [null], null, null, 125],
   ])('names the newest person who edited Manki\'s review as the sender of a box tick by %s', async (_case, edits, sender, writer, number) => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
