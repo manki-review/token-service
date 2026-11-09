@@ -214,9 +214,9 @@ To rotate the token, create a new one with the same permissions (My Profile, API
 - Failed writes of a note or comment: the conflict note, the starting status, a cancelled review's report and the eyes reaction.
 - Runs the safety poll cancelled (`timed_out`) or queued again.
 - Any line with a 5xx status or an error naming one.
-- Work queued over 20 minutes ago that no dispatch, end or close of its PR has followed, looked for over the last 6 hours.
+- Work queued over 20 minutes ago that no dispatch, end or close of its PR has followed, looked for over the last 6 hours. Work waiting while its PR has a run going is not stuck, and a review held by the hourly cap counts from when the cap releases it.
 
-It keeps one issue titled "Worker logs show warning signs", marked `<!-- log-watch -->`. A window with warning signs opens the issue, or replaces the body of the open one with that window's lines and Workers Logs request ids. A clean window comments on the open issue and closes it. The next warning sign opens a new one.
+It keeps one issue titled "Worker logs show warning signs", marked `<!-- log-watch -->`. A window with warning signs opens the issue, or replaces the body of the open one with that window's lines and Workers Logs request ids, at most 10 lines and 50 ids per sign. The issue is public, so a line about a repository GitHub does not show as public to the job's token names no repository, PR or error, only the time, the message and its request id. A clean window comments on the open issue and closes it. The next warning sign opens a new one.
 
 It reads the logs with the repository secret `CF_LOGS_READ_TOKEN`, a Cloudflare API token with only Account, Workers Observability, Read on the account that runs the Worker. Its job holds `contents: read` and `issues: write`. It changes nothing in the Worker, so it needs no deploy.
 

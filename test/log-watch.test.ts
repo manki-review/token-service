@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { findings, ISSUE_MARKER, issueBody, type LogEvent, STUCK_AFTER_MS } from '../scripts/log-watch/findings';
+import { findings, ISSUE_MARKER, issueBody, type LogEvent, repositories, STUCK_AFTER_MS } from '../scripts/log-watch/findings';
 
 const NOW = Date.parse('2026-11-09T09:00:00Z');
 const MINUTE = 60_000;
 const PR = { repo: 'manki-review/manki', pr: 1289 };
+const PUBLIC = new Set(['manki-review/manki']);
 
 let nextId = 0;
 function event(minutesAgo: number, source: Record<string, unknown>): LogEvent {
@@ -23,7 +24,7 @@ describe('findings', () => {
       event(10, { msg: 'request_failed', status: 502, error: 'Memory append failed' }),
       event(9, { msg: 'coordinator_dispatch_error', work_id: 6, error: 'Error: dispatch failed with 503' }),
     ];
-    expect(findings(signals, [], NOW)).toEqual([
+    expect(findings(signals, [], NOW, PUBLIC)).toEqual([
       {
         title: 'Start errors (2)',
         lines: [
@@ -31,6 +32,7 @@ describe('findings', () => {
           '08:40:00 `coordinator_start_error` manki-review/manki#1289 work 2: Error: posting the conflict note failed with 403',
         ],
         requestIds: ['req-0', 'req-1'],
+        moreRequestIds: 0,
       },
       {
         title: 'Failed note and comment writes (2)',
@@ -39,6 +41,7 @@ describe('findings', () => {
           '08:36:00 `coordinator_reaction_failed` manki-review/manki#1289: status 403',
         ],
         requestIds: ['req-2', 'req-3'],
+        moreRequestIds: 0,
       },
       {
         title: 'Runs the safety poll cancelled or queued again (2)',
@@ -47,6 +50,7 @@ describe('findings', () => {
           '08:39:00 `coordinator_requeued` manki-review/manki#1289 work 5: run never started',
         ],
         requestIds: ['req-4', 'req-6'],
+        moreRequestIds: 0,
       },
       {
         title: '5xx statuses (2)',
@@ -55,16 +59,31 @@ describe('findings', () => {
           '08:51:00 `coordinator_dispatch_error` manki-review/manki#1289 work 6: Error: dispatch failed with 503',
         ],
         requestIds: ['req-7', 'req-8'],
+        moreRequestIds: 0,
       },
     ]);
-    expect(findings([event(5, { msg: 'coordinator_finished', work_id: 4, status: 'done' })], [], NOW)).toEqual([]);
+    expect(findings([event(5, { msg: 'coordinator_finished', work_id: 4, status: 'done' })], [], NOW, PUBLIC)).toEqual([]);
 
-    const many = Array.from({ length: 12 }, (_, index) => event(40 - index, { msg: 'coordinator_start_error', work_id: 9, error: 'Error: x' }));
-    const [crowded] = findings(many, [], NOW);
-    expect(crowded.title).toBe('Start errors (12)');
+    const many = Array.from({ length: 52 }, (_, index) => event(55 - index, { msg: 'coordinator_start_error', work_id: 9, error: 'Error: x' }));
+    const [crowded] = findings(many, [], NOW, PUBLIC);
+    expect(crowded.title).toBe('Start errors (52)');
     expect(crowded.lines).toHaveLength(11);
-    expect(crowded.lines.at(-1)).toBe('and 2 more');
-    expect(crowded.requestIds).toHaveLength(12);
+    expect(crowded.lines.at(-1)).toBe('and 42 more');
+    expect(crowded.requestIds).toHaveLength(50);
+    expect(crowded.moreRequestIds).toBe(2);
+  });
+
+  it('names no repository, PR, work or detail of a repository not known to be public', () => {
+    const signals = [
+      event(10, { msg: 'coordinator_start_error', repo: 'acme/secret', pr: 7, work_id: 2, error: 'Error: reading acme/secret failed with 403' }),
+      event(9, { msg: 'request_failed', repo: undefined, repository: 'acme/secret', status: 502, error: 'Memory append failed' }),
+      event(8, { msg: 'coordinator_start_error', work_id: 3, error: 'Error: x' }),
+    ];
+    expect(repositories(signals)).toEqual(['acme/secret', 'manki-review/manki']);
+    expect(findings(signals, [], NOW, PUBLIC).map((entry) => entry.lines)).toEqual([
+      ['08:50:00 `coordinator_start_error` in a private repository', '08:52:00 `coordinator_start_error` manki-review/manki#1289 work 3: Error: x'],
+      ['08:51:00 `request_failed` in a private repository'],
+    ]);
   });
 
   it('reports work queued longer than 20 minutes that no dispatch, end or close followed', () => {
@@ -72,6 +91,7 @@ describe('findings', () => {
     const queue = [
       event(60, { msg: 'coordinator_receive', effect: 'queued work 1' }),
       event(55, { msg: 'coordinator_dispatched', work_id: 1 }),
+      event(52, { msg: 'coordinator_finished', work_id: 1, status: 'done' }),
       event(50, { msg: 'coordinator_receive', effect: 'queued work 2' }),
       event(45, { msg: 'coordinator_finished', work_id: 2, status: 'skipped' }),
       event(40, { msg: 'coordinator_receive', effect: 'queued work 3' }),
@@ -83,19 +103,32 @@ describe('findings', () => {
       // A close drops the queued work and queues the merge's.
       event(35, { msg: 'coordinator_receive', effect: 'queued work 7', pr: 1291 }),
       event(34, { msg: 'coordinator_receive', effect: 'closed, dropped 1, queued work 8', pr: 1291 }),
+      // Work behind a run of its PR waits by design, until the run ends.
+      event(50, { msg: 'coordinator_dispatched', work_id: 1, pr: 1292 }),
+      event(45, { msg: 'coordinator_receive', effect: 'queued work 2', pr: 1292 }),
+      event(50, { msg: 'coordinator_dispatched', work_id: 1, pr: 1293 }),
+      event(45, { msg: 'coordinator_receive', effect: 'queued work 2', pr: 1293 }),
+      event(30, { msg: 'coordinator_finished', work_id: 1, pr: 1293, status: 'done' }),
+      // A review held by the hourly cap waits until the cap releases it.
+      event(50, { msg: 'coordinator_receive', effect: 'queued work 1', pr: 1294 }),
+      event(49, { msg: 'coordinator_held', work_id: 1, pr: 1294, until: NOW - 10 * MINUTE }),
+      // A run that never started is queued again and waits anew.
+      event(30, { msg: 'coordinator_requeued', work_id: 1, pr: 1295, reason: 'run never started' }),
     ];
-    const [stuck] = findings([], queue, NOW);
-    expect(stuck.title).toBe('Work queued over 20 minutes without a dispatch (4)');
+    const [stuck] = findings([], queue, NOW, PUBLIC);
+    expect(stuck.title).toBe('Work queued over 20 minutes without a dispatch (6)');
     expect(stuck.lines).toEqual([
+      '08:15:00 `coordinator_receive` manki-review/manki#1293: work 2 waiting 45 minutes',
       '08:20:00 `coordinator_receive` manki-review/manki#1289: work 3 waiting 40 minutes',
       '08:26:00 `coordinator_receive` manki-review/manki#1291: work 8 waiting 34 minutes',
       '08:30:00 `coordinator_receive` manki-review/manki#1290: work 1 waiting 30 minutes',
+      '08:30:00 `coordinator_requeued` manki-review/manki#1295 work 1: waiting 30 minutes',
       '08:39:00 `reconciler_caught_up` manki-review/manki#1289: work 4 waiting 21 minutes',
     ]);
   });
 
   it('writes an issue body with the window, each sign and the marker the watcher finds the issue by', () => {
-    const found = findings([event(5, { msg: 'coordinator_start_error', work_id: 2, error: 'Error: boom' })], [], NOW);
+    const found = findings([event(5, { msg: 'coordinator_start_error', work_id: 2, error: 'Error: boom' })], [], NOW, PUBLIC);
     const body = issueBody(found, NOW - 75 * MINUTE, NOW);
     expect(body).toBe([
       'The Worker logged warning signs from 2026-11-09T07:45:00.000Z to 2026-11-09T09:00:00.000Z. Filter Workers Logs on `$metadata.requestId` to read a request in full.',

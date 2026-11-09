@@ -10,6 +10,7 @@ export interface Finding {
   title: string;
   lines: string[];
   requestIds: string[];
+  moreRequestIds: number;
 }
 
 /** Work queued longer than this without a dispatch or an end counts as stuck. */
@@ -28,26 +29,45 @@ const FAILED_WRITES = new Set([
 /** The messages the window query reads, besides timed out items and any line with a 5xx status or error. */
 export const SIGNAL_MESSAGES = ['coordinator_start_error', ...FAILED_WRITES, 'coordinator_requeued', 'coordinator_cancel_failed'];
 
-/** The messages that queue work, start it or end it, which the stuck work check reads over a longer span. */
-export const QUEUE_MESSAGES = ['coordinator_receive', 'reconciler_caught_up', 'coordinator_dispatched', 'coordinator_finished'];
+/** The messages that queue, hold, start or end work, which the stuck work check reads over a longer span. */
+export const QUEUE_MESSAGES = [
+  'coordinator_receive', 'reconciler_caught_up', 'coordinator_held', 'coordinator_dispatched', 'coordinator_requeued', 'coordinator_finished',
+];
 
 const MAX_LINES = 10;
+const MAX_REQUEST_IDS = 50;
 
 function text(value: unknown): string {
   return typeof value === 'string' ? value : value === undefined || value === null ? '' : JSON.stringify(value);
 }
 
-function where(source: Record<string, unknown>): string {
-  const repo = text(source.repo ?? source.repository);
-  const pr = source.pr === undefined ? '' : `#${text(source.pr)}`;
-  const work = source.work_id === undefined ? '' : ` work ${text(source.work_id)}`;
-  return `${repo}${pr}${work}`.trim();
+function repositoryOf(source: Record<string, unknown>): string {
+  return text(source.repo ?? source.repository);
 }
 
-function line(event: LogEvent, detail: string): string {
+/** Returns the repositories `events` name, whose visibility decides what the issue may show of them. */
+export function repositories(events: LogEvent[]): string[] {
+  return [...new Set(events.map((event) => repositoryOf(event.source)).filter((repo) => repo !== ''))];
+}
+
+interface Match {
+  event: LogEvent;
+  detail: string;
+}
+
+/**
+ * Writes one issue line. The issue is public, so a line about a repository not known to be public names no repository,
+ * PR or work, and leaves out the detail, which can quote it.
+ */
+function line({ event, detail }: Match, publicRepos: ReadonlySet<string>): string {
   const at = new Date(event.timestamp).toISOString().slice(11, 19);
-  const place = where(event.source);
-  return `${at} \`${text(event.source.msg)}\`${place ? ` ${place}` : ''}${detail ? `: ${detail}` : ''}`;
+  const head = `${at} \`${text(event.source.msg)}\``;
+  const repo = repositoryOf(event.source);
+  if (repo !== '' && !publicRepos.has(repo)) return `${head} in a private repository`;
+  const pr = event.source.pr === undefined ? '' : `#${text(event.source.pr)}`;
+  const work = event.source.work_id === undefined ? '' : ` work ${text(event.source.work_id)}`;
+  const place = `${repo}${pr}${work}`.trim();
+  return `${head}${place ? ` ${place}` : ''}${detail ? `: ${detail}` : ''}`;
 }
 
 function isServerError(source: Record<string, unknown>): boolean {
@@ -55,20 +75,20 @@ function isServerError(source: Record<string, unknown>): boolean {
   return (status >= 500 && status < 600) || /\bwith 5\d\d\b/.test(text(source.error));
 }
 
-function finding(title: string, matches: Array<{ event: LogEvent; detail: string }>): Finding | null {
+function finding(title: string, matches: Match[], publicRepos: ReadonlySet<string>): Finding | null {
   if (matches.length === 0) return null;
   const sorted = [...matches].sort((a, b) => a.event.timestamp - b.event.timestamp);
-  const lines = sorted.slice(0, MAX_LINES).map(({ event, detail }) => line(event, detail));
+  const lines = sorted.slice(0, MAX_LINES).map((match) => line(match, publicRepos));
   if (sorted.length > MAX_LINES) lines.push(`and ${sorted.length - MAX_LINES} more`);
-  const requestIds = [...new Set(sorted.map(({ event }) => event.$metadata.requestId).filter((id): id is string => !!id))];
-  return { title: `${title} (${matches.length})`, lines, requestIds };
+  const ids = [...new Set(sorted.map(({ event }) => event.$metadata.requestId).filter((id): id is string => !!id))];
+  return { title: `${title} (${matches.length})`, lines, requestIds: ids.slice(0, MAX_REQUEST_IDS), moreRequestIds: Math.max(0, ids.length - MAX_REQUEST_IDS) };
 }
 
 /**
  * Returns the warning signs in `signals`, the lines of the window, and the work in `queue` still waiting at `now`
- * after `STUCK_AFTER_MS`. Work ends when it is dispatched or finished, or when its PR closes, which drops it.
+ * after `STUCK_AFTER_MS`. `publicRepos` are the repositories the issue may name.
  */
-export function findings(signals: LogEvent[], queue: LogEvent[], now: number): Finding[] {
+export function findings(signals: LogEvent[], queue: LogEvent[], now: number, publicRepos: ReadonlySet<string>): Finding[] {
   const starts = signals.filter((event) => event.source.msg === 'coordinator_start_error')
     .map((event) => ({ event, detail: text(event.source.error) }));
   const writes = signals.filter((event) => FAILED_WRITES.has(text(event.source.msg)))
@@ -80,46 +100,69 @@ export function findings(signals: LogEvent[], queue: LogEvent[], now: number): F
   const serverErrors = signals.filter((event) => isServerError(event.source))
     .map((event) => ({ event, detail: text(event.source.error ?? `status ${text(event.source.status)}`) }));
   return [
-    finding('Start errors', starts),
-    finding('Failed note and comment writes', writes),
-    finding('Runs the safety poll cancelled or queued again', cancels),
-    finding('5xx statuses', serverErrors),
-    finding('Work queued over 20 minutes without a dispatch', stuck(queue, now)),
+    finding('Start errors', starts, publicRepos),
+    finding('Failed note and comment writes', writes, publicRepos),
+    finding('Runs the safety poll cancelled or queued again', cancels, publicRepos),
+    finding('5xx statuses', serverErrors, publicRepos),
+    finding('Work queued over 20 minutes without a dispatch', stuck(queue, now), publicRepos),
   ].filter((entry): entry is Finding => entry !== null);
 }
 
-function stuck(queue: LogEvent[], now: number): Array<{ event: LogEvent; detail: string }> {
-  const waiting = new Map<string, LogEvent>();
+/**
+ * Returns the work queued over `STUCK_AFTER_MS` that no dispatch, end or close of its PR followed. Work waiting while its
+ * PR has a run going waits by design, and a review held by the hourly cap waits until the cap releases it.
+ */
+function stuck(queue: LogEvent[], now: number): Match[] {
+  const waiting = new Map<string, { event: LogEvent; since: number }>();
+  const running = new Set<string>();
   for (const event of [...queue].sort((a, b) => a.timestamp - b.timestamp)) {
     const { source } = event;
-    const pr = `${text(source.repo)}#${text(source.pr)}`;
+    const pr = `${repositoryOf(source)}#${text(source.pr)}`;
+    const effect = text(source.effect);
     // A close drops the PR's queued work and can queue the work of a merge in the same line.
-    if (source.msg === 'coordinator_receive' && text(source.effect).startsWith('closed')) {
+    if (source.msg === 'coordinator_receive' && effect.startsWith('closed')) {
       for (const key of waiting.keys()) if (key.startsWith(`${pr} `)) waiting.delete(key);
     }
-    const queued = text(source.effect).match(/queued work (\d+)/);
-    if (queued) waiting.set(`${pr} ${queued[1]}`, event);
-    if ((source.msg === 'coordinator_dispatched' || source.msg === 'coordinator_finished') && source.work_id !== undefined) {
-      waiting.delete(`${pr} ${text(source.work_id)}`);
+    const queued = effect.match(/queued work (\d+)/);
+    if (queued) waiting.set(`${pr} ${queued[1]}`, { event, since: event.timestamp });
+    if (source.work_id === undefined) continue;
+    const key = `${pr} ${text(source.work_id)}`;
+    if (source.msg === 'coordinator_dispatched') {
+      waiting.delete(key);
+      running.add(key);
+    } else if (source.msg === 'coordinator_finished') {
+      waiting.delete(key);
+      running.delete(key);
+    } else if (source.msg === 'coordinator_requeued') {
+      running.delete(key);
+      waiting.set(key, { event, since: event.timestamp });
+    } else if (source.msg === 'coordinator_held') {
+      const entry = waiting.get(key) ?? { event, since: event.timestamp };
+      waiting.set(key, { ...entry, since: Math.max(entry.since, Number(source.until) || 0) });
     }
   }
+  const busy = new Set([...running].map((key) => key.slice(0, key.lastIndexOf(' '))));
   return [...waiting.entries()]
-    .filter(([, event]) => now - event.timestamp > STUCK_AFTER_MS)
-    .map(([key, event]) => ({
-      event,
-      detail: `work ${key.split(' ')[1]} waiting ${Math.round((now - event.timestamp) / 60_000)} minutes`,
-    }));
+    .filter(([key, { since }]) => now - since > STUCK_AFTER_MS && !busy.has(key.slice(0, key.lastIndexOf(' '))))
+    .map(([key, { event }]) => {
+      const minutes = `waiting ${Math.round((now - event.timestamp) / 60_000)} minutes`;
+      // A line that queued the work names it only in its effect.
+      return { event, detail: event.source.work_id === undefined ? `work ${key.slice(key.lastIndexOf(' ') + 1)} ${minutes}` : minutes };
+    });
 }
 
 /** The issue body for `found` in the window from `from` to `to`. */
 export function issueBody(found: Finding[], from: number, to: number): string {
-  const sections = found.map((entry) => [
-    `### ${entry.title}`,
-    '',
-    ...entry.lines.map((entryLine) => `- ${entryLine}`),
-    '',
-    `Request ids: ${entry.requestIds.map((id) => `\`${id}\``).join(', ') || 'none'}`,
-  ].join('\n'));
+  const sections = found.map((entry) => {
+    const ids = entry.requestIds.map((id) => `\`${id}\``).join(', ') || 'none';
+    return [
+      `### ${entry.title}`,
+      '',
+      ...entry.lines.map((entryLine) => `- ${entryLine}`),
+      '',
+      `Request ids: ${ids}${entry.moreRequestIds > 0 ? `, and ${entry.moreRequestIds} more` : ''}`,
+    ].join('\n');
+  });
   return [
     `The Worker logged warning signs from ${new Date(from).toISOString()} to ${new Date(to).toISOString()}. Filter Workers Logs on \`$metadata.requestId\` to read a request in full.`,
     '',

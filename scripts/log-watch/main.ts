@@ -1,4 +1,4 @@
-import { findings, ISSUE_MARKER, issueBody, type LogEvent, QUEUE_MESSAGES, SIGNAL_MESSAGES } from './findings.ts';
+import { findings, ISSUE_MARKER, issueBody, type LogEvent, QUEUE_MESSAGES, repositories, SIGNAL_MESSAGES } from './findings.ts';
 
 // Each run reads a bit more than the hour since the last, so a late scheduled run leaves no gap.
 const WINDOW_MS = 75 * 60_000;
@@ -42,8 +42,8 @@ async function query(filters: unknown[], from: number, to: number): Promise<LogE
   }
 }
 
-async function github(path: string, init: { method?: string; body?: unknown } = {}): Promise<unknown> {
-  const response = await fetch(`https://api.github.com/repos/${env('GITHUB_REPOSITORY')}${path}`, {
+function githubFetch(path: string, init: { method?: string; body?: unknown } = {}): Promise<Response> {
+  return fetch(`https://api.github.com${path}`, {
     method: init.method ?? 'GET',
     headers: {
       authorization: `Bearer ${env('GITHUB_TOKEN')}`,
@@ -53,8 +53,20 @@ async function github(path: string, init: { method?: string; body?: unknown } = 
     },
     ...(init.body !== undefined && { body: JSON.stringify(init.body) }),
   });
+}
+
+/** Calls the GitHub API on this repository. */
+async function github(path: string, init: { method?: string; body?: unknown } = {}): Promise<unknown> {
+  const response = await githubFetch(`/repos/${env('GITHUB_REPOSITORY')}${path}`, init);
   if (!response.ok) throw new Error(`${init.method ?? 'GET'} ${path} failed with ${response.status}`);
   return response.json();
+}
+
+/** Whether GitHub shows `repo` as public. A repository the token cannot read counts as private. */
+async function isPublic(repo: string): Promise<boolean> {
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return false;
+  const response = await githubFetch(`/repos/${repo}`);
+  return response.ok && (await response.json() as { private?: boolean }).private === false;
 }
 
 const to = Date.now();
@@ -77,7 +89,9 @@ const signals = await query([{
   ],
 }], from, to);
 const queue = await query([{ key: 'msg', operation: 'in', type: 'string', value: QUEUE_MESSAGES.join(',') }], to - QUEUE_SPAN_MS, to);
-const found = findings(signals, queue, to);
+const named = repositories([...signals, ...queue]);
+const visible = await Promise.all(named.map(isPublic));
+const found = findings(signals, queue, to, new Set(named.filter((_, index) => visible[index])));
 
 const issues = await github(`/issues?state=open&creator=${encodeURIComponent('github-actions[bot]')}&per_page=100`) as Array<{ number: number; body: string | null }>;
 const open = issues.find((issue) => issue.body?.includes(ISSUE_MARKER));
