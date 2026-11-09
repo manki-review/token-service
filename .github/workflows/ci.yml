@@ -22,4 +22,5 @@ jobs:
           cache: 'npm'
       - run: npm ci
       - run: npm run typecheck
+      - run: npx tsc -p scripts
       - run: npm test

@@ -1,0 +1,35 @@
+name: Log watch
+
+# Reads the Workers Logs since the last run for warning signs and keeps one issue about them, closed once a window is clean.
+on:
+  schedule:
+    - cron: '23 * * * *'
+
+permissions: {}
+
+concurrency:
+  group: log-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    name: Watch the Worker logs
+    if: github.repository == 'manki-review/token-service'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read  # finds when the last successful run started, where the next window begins
+      contents: read  # checks out the watcher script
+      issues: write  # opens, updates and closes the warning issue
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '24'
+      - run: node scripts/log-watch/main.ts
+        env:
+          CF_ACCOUNT_ID: 3b92b0c57c5dbec24ddfbf114e17db8e
+          CF_LOGS_READ_TOKEN: ${{ secrets.CF_LOGS_READ_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
