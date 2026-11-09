@@ -13,6 +13,9 @@ export const MANKI_LOGINS: readonly string[] = [BOT_LOGIN, 'github-actions[bot]'
 /** The marker every comment and review comment Manki writes carries. */
 export const MANKI_COMMENT_MARKER = '<!-- manki';
 
+/** The marker in the body of Manki's review and its progress comment. A thread reply's review has an empty body. */
+export const BOT_MARKER = '<!-- manki-bot -->';
+
 /** The answer to a help command, as Manki's `handleHelp` posts it. */
 export const HELP_REPLY = [
   '| Command | What it does |',
@@ -139,7 +142,7 @@ const SETTINGS_BLOCK = /(?:^|\n+)---\n((?:Last reviewed `[0-9a-f]+`|Not reviewed
 
 /** Whether `body` is Manki's progress comment of a review that has not ended. */
 export function isRunningProgress(body: string): boolean {
-  return body.includes('<!-- manki-bot -->') && /\*\*Review (?:started|in progress)\*\*/.test(body)
+  return body.includes(BOT_MARKER) && /\*\*Review (?:started|in progress)\*\*/.test(body)
     && !body.includes(REVIEW_COMPLETE_MARKER) && !body.includes(CANCELLED_MARKER);
 }
 
