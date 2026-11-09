@@ -184,13 +184,17 @@ export function settingsHead(body: string): string | null {
   return SETTINGS_BLOCK.exec(body)?.[1].match(/head `([0-9a-f]+)`/)?.[1] ?? null;
 }
 
-/** Returns `body` with the status of its settings block set to `status` and the boxes in `untick` cleared. */
-export function withSettingsStatus(body: string, status: string, untick: SettingsBox[]): string {
+/**
+ * Returns `body` with the status of its settings block set to `status` and the boxes in `untick` cleared. With `head`,
+ * the status line names that commit as the head, as Manki writes it.
+ */
+export function withSettingsStatus(body: string, status: string, untick: SettingsBox[], head?: string): string {
   const block = SETTINGS_BLOCK.exec(body);
   if (!block) return body;
   const lines = body.slice(block.index).split('\n');
   const at = lines.findIndex((line) => line.startsWith(block[1]));
-  lines[at] = `${block[1]}${status}`;
+  const prefix = head ? block[1].replace(/head `[0-9a-f]+`/, `head \`${head.slice(0, 7)}\``) : block[1];
+  lines[at] = `${prefix}${status}`;
   return setBoxes(body.slice(0, block.index) + lines.join('\n'), untick.map((box) => ({ box, ticked: false })));
 }
 

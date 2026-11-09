@@ -1024,7 +1024,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const { body, user } = await read.json() as IssueCommentRead;
     if (!MANKI_LOGINS.includes(user?.login ?? '')) return;
     const labels = boxLabels(body ?? '', modesOf(item));
-    const starting = withSettingsStatus(body ?? '', `${labels.join(' and ') || 'Review'} requested by @${item.sender}, starting…`, []);
+    const starting = withSettingsStatus(body ?? '', `${labels.join(' and ') || 'Review'} requested by @${item.sender}, starting…`, [], item.run_head ?? undefined);
     if (starting === body) return;
     const response = await githubApi(token, path, { method: 'PATCH', body: { body: starting } });
     if (!response.ok) throw new Error(`showing the review as starting failed with ${response.status}`);
@@ -1131,7 +1131,7 @@ export class PrCoordinator extends DurableObject<Env> {
         const ticked = item.object_id !== null && item.object_id !== progress?.id ? await this.readComment(token, repo, item.object_id) : null;
         for (const comment of [progress, ticked]) {
           if (!comment) continue;
-          const body = withSettingsStatus(comment.body, `already reviewing \`${head.slice(0, 7)}\``, ['again']);
+          const body = withSettingsStatus(comment.body, `already reviewing \`${head.slice(0, 7)}\``, ['again'], head);
           const edited = await githubApi(token, `${repo}/issues/comments/${comment.id}`, { method: 'PATCH', body: { body } });
           if (!edited.ok) throw new Error(`showing the running review failed with ${edited.status}`);
         }
@@ -1506,7 +1506,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const settings = await this.newestMankiComment(token, target, (body) => settingsHead(body) !== null);
     // A progress comment still in progress belongs to its run, which may edit it at any time.
     if (!settings || isRunningProgress(settings.body)) return;
-    const body = withSettingsStatus(settings.body, `automatic review paused, \`${head.slice(0, 7)}\` waits`, []);
+    const body = withSettingsStatus(settings.body, `automatic review paused, \`${head.slice(0, 7)}\` waits`, [], head);
     if (body === settings.body) return;
     const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/comments/${settings.id}`, { method: 'PATCH', body: { body } });
     if (!response.ok) throw new Error(`showing the paused push failed with ${response.status}`);
