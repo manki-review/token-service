@@ -1,7 +1,7 @@
 import type { Env } from './env';
 import { githubApi, githubGraphql, mintRepositoryToken } from './github';
 import { failure, log } from './log';
-import { MANKI_LOGINS } from './manki';
+import { isMankiGraphqlLogin } from './manki';
 import { verifyWorkflowRequest } from './oidc';
 import { checkDispatchedRun } from './run-check';
 
@@ -47,11 +47,6 @@ async function readThread(token: string, id: string): Promise<ThreadNode | null>
   return result.data?.node ?? null;
 }
 
-/** Whether a GraphQL login is one of Manki's. GraphQL names a bot `<slug>`, while REST and webhooks use `<slug>[bot]`. */
-function isMankiLogin(login: string | undefined): boolean {
-  return login !== undefined && MANKI_LOGINS.includes(`${login}[bot]`);
-}
-
 /**
  * Serves `/resolve`, through which the run a PR coordinator dispatched resolves or reopens one of Manki's review threads
  * on its PR. It takes the workflow's OIDC token like `/token`, so the run itself never needs `contents: write`.
@@ -82,7 +77,7 @@ export async function handleResolve(request: Request, env: Env): Promise<Respons
 
     const thread = await readThread(mint.token, threadId);
     const pr = thread?.pullRequest;
-    if (pr?.repository.databaseId !== repositoryId || pr.number !== run.pr || !isMankiLogin(thread?.comments?.nodes[0]?.author?.login)) {
+    if (pr?.repository.databaseId !== repositoryId || pr.number !== run.pr || !isMankiGraphqlLogin(thread?.comments?.nodes[0]?.author?.login)) {
       log('resolve_refused', { ...audit, pr: run.pr, reason: 'not a Manki thread on the run\'s pull request' });
       return Response.json({ error: 'No Manki review thread with that id on the run\'s pull request' }, { status: 404 });
     }
