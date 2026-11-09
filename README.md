@@ -206,6 +206,20 @@ The `production` environment is set up in the repository settings:
 
 To rotate the token, create a new one with the same permissions (My Profile, API Tokens, Create Token, Create Custom Token), replace the secret in `production`, and delete the old token in the dashboard. For a manual deploy from a laptop, use `wrangler login` rather than a token in the shell environment.
 
+## Log watch
+
+`.github/workflows/log-watch.yml` runs `scripts/log-watch/main.ts` every hour. It reads the last 75 minutes of Workers Logs for warning signs:
+
+- `coordinator_start_error`.
+- Failed writes of a note or comment: the conflict note, the starting status, a cancelled review's report and the eyes reaction.
+- Runs the safety poll cancelled (`timed_out`) or queued again.
+- Any line with a 5xx status or an error naming one.
+- Work queued over 20 minutes ago that no dispatch, end or close of its PR has followed, looked for over the last 6 hours.
+
+It keeps one issue titled "Worker logs show warning signs", marked `<!-- log-watch -->`. A window with warning signs opens the issue, or replaces the body of the open one with that window's lines and Workers Logs request ids. A clean window comments on the open issue and closes it. The next warning sign opens a new one.
+
+It reads the logs with the repository secret `CF_LOGS_READ_TOKEN`, a Cloudflare API token with only Account, Workers Observability, Read on the account that runs the Worker. Its job holds `contents: read` and `issues: write`. It changes nothing in the Worker, so it needs no deploy.
+
 ## Development
 
 ```sh

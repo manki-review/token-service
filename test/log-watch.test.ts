@@ -1,0 +1,112 @@
+import { describe, expect, it } from 'vitest';
+import { findings, ISSUE_MARKER, issueBody, type LogEvent, STUCK_AFTER_MS } from '../scripts/log-watch/findings';
+
+const NOW = Date.parse('2026-11-09T09:00:00Z');
+const MINUTE = 60_000;
+const PR = { repo: 'manki-review/manki', pr: 1289 };
+
+let nextId = 0;
+function event(minutesAgo: number, source: Record<string, unknown>): LogEvent {
+  return { timestamp: NOW - minutesAgo * MINUTE, source: { ...PR, ...source }, $metadata: { requestId: `req-${nextId++}` } };
+}
+
+describe('findings', () => {
+  it('sorts each warning sign under its title with its lines and request ids, and finds nothing in a clean window', () => {
+    const signals = [
+      event(30, { msg: 'coordinator_start_error', work_id: 2, error: 'Error: posting the conflict note failed with 403' }),
+      event(20, { msg: 'coordinator_start_error', work_id: 2, error: 'Error: posting the conflict note failed with 403' }),
+      event(25, { msg: 'coordinator_conflict_note_failed', error: 'Error: posting the conflict note failed with 403' }),
+      event(24, { msg: 'coordinator_reaction_failed', comment_id: 7, status: 403 }),
+      event(23, { msg: 'coordinator_finished', work_id: 3, status: 'timed_out', note: 'run went past its timeout, cancel requested' }),
+      event(22, { msg: 'coordinator_finished', work_id: 4, status: 'done', note: 'run completed' }),
+      event(21, { msg: 'coordinator_requeued', work_id: 5, reason: 'run never started' }),
+      event(10, { msg: 'request_failed', status: 502, error: 'Memory append failed' }),
+      event(9, { msg: 'coordinator_dispatch_error', work_id: 6, error: 'Error: dispatch failed with 503' }),
+    ];
+    expect(findings(signals, [], NOW)).toEqual([
+      {
+        title: 'Start errors (2)',
+        lines: [
+          '08:30:00 `coordinator_start_error` manki-review/manki#1289 work 2: Error: posting the conflict note failed with 403',
+          '08:40:00 `coordinator_start_error` manki-review/manki#1289 work 2: Error: posting the conflict note failed with 403',
+        ],
+        requestIds: ['req-0', 'req-1'],
+      },
+      {
+        title: 'Failed note and comment writes (2)',
+        lines: [
+          '08:35:00 `coordinator_conflict_note_failed` manki-review/manki#1289: Error: posting the conflict note failed with 403',
+          '08:36:00 `coordinator_reaction_failed` manki-review/manki#1289: status 403',
+        ],
+        requestIds: ['req-2', 'req-3'],
+      },
+      {
+        title: 'Runs the safety poll cancelled or queued again (2)',
+        lines: [
+          '08:37:00 `coordinator_finished` manki-review/manki#1289 work 3: run went past its timeout, cancel requested',
+          '08:39:00 `coordinator_requeued` manki-review/manki#1289 work 5: run never started',
+        ],
+        requestIds: ['req-4', 'req-6'],
+      },
+      {
+        title: '5xx statuses (2)',
+        lines: [
+          '08:50:00 `request_failed` manki-review/manki#1289: Memory append failed',
+          '08:51:00 `coordinator_dispatch_error` manki-review/manki#1289 work 6: Error: dispatch failed with 503',
+        ],
+        requestIds: ['req-7', 'req-8'],
+      },
+    ]);
+    expect(findings([event(5, { msg: 'coordinator_finished', work_id: 4, status: 'done' })], [], NOW)).toEqual([]);
+
+    const many = Array.from({ length: 12 }, (_, index) => event(40 - index, { msg: 'coordinator_start_error', work_id: 9, error: 'Error: x' }));
+    const [crowded] = findings(many, [], NOW);
+    expect(crowded.title).toBe('Start errors (12)');
+    expect(crowded.lines).toHaveLength(11);
+    expect(crowded.lines.at(-1)).toBe('and 2 more');
+    expect(crowded.requestIds).toHaveLength(12);
+  });
+
+  it('reports work queued longer than 20 minutes that no dispatch, end or close followed', () => {
+    const stuckMinutes = STUCK_AFTER_MS / MINUTE + 1;
+    const queue = [
+      event(60, { msg: 'coordinator_receive', effect: 'queued work 1' }),
+      event(55, { msg: 'coordinator_dispatched', work_id: 1 }),
+      event(50, { msg: 'coordinator_receive', effect: 'queued work 2' }),
+      event(45, { msg: 'coordinator_finished', work_id: 2, status: 'skipped' }),
+      event(40, { msg: 'coordinator_receive', effect: 'queued work 3' }),
+      event(39, { msg: 'coordinator_receive', effect: 'merged into work 3' }),
+      event(stuckMinutes, { msg: 'reconciler_caught_up', effect: 'queued work 4' }),
+      event(10, { msg: 'coordinator_receive', effect: 'queued work 5' }),
+      // The same work id on another PR is other work.
+      event(30, { msg: 'coordinator_receive', effect: 'queued work 1', pr: 1290 }),
+      // A close drops the queued work and queues the merge's.
+      event(35, { msg: 'coordinator_receive', effect: 'queued work 7', pr: 1291 }),
+      event(34, { msg: 'coordinator_receive', effect: 'closed, dropped 1, queued work 8', pr: 1291 }),
+    ];
+    const [stuck] = findings([], queue, NOW);
+    expect(stuck.title).toBe('Work queued over 20 minutes without a dispatch (4)');
+    expect(stuck.lines).toEqual([
+      '08:20:00 `coordinator_receive` manki-review/manki#1289: work 3 waiting 40 minutes',
+      '08:26:00 `coordinator_receive` manki-review/manki#1291: work 8 waiting 34 minutes',
+      '08:30:00 `coordinator_receive` manki-review/manki#1290: work 1 waiting 30 minutes',
+      '08:39:00 `reconciler_caught_up` manki-review/manki#1289: work 4 waiting 21 minutes',
+    ]);
+  });
+
+  it('writes an issue body with the window, each sign and the marker the watcher finds the issue by', () => {
+    const found = findings([event(5, { msg: 'coordinator_start_error', work_id: 2, error: 'Error: boom' })], [], NOW);
+    const body = issueBody(found, NOW - 75 * MINUTE, NOW);
+    expect(body).toBe([
+      'The Worker logged warning signs from 2026-11-09T07:45:00.000Z to 2026-11-09T09:00:00.000Z. Filter Workers Logs on `$metadata.requestId` to read a request in full.',
+      '',
+      '### Start errors (1)',
+      '',
+      '- 08:55:00 `coordinator_start_error` manki-review/manki#1289 work 2: Error: boom',
+      '',
+      `Request ids: \`${found[0].requestIds[0]}\``,
+      '',
+      ISSUE_MARKER,
+    ].join('\n'));
+  });
+});
