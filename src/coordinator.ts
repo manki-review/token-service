@@ -1504,7 +1504,8 @@ export class PrCoordinator extends DurableObject<Env> {
     const token = await this.token({ issues: 'write', pull_requests: 'write' });
     if (token === null) return;
     const settings = await this.newestMankiComment(token, target, (body) => settingsHead(body) !== null);
-    if (!settings) return;
+    // A progress comment still in progress belongs to its run, which may edit it at any time.
+    if (!settings || isRunningProgress(settings.body)) return;
     const body = withSettingsStatus(settings.body, `automatic review paused, \`${head.slice(0, 7)}\` waits`, []);
     if (body === settings.body) return;
     const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/comments/${settings.id}`, { method: 'PATCH', body: { body } });

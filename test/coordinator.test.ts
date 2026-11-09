@@ -1764,11 +1764,15 @@ describe('PrCoordinator dispatch', () => {
       await pr.stub.runCompleted(key('d-push'), 9001, 'success');
 
       // Unticking Pause reviews the push the pause skipped once, as if it had just arrived. An outsider's review request
-      // in between starts no run, so it does not count as a review since.
+      // in between starts no run, so it does not count as a review since. A newest settings comment still in progress
+      // is its run's, so the status line is left alone.
       await edit([], ['pause']);
+      github.issueComments.set(1700, progress());
       github.head = SHA_3;
       await pr.send('pull_request', pr.push(SHA_3));
       await runDurableObjectAlarm(pr.stub);
+      expect(github.issueComments.get(1700)).toBe(progress());
+      expect(github.checkRuns.at(-1)).toMatchObject({ head_sha: SHA_3 });
       expect(github.dispatches).toHaveLength(2);
       const outsider = { login: 'mallory', type: 'User' };
       await pr.send('issue_comment', issueCommentEvent('@manki review', { number: pr.number, association: 'NONE', author: outsider, sender: outsider }));
