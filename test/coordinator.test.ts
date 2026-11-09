@@ -1762,11 +1762,16 @@ describe('PrCoordinator dispatch', () => {
       expect(github.dispatches.at(-1)?.inputs).toMatchObject({ event: 'pull_request', head_sha: SHA_2 });
       await pr.stub.runCompleted(key('d-push'), 9001, 'success');
 
-      // Unticking Pause reviews the push the pause skipped once, as if it had just arrived.
+      // Unticking Pause reviews the push the pause skipped once, as if it had just arrived. An outsider's review request
+      // in between starts no run, so it does not count as a review since.
       await edit([], ['pause']);
       github.head = SHA_3;
       await pr.send('pull_request', pr.push(SHA_3));
       await runDurableObjectAlarm(pr.stub);
+      const outsider = { login: 'mallory', type: 'User' };
+      await pr.send('issue_comment', issueCommentEvent('@manki review', { number: pr.number, association: 'NONE', author: outsider, sender: outsider }));
+      await runDurableObjectAlarm(pr.stub);
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'review', status: 'skipped', note: 'commenter has no write access' });
       expect(github.dispatches).toHaveLength(2);
       await edit(['pause'], []);
       expect(github.dispatches).toHaveLength(3);
@@ -1792,7 +1797,7 @@ describe('PrCoordinator dispatch', () => {
 
       expect(github.checkRuns.map((check) => check.head_sha)).toEqual([SHA_1, SHA_4, SHA_3, SHA_5]);
       expect((await workRows(pr.stub)).filter((row) => row.kind === 'settings').map((row) => row.note)).toEqual([
-        'paused', 'again review work 6', 'resumed', 'paused', 'resumed, queued work 12', 'paused', 'resumed',
+        'paused', 'again review work 6', 'resumed', 'paused', 'resumed, queued work 13', 'paused', 'resumed',
       ]);
     });
 

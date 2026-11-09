@@ -1080,14 +1080,21 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Lifts the Pause box. When the newest review is a push the pause skipped, nothing reviewed the PR since, so one
-   * review of that push is queued as if it had just arrived.
+   * Lifts the Pause box. When no review ran or waits since the last push the pause skipped, one review of that push is
+   * queued as if it had just arrived. A later review that started no run, such as an outsider's request, does not count.
    */
   private resume(item: WorkRow): string {
-    const [newest] = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE kind = 'review' ORDER BY id DESC LIMIT 1`).toArray();
-    if (newest?.status !== 'skipped' || newest.note !== PAUSED_NOTE) return 'resumed';
+    const [waiting] = this.sql.exec<WorkRow>(
+      `SELECT * FROM work WHERE kind = 'review' AND status = 'skipped' AND note = ? ORDER BY id DESC LIMIT 1`, PAUSED_NOTE,
+    ).toArray();
+    if (!waiting) return 'resumed';
+    const since = this.sql.exec(
+      `SELECT 1 FROM work WHERE kind = 'review' AND id > ? AND (status IN ('queued', 'dispatching', 'running', 'done', 'failed') OR conclusion = 'cancelled')`,
+      waiting.id,
+    ).toArray();
+    if (since.length > 0) return 'resumed';
     const work: Work = {
-      lane: 'state', kind: 'review', event: newest.event, headSha: newest.head_sha, objectId: null, sender: '',
+      lane: 'state', kind: 'review', event: waiting.event, headSha: waiting.head_sha, objectId: null, sender: '',
       trusted: true, acknowledge: false, writer: true,
     };
     return `resumed, ${this.enqueue(work, item.delivery, Date.now())}`;
