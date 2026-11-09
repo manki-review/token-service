@@ -681,6 +681,7 @@ function fakeGitHub(number: number) {
     /** The refs `.manki.yml` was read at, and the check runs created. */
     configReads: [] as string[],
     checkRuns: [] as Array<Record<string, unknown>>,
+    checkRunStatus: 201,
     /** Replies the next dispatches get, in order. Afterwards 200 with a new run id. */
     dispatchStatuses: [] as Reply[],
     /** Statuses the next cancels answer with, in order. Afterwards 202. */
@@ -777,6 +778,7 @@ function fakeGitHub(number: number) {
       return Response.json({ type: 'file', encoding: 'base64', size: state.config.length, content });
     }
     if (route === `POST ${repo}/check-runs`) {
+      if (state.checkRunStatus !== 201) return Response.json({ message: 'no' }, { status: state.checkRunStatus });
       state.checkRuns.push(await request.json() as Record<string, unknown>);
       return Response.json({ id: 1 }, { status: 201 });
     }
@@ -1116,9 +1118,38 @@ describe('PrCoordinator dispatch', () => {
     // cancelled run leaves the reported state as it was.
     expect(await pr.stub.runCompleted(key('d-1'), 9000, 'success')).toMatchObject({ accepted: true });
     expect(await call('/state/report', { pause: null })).toEqual({ status: 403, body: { error: 'run 9000 is not active on this PR' } });
+    // The waiting push gets a check and the status line of the settings comment. A check that fails to post is logged,
+    // and a later skip of the same head, such as a catch-up, posts it once.
+    const notice = (status: string) => ['Round cap reached. Automatic review is paused.', '<!-- manki-bot -->', '', '---',
+      `Last reviewed \`${SHA_1.slice(0, 7)}\` · head \`${SHA_1.slice(0, 7)}\` · ${status}`,
+      '- [ ] Pause automatic reviews <!-- manki-box:pause -->', '<!-- manki-settings -->'].join('\n');
+    github.issueComments.set(1500, notice('automatic review paused'));
+    github.checkRunStatus = 502;
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches).toHaveLength(1);
     expect((await workRows(pr.stub)).at(-1)).toMatchObject({ head_sha: SHA_2, status: 'skipped', note: 'pull request is paused' });
+    expect(logged(log, 'coordinator_paused_report_failed')).toMatchObject([
+      { head_sha: SHA_2, part: 'check', error: 'creating the Automatic review paused check failed with 502' },
+    ]);
+    expect(github.issueComments.get(1500)).toBe(notice(`automatic review paused, \`${SHA_2.slice(0, 7)}\` waits`));
+    github.checkRunStatus = 201;
+    const pausedCheck = {
+      name: 'Manki', head_sha: SHA_2, status: 'completed', conclusion: 'action_required',
+      output: {
+        title: 'Automatic review paused',
+        summary: "Round cap reached. Automatic review is paused, so this commit waits. Tick **Review again** on Manki's settings comment to review it.",
+      },
+    };
+    const catchUp = { installationId: INSTALLATION_ID, repositoryId: REPOSITORY_ID, owner: OWNER, ownerId: OWNER_ID, repo: REPO, defaultBranch: 'main', number: pr.number };
+    for (const _ of [1, 2]) {
+      await pr.stub.catchUp(catchUp, SHA_2);
+      await runDurableObjectAlarm(pr.stub);
+    }
+    expect(github.checkRuns).toEqual([pausedCheck]);
+    expect((await workRows(pr.stub)).at(-1)).toMatchObject({ head_sha: SHA_2, status: 'skipped', note: 'pull request is paused' });
+    for (const permissions of [{ checks: 'write' }, { issues: 'write', pull_requests: 'write' }]) {
+      expect(github.mints).toContainEqual({ permissions, repository_ids: [REPOSITORY_ID] });
+    }
     const request = async (event: string, payload: WebhookPayload) => {
       await pr.send(event, payload);
       await runDurableObjectAlarm(pr.stub);
@@ -1141,6 +1172,7 @@ describe('PrCoordinator dispatch', () => {
     await pr.send('pull_request', pr.push(SHA_3));
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches.at(-1)?.inputs).toMatchObject({ event: 'pull_request', head_sha: SHA_3 });
+    expect(github.checkRuns).toEqual([pausedCheck]);
   });
 
   it('keeps a closed PR while its run is still running, then deletes it a week after the close', async () => {
@@ -1669,10 +1701,26 @@ describe('PrCoordinator dispatch', () => {
       const { pr, github, state, edit } = setup();
       await edit([], ['pause']);
       expect(await state()).toMatchObject({ settings: { paused: true } });
+      // The status line goes on Manki's newest settings comment, never on someone else's.
+      const notice = (status: string) => ['**Review complete**', '<!-- manki-bot -->', '', '---',
+        `Last reviewed \`1111111\` · head \`1111111\` · ${status}`, ...boxLines(['pause'], ['pause', 'deeper']), '<!-- manki-settings -->'].join('\n');
+      github.issueComments.set(1400, notice('up to date'));
+      github.issueComments.set(1600, notice('up to date'));
+      github.commentAuthors.set(1600, 'mallory');
       await pr.send('pull_request', pr.push(SHA_1));
       await runDurableObjectAlarm(pr.stub);
       expect(github.dispatches).toEqual([]);
       expect((await workRows(pr.stub)).at(-1)).toMatchObject({ status: 'skipped', note: 'pull request is paused' });
+      expect(github.checkRuns).toEqual([{
+        name: 'Manki', head_sha: SHA_1, status: 'completed', conclusion: 'action_required',
+        output: {
+          title: 'Automatic review paused',
+          summary: "Automatic review is paused by the **Pause automatic reviews** box on Manki's settings comment, so this commit waits. "
+            + "Tick **Review again** on Manki's settings comment to review it, or untick Pause so later pushes are reviewed.",
+        },
+      }]);
+      expect(github.issueComments.get(1400)).toBe(notice(`automatic review paused, \`${SHA_1.slice(0, 7)}\` waits`));
+      expect(github.issueComments.get(1600)).toBe(notice('up to date'));
       await edit(['pause'], ['pause', 'again']);
       expect(github.dispatches.at(-1)?.inputs).toMatchObject({ event: 'issue_comment', action: 'edited', comment_id: String(SETTINGS) });
       expect(await state()).toMatchObject({ active: [{ kind: 'review', run_id: 9000, modes: ['again'] }], settings: { paused: true } });
@@ -1684,6 +1732,7 @@ describe('PrCoordinator dispatch', () => {
       await pr.send('pull_request', pr.push(SHA_2));
       await runDurableObjectAlarm(pr.stub);
       expect(github.dispatches.at(-1)?.inputs).toMatchObject({ event: 'pull_request', head_sha: SHA_2 });
+      expect(github.checkRuns.map((check) => check.head_sha)).toEqual([SHA_1]);
       expect((await workRows(pr.stub)).filter((row) => row.kind === 'settings').map((row) => row.note)).toEqual(['paused', 'again review work 4', 'resumed']);
     });
 

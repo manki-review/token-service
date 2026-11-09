@@ -200,6 +200,15 @@ const editOf = (row: WorkRow): SettingsEdit => JSON.parse(row.boxes ?? '{"at":0,
 
 const modesOf = (row: WorkRow): ReviewMode[] => (row.modes === null ? [] : JSON.parse(row.modes) as ReviewMode[]);
 
+/** Returns why a push waits out the pause, from the reported `reason` and the Pause box, and what reviews it. */
+function pausedSummary(reason: string | null, paused: boolean): string {
+  const box = paused ? ' by the **Pause automatic reviews** box on Manki\'s settings comment' : '';
+  // While the Action's pause holds, unticking Pause alone leaves later pushes paused.
+  const resume = paused && reason === null ? ', or untick Pause so later pushes are reviewed' : '';
+  return `${reason ? `${reason} ` : ''}Automatic review is paused${box}, so this commit waits. `
+    + `Tick **Review again** on Manki's settings comment to review it${resume}.`;
+}
+
 // Each entry runs once, in order. Append new entries; never edit a shipped one.
 export const MIGRATIONS = [
   `CREATE TABLE deliveries (id TEXT PRIMARY KEY, received_at INTEGER NOT NULL);
@@ -914,7 +923,8 @@ export class PrCoordinator extends DurableObject<Env> {
     // Only a review nobody asked for waits out a pause. A request, a reply or a settings box review still runs.
     const { pause, settings } = this.reported();
     if (item.kind === 'review' && item.event.startsWith('pull_request.') && (pause !== null || settings.paused)) {
-      this.finish(item.id, 'skipped', 'pull request is paused');
+      await this.reportPaused(item.head_sha, target);
+      if (this.isDispatching(item.id)) this.finish(item.id, 'skipped', 'pull request is paused');
       return;
     }
     if (item.kind === 'review' && !(await this.refreshReview(item, target))) return;
@@ -1405,6 +1415,43 @@ export class PrCoordinator extends DurableObject<Env> {
   private async reportSkipped(head: string, rule: string, target: Target): Promise<void> {
     const summary = `This PR matches the skip rule for ${rule} in \`.manki.yml\` on the base branch.`;
     await this.completeCheck(head, 'skipped', { title: 'Review skipped', summary }, target);
+  }
+
+  /**
+   * Tells the PR's author that the push of `head` waits out a pause: one `Manki` check per head that says why and what
+   * starts a review, and the status line of Manki's settings comment. A failure is logged and still skips the review.
+   */
+  private async reportPaused(head: string | null, target: Target): Promise<void> {
+    if (head === null) return;
+    const { pause, settings } = this.reported();
+    const failed = (part: string) => (error: unknown) => {
+      log('coordinator_paused_report_failed', { ...this.logFields(), head_sha: head, part, error: error instanceof Error ? error.message : String(error) });
+    };
+    // A catch-up of a head whose push was skipped asks again, and must not add a second check.
+    if (this.getMeta<string>('paused_head') !== head) {
+      const output = { title: 'Automatic review paused', summary: pausedSummary(pause?.reason ?? null, settings.paused) };
+      await this.completeCheck(head, 'action_required', output, target)
+        .then(() => this.setMeta('paused_head', head), failed('check'));
+    }
+    // The settings comment was last edited when the pause began: by the run that reported it, or by the Pause tick.
+    const began = Math.min(pause?.at ?? Infinity, settings.paused ? this.getMeta<number>('pause_at') ?? 0 : Infinity);
+    await this.showPaused(head, began - MINUTE, target).catch(failed('comment'));
+  }
+
+  /** Sets the status line of Manki's newest settings comment edited since `since` to say that `head` waits. */
+  private async showPaused(head: string, since: number, target: Target): Promise<void> {
+    const token = await this.token({ issues: 'write', pull_requests: 'write' });
+    if (token === null) return;
+    const repo = `/repos/${target.owner}/${target.repo}`;
+    const list = await githubApi(token, `${repo}/issues/${target.number}/comments?since=${new Date(since).toISOString()}&per_page=100`);
+    if (!list.ok) throw new Error(`listing the PR comments failed with ${list.status}`);
+    const comments = await list.json() as Array<IssueCommentRead & { id: number }>;
+    const settings = comments.reverse().find((c) => MANKI_LOGINS.includes(c.user?.login ?? '') && settingsHead(c.body ?? '') !== null);
+    if (!settings?.body) return;
+    const body = withSettingsStatus(settings.body, `automatic review paused, \`${head.slice(0, 7)}\` waits`, []);
+    if (body === settings.body) return;
+    const response = await githubApi(token, `${repo}/issues/comments/${settings.id}`, { method: 'PATCH', body: { body } });
+    if (!response.ok) throw new Error(`showing the paused push failed with ${response.status}`);
   }
 
   /** Creates a completed `Manki` check on `head`. Without `checks: write` on the installation, it creates none. */
