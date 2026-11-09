@@ -1339,20 +1339,11 @@ export class PrCoordinator extends DurableObject<Env> {
    */
   private async reportConflict(pr: PullRequestRead, target: Target): Promise<void> {
     const text = `This PR conflicts with \`${pr.base.ref}\`. Rebase it, and Manki reviews it then.`;
-    const token = await this.token({ issues: 'write' });
-    if (token !== null) {
-      const body = `${text}\n\n${CONFLICT_NOTE_MARKER}`;
-      const noteId = this.getMeta<number>('conflict_note');
-      const edited = noteId === null ? null
-        : await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/comments/${noteId}`, { method: 'PATCH', body: { body } });
-      // Manki deletes the note once a review posts, so a note that is gone is posted again.
-      if (edited === null || edited.status === 404) {
-        const posted = await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/${target.number}/comments`, { method: 'POST', body: { body } });
-        if (!posted.ok) throw new Error(`posting the conflict note failed with ${posted.status}`);
-        this.setMeta('conflict_note', ((await posted.json()) as { id: number }).id);
-      } else if (!edited.ok) {
-        throw new Error(`updating the conflict note failed with ${edited.status}`);
-      }
+    try {
+      await this.postConflictNote(`${text}\n\n${CONFLICT_NOTE_MARKER}`, target);
+    } catch (error) {
+      // The note only explains the skip, so a failure to post it never holds the lane.
+      log('coordinator_conflict_note_failed', { ...this.logFields(), error: String(error) });
     }
     const checks = await this.token({ checks: 'write' });
     if (checks === null) return;
@@ -1368,6 +1359,24 @@ export class PrCoordinator extends DurableObject<Env> {
       },
     });
     if (!response.ok) throw new Error(`creating the rebase check failed with ${response.status}`);
+  }
+
+  /** Posts the conflict note, or edits the one an earlier skip posted. */
+  private async postConflictNote(body: string, target: Target): Promise<void> {
+    // A comment on a pull request needs `pull_requests: write`, one on a plain issue `issues: write`.
+    const token = await this.token({ issues: 'write', pull_requests: 'write' });
+    if (token === null) return;
+    const noteId = this.getMeta<number>('conflict_note');
+    const edited = noteId === null ? null
+      : await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/comments/${noteId}`, { method: 'PATCH', body: { body } });
+    // Manki deletes the note once a review posts, so a note that is gone is posted again.
+    if (edited === null || edited.status === 404) {
+      const posted = await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/${target.number}/comments`, { method: 'POST', body: { body } });
+      if (!posted.ok) throw new Error(`posting the conflict note failed with ${posted.status}`);
+      this.setMeta('conflict_note', ((await posted.json()) as { id: number }).id);
+    } else if (!edited.ok) {
+      throw new Error(`updating the conflict note failed with ${edited.status}`);
+    }
   }
 
   /**

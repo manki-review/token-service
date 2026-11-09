@@ -1392,18 +1392,25 @@ describe('PrCoordinator dispatch', () => {
     expect(github.checkRuns.map((check) => check.head_sha)).toEqual([SHA_1, SHA_1, SHA_2]);
   });
 
-  it('still skips a conflicting PR when posting the note failed once, since no dispatch was tried', async () => {
+  it('skips a conflicting PR at once when its note cannot be posted, and posts the note on the next skip', async () => {
     const pr = pullRequest();
-    const github = Object.assign(fakeGitHub(pr.number), { mergeable: [false] as Array<boolean | null>, mergeableState: 'dirty', commentStatus: 502 });
+    const github = Object.assign(fakeGitHub(pr.number), { mergeable: [false] as Array<boolean | null>, mergeableState: 'dirty', commentStatus: 403 });
     await pr.send('pull_request', pr.push(SHA_1));
     await runDurableObjectAlarm(pr.stub);
-    expect(await workRows(pr.stub)).toMatchObject([{ status: 'dispatching', attempts: 0, errors: 1 }]);
-    github.commentStatus = 201;
-    advanceClock(backoff(0));
-    await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches).toEqual([]);
-    expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped', conclusion: 'conflict' }]);
-    expect(github.mints).toContainEqual({ permissions: { issues: 'write' }, repository_ids: [REPOSITORY_ID] });
+    expect(github.checkRuns.map((check) => check.head_sha)).toEqual([SHA_1]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped', conclusion: 'conflict', errors: 0 }]);
+    expect(logged(log, 'coordinator_conflict_note_failed')).toMatchObject([{ error: 'Error: posting the conflict note failed with 403' }]);
+    // A comment on a pull request needs `pull_requests: write`.
+    expect(github.mints).toContainEqual({ permissions: { issues: 'write', pull_requests: 'write' }, repository_ids: [REPOSITORY_ID] });
+
+    github.commentStatus = 201;
+    await pr.send('pull_request', pr.push(SHA_2));
+    github.head = SHA_2;
+    github.mergeable = [false];
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.comments).toHaveLength(2);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped' }, { status: 'skipped', conclusion: 'conflict' }]);
   });
 
   it('reviews a PR GitHub has not computed mergeability for after reading it twice more, and a clean one at once', async () => {
