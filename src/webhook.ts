@@ -3,6 +3,7 @@ import { allowedAccounts, type Env } from './env';
 import { githubGraphql, hasWriteAccess, mintRepositoryToken } from './github';
 import { eventsPerHour } from './limiter';
 import { log } from './log';
+import { BOT_LOGIN } from './manki';
 import { routeDelivery, type Route, type Target, type Work, type WebhookPayload } from './routing';
 import { sha256Hex, verifyWebhookSignature } from './signature';
 
@@ -60,29 +61,24 @@ interface Editor {
 }
 
 /**
- * Names the newest editor of an edited review other than its author as the work's sender, since GitHub sends the
- * review's author. Manki can rewrite its review right after a tick, so the last editor is often Manki. The newest other
- * edit decides, so a tick by another bot or by an editor GitHub no longer names drops the work. Without another edit the
- * last editor counts. Returns `null` when that editor is unknown or a bot. Throws when the lookup fails.
+ * Names the editor of an edited review as the work's sender, since GitHub sends the review's author. Manki can rewrite
+ * its review right after a tick, so the newest edit decides once Manki's edits made after the delivery arrived at
+ * `receivedAt` are passed over. Without another edit the last editor counts. Returns `null` when that editor is unknown
+ * or a bot, such as Manki whose own edit this delivery reports. Throws when the lookup fails.
  */
-async function editedWork(env: Env, target: Target, work: Work): Promise<Work | null> {
+async function editedWork(env: Env, target: Target, work: Work, receivedAt: number): Promise<Work | null> {
   if (!work.editorOf) return work;
   const { node } = await githubGraphql<{
-    node: {
-      author: { login: string } | null;
-      editor: Editor | null;
-      userContentEdits: { nodes: Array<{ editor: Editor | null } | null> | null } | null;
-    } | null;
+    node: { editor: Editor | null; userContentEdits: { nodes: Array<{ editedAt: string; editor: Editor | null } | null> | null } | null } | null;
   }>(
     await lookupToken(env, target),
     // GitHub lists the edits newest first.
-    'query($id: ID!) { node(id: $id) { ... on PullRequestReview { author { login } editor { login __typename } userContentEdits(first: 100) { nodes { editor { login __typename } } } } } }',
+    'query($id: ID!) { node(id: $id) { ... on PullRequestReview { editor { login __typename } userContentEdits(first: 100) { nodes { editedAt editor { login __typename } } } } } }',
     { id: work.editorOf },
   );
-  const author = node?.author?.login;
-  const isAuthors = (edit: { editor: Editor | null } | null) => edit?.editor?.__typename === 'Bot' && edit.editor.login === author;
-  const edits = node?.userContentEdits?.nodes ?? [];
-  const newest = edits.find((edit) => !isAuthors(edit));
+  const isLaterRewrite = (edit: { editedAt: string; editor: Editor | null } | null) => edit?.editor?.__typename === 'Bot'
+    && `${edit.editor.login}[bot]` === BOT_LOGIN && Date.parse(edit.editedAt) > receivedAt;
+  const newest = (node?.userContentEdits?.nodes ?? []).find((edit) => !isLaterRewrite(edit));
   const editor = newest === undefined ? node?.editor : newest?.editor;
   return editor && editor.__typename !== 'Bot' ? { ...work, sender: editor.login } : null;
 }
@@ -123,6 +119,7 @@ function summarize(route: Route): Record<string, unknown> {
  * delivery that can be redelivered.
  */
 export async function handleWebhook(request: Request, env: Env): Promise<Response> {
+  const receivedAt = Date.now();
   if (!env.WEBHOOK_SECRET) {
     console.error('WEBHOOK_SECRET is not set, refusing webhook deliveries');
     return Response.json({ error: 'Webhook secret not configured' }, { status: 500 });
@@ -168,7 +165,7 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
   if (route.type === 'work') {
     let edited: Work | null;
     try {
-      edited = await editedWork(env, route.target, route.work);
+      edited = await editedWork(env, route.target, route.work, receivedAt);
     } catch (error) {
       // The tick would be lost, so the delivery fails and can be delivered again, as for a coordinator failure.
       log('webhook_editor_lookup_failed', { delivery, repository_id: route.target.repositoryId, error: String(error) });
