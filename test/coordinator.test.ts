@@ -1416,19 +1416,36 @@ describe('PrCoordinator dispatch', () => {
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped' }, { status: 'skipped', conclusion: 'conflict' }]);
   });
 
-  it('reviews a PR GitHub has not computed mergeability for after reading it twice more, and a clean one at once', async () => {
+  it('reviews a PR GitHub has not computed mergeability for after reading it twice more, with replies first and newer pushes merged in, and a clean one at once', async () => {
     const pr = pullRequest();
     const github = Object.assign(fakeGitHub(pr.number), { mergeable: [null], mergeableState: 'unknown' });
     await pr.send('pull_request', pr.push(SHA_1));
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches).toEqual([]);
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'queued', merge_checks: 1 }]);
-    advanceClock(5_000);
+    expect(await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm())).toBe(Date.now() + 5_000);
+
+    // A thread reply arriving during the wait goes first, and a newer push joins the waiting review.
+    advanceClock(2_000);
+    await pr.send('pull_request_review', pr.review());
+    await pr.send('pull_request_review_comment', pr.reply('Fixed'));
     await runDurableObjectAlarm(pr.stub);
-    expect(await workRows(pr.stub)).toMatchObject([{ status: 'queued', merge_checks: 2 }]);
+    expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request_review_comment']);
+    expect(await pr.send('pull_request', pr.push(SHA_2))).toEqual({ accepted: true, effect: 'merged into work 1' });
+    github.head = SHA_2;
+    expect(await workRows(pr.stub)).toMatchObject([
+      { kind: 'review', status: 'queued', head_sha: SHA_2 }, { kind: 'review_state', status: 'queued' }, { kind: 'thread', status: 'running' },
+    ]);
+
+    advanceClock(3_000);
+    await pr.stub.runCompleted(key('d-reply-end'), 9000, 'success');
+    await runDurableObjectAlarm(pr.stub);
+    expect(await workRows(pr.stub)).toMatchObject([{ kind: 'review', status: 'queued', merge_checks: 2 }, { kind: 'review_state', status: 'queued' }, { kind: 'thread', status: 'done' }]);
     advanceClock(15_000);
     await runDurableObjectAlarm(pr.stub);
-    expect(github.dispatches).toHaveLength(1);
+    expect(github.dispatches.map((dispatch) => [dispatch.inputs.event, dispatch.inputs.head_sha])).toEqual([
+      ['pull_request_review_comment', undefined], ['pull_request', SHA_2],
+    ]);
     expect(logged(log, 'coordinator_mergeability_pending')).toHaveLength(2);
     expect(github.comments).toEqual([]);
 
