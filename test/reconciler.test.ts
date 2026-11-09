@@ -68,7 +68,7 @@ function fakeGitHub() {
     redelivered: [] as number[],
     pulls: new Map<string, Pull[]>(),
     /** Reviews as GraphQL returns them, keyed `<repo>#<number>`. */
-    reviews: new Map<string, Array<{ author: string; oid: string }>>(),
+    reviews: new Map<string, Array<{ author: string; oid: string; body?: string; state?: string }>>(),
     pullsStatus: new Map<string, number>(),
     graphqlCalls: 0,
     calls: 0,
@@ -141,11 +141,12 @@ function fakeGitHub() {
       return Response.json({ id, name: id === 4242 ? 'manki' : `repo-${id}`, owner: { login: OWNER, id: OWNER_ID }, default_branch: 'main' });
     }
     if (route === 'POST /graphql') {
-      const { query, variables } = await request.json() as { query: string; variables: { name: string; number: number } };
+      const { query, variables } = await request.json() as { query: string; variables: { name: string; number: number; author: string } };
       if (query.includes('reviews')) {
         state.graphqlCalls++;
-        const reviews = state.reviews.get(`${variables.name}#${variables.number}`) ?? [];
-        const nodes = reviews.map((review) => ({ author: { login: review.author }, commit: { oid: review.oid } }));
+        // GraphQL filters by the REST login, `<slug>[bot]` for a bot. A review given no body gets Manki's review body.
+        const reviews = (state.reviews.get(`${variables.name}#${variables.number}`) ?? []).filter((review) => `${review.author}[bot]` === variables.author);
+        const nodes = reviews.map((review) => ({ commit: { oid: review.oid }, state: review.state ?? 'CHANGES_REQUESTED', body: review.body ?? 'Changes requested.\n<!-- manki-bot -->' }));
         return Response.json({ data: { repository: { pullRequest: { reviews: { nodes } } } } });
       }
       return Response.json(workflowsReply({ 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML }).body);
@@ -610,7 +611,11 @@ describe('Reconciler catch-up', () => {
     const github = fakeGitHub();
     github.pulls.set(target.repo, [pull(1, SHA_1, { repo: target.repo }), pull(2, SHA_2, { repo: target.repo })]);
     github.reviews.set(`${target.repo}#1`, [{ author: 'manki-review', oid: SHA_1 }]);
-    github.reviews.set(`${target.repo}#2`, [{ author: 'alice', oid: SHA_1 }, { author: 'manki-review', oid: SHA_2 }]);
+    // Manki approves a rebased head on its unchanged verdict with a review of its own markers.
+    github.reviews.set(`${target.repo}#2`, [
+      { author: 'alice', oid: SHA_1 },
+      { author: 'manki-review', oid: SHA_2, body: 'Approved.\n<!-- manki -->\n<!-- manki-auto-approve -->' },
+    ]);
     await stub.reconcile();
     expect(logged(log, 'reconciler_caught_up')).toEqual([]);
     // No coordinator state is created for a PR that needed nothing.
@@ -619,10 +624,13 @@ describe('Reconciler catch-up', () => {
   });
 
   it.each([
-    ['another author', [{ author: 'alice', oid: SHA_1 }]],
-    ['an older commit', [{ author: 'manki-review', oid: SHA_2 }]],
-    ['another bot', [{ author: 'acme-review', oid: SHA_1 }]],
-  ])('catches up a head whose only review is by %s', async (_case, reviews) => {
+    ['by another author', [{ author: 'alice', oid: SHA_1 }]],
+    ['of an older commit', [{ author: 'manki-review', oid: SHA_2 }]],
+    ['by another bot', [{ author: 'acme-review', oid: SHA_1 }]],
+    ['a thread reply of Manki\'s', [{ author: 'manki-review', oid: SHA_1, body: '' }]],
+    ['Manki\'s dismissed review', [{ author: 'manki-review', oid: SHA_1, state: 'DISMISSED' }]],
+    ['Manki\'s review without a verdict', [{ author: 'manki-review', oid: SHA_1, body: 'Review incomplete.\n<!-- manki-bot -->\n<!-- manki-no-verdict -->' }]],
+  ])('catches up a head whose only review is %s', async (_case, reviews) => {
     const { stub, repo } = setup();
     const target = repo();
     await stub.recordOptIn(target, true);

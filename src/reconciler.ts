@@ -3,7 +3,7 @@ import { createAppJWT } from './app-jwt';
 import { allowedAccounts, type Env } from './env';
 import { githubApi, githubGraphql, isRateLimited, mintRepositoryToken } from './github';
 import { log } from './log';
-import { BOT_LOGIN } from './manki';
+import { BOT_LOGIN, MANKI_COMMENT_MARKER } from './manki';
 import { STALE_COMMENT_MS, type Target } from './routing';
 
 const MINUTE = 60_000;
@@ -60,15 +60,19 @@ interface PullSummary {
   base: { repo: { full_name: string } };
 }
 
-const REVIEWS_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
+// The `author` filter takes the REST login `<slug>[bot]` of an App. The plain `<slug>` matches no review.
+const REVIEWS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $author: String!) {
   repository(owner: $owner, name: $name) {
-    pullRequest(number: $number) { reviews(last: 100) { nodes { author { login } commit { oid } } } }
+    pullRequest(number: $number) { reviews(last: 100, author: $author) { nodes { commit { oid } state body } } }
   }
 }`;
 
 interface ReviewsResponse {
-  repository: { pullRequest: { reviews: { nodes: Array<{ author: { login: string } | null; commit: { oid: string } | null }> } } | null } | null;
+  repository: { pullRequest: { reviews: { nodes: Array<{ commit: { oid: string } | null; state: string; body: string }> } } | null } | null;
 }
+
+/** Marks a Manki review that reached no verdict, which Manki does not count as covering its head. */
+const NO_VERDICT_MARKER = '<!-- manki-no-verdict -->';
 
 /** Counts the GitHub calls of one pass. */
 class Budget {
@@ -406,10 +410,13 @@ export class Reconciler extends DurableObject<Env> {
       // A review still queued or running is asked about again, so one that fails is caught up on a later pass.
       if (state !== 'needed') continue;
       if (!budget.take()) return false;
-      const data = await githubGraphql<ReviewsResponse>(mint.token, REVIEWS_QUERY, { owner: repo.owner, name: repo.repo, number: pull.number });
-      // GraphQL names a bot `<slug>`, while REST and webhooks use `<slug>[bot]`.
+      const data = await githubGraphql<ReviewsResponse>(mint.token, REVIEWS_QUERY, {
+        owner: repo.owner, name: repo.repo, number: pull.number, author: BOT_LOGIN,
+      });
+      // A review counts as Manki's `reviewCoversHead` counts it. Thread replies are reviews too, with an empty body.
       const reviewed = data.repository?.pullRequest?.reviews.nodes.some((review) =>
-        `${review.author?.login}[bot]` === BOT_LOGIN && review.commit?.oid === pull.head.sha);
+        review.commit?.oid === pull.head.sha && review.state !== 'DISMISSED'
+        && review.body.includes(MANKI_COMMENT_MARKER) && !review.body.includes(NO_VERDICT_MARKER));
       if (reviewed) {
         this.markChecked(repo, pull);
         continue;
