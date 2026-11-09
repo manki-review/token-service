@@ -1,0 +1,7 @@
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        # Manki releases are immutable and only org admins move the major tag.
+        "manki-review/*": ref-pin
+        "*": hash-pin
