@@ -183,20 +183,26 @@ describe('/webhook', () => {
   const READER = { login: 'box-reader', __typename: 'User' };
   const MANKI = { login: 'manki-review', __typename: 'Bot' };
   const OTHER_BOT = { login: 'acme-bot', __typename: 'Bot' };
-  // Each edit history lists the newest edit first, as GitHub does.
-  // Each case has a PR number of its own, apart from the lookups above and below.
-  it.each<[string, Array<{ login: string; __typename: string } | null>, string | null, number | null, number]>([
+  const ACTIONS = { login: 'github-actions', __typename: 'Bot' };
+  // An edit GitHub lists as `null`, apart from an edit whose editor it no longer names.
+  const LOST = 'lost';
+  // Each edit history lists the newest edit first, as GitHub does. Manki wrote the review, and only its own edits are
+  // passed over, so the newest other edit decides. Each case has a PR number of its own, apart from the other lookups.
+  it.each<[string, Array<{ login: string; __typename: string } | null | typeof LOST>, string | null, number | null, number]>([
     ['a writer, the only editor', [WRITER, WRITER], 'box-writer', 1, 120],
     ['an editor without write access', [READER], 'box-reader', 0, 121],
     ['a writer, after whom Manki rewrote the review', [MANKI, WRITER, MANKI], 'box-writer', 1, 122],
     ['the newest of two people, after whom Manki rewrote the review', [MANKI, READER, WRITER], 'box-reader', 0, 123],
     ['Manki alone', [MANKI, MANKI], null, null, 124],
-    // A tick by another bot is dropped, not credited to a person who edited the review earlier.
-    ['another bot after a writer', [MANKI, OTHER_BOT, WRITER], null, null, 126],
     ['an unknown editor', [null], null, null, 125],
-  ])('names the newest person who edited Manki\'s review as the sender of a box tick by %s', async (_case, edits, sender, writer, number) => {
+    ['another bot after a writer', [MANKI, OTHER_BOT, WRITER], null, null, 126],
+    ['a workflow\'s `github-actions` after a writer', [MANKI, ACTIONS, WRITER], null, null, 127],
+    ['an unknown editor after a writer', [MANKI, null, WRITER], null, null, 128],
+    ['a lost edit after a writer', [MANKI, LOST, WRITER], null, null, 129],
+  ])('names the newest editor of Manki\'s review other than Manki as the sender of a box tick by %s', async (_case, edits, sender, writer, number) => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
-    const node = { editor: edits[0], userContentEdits: { nodes: edits.map((editor) => ({ editor })) } };
+    const nodes = edits.map((editor) => (editor === LOST ? null : { editor }));
+    const node = { author: { login: 'manki-review' }, editor: nodes[0]?.editor ?? null, userContentEdits: { nodes } };
     const graphql = vi.fn(async () => Response.json({ data: { node } }));
     stubGitHub({ permissions: { 'box-writer': 'write', 'box-reader': 'read' }, api: { 'POST /graphql': graphql } });
     const box = '- [ ] Create an issue for this <!-- manki-box:issue:src/a.ts:3:Off-by-one -->';

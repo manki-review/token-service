@@ -10,11 +10,6 @@ export const BOT_LOGIN = 'manki-review[bot]';
 /** The logins Manki's own comments carry: the App, or `github-actions[bot]` when a run had no App token. */
 export const MANKI_LOGINS: readonly string[] = [BOT_LOGIN, 'github-actions[bot]'];
 
-/** Whether a GraphQL login is one of Manki's. GraphQL names a bot `<slug>`, while REST and webhooks use `<slug>[bot]`. */
-export function isMankiLogin(login: string | undefined): boolean {
-  return login !== undefined && MANKI_LOGINS.includes(`${login}[bot]`);
-}
-
 /** The marker every comment and review comment Manki writes carries. */
 export const MANKI_COMMENT_MARKER = '<!-- manki';
 
