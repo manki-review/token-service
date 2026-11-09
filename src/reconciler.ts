@@ -60,15 +60,19 @@ interface PullSummary {
   base: { repo: { full_name: string } };
 }
 
+// The `author` filter takes the REST login `<slug>[bot]` of an App. The plain `<slug>` matches no review.
 const REVIEWS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $author: String!) {
   repository(owner: $owner, name: $name) {
-    pullRequest(number: $number) { reviews(last: 100, author: $author) { nodes { commit { oid } body } } }
+    pullRequest(number: $number) { reviews(last: 100, author: $author) { nodes { commit { oid } state body } } }
   }
 }`;
 
 interface ReviewsResponse {
-  repository: { pullRequest: { reviews: { nodes: Array<{ commit: { oid: string } | null; body: string }> } } | null } | null;
+  repository: { pullRequest: { reviews: { nodes: Array<{ commit: { oid: string } | null; state: string; body: string }> } } | null } | null;
 }
+
+/** Marks a Manki review that reached no verdict, which Manki does not count as covering its head. */
+const NO_VERDICT_MARKER = '<!-- manki-no-verdict -->';
 
 /** Counts the GitHub calls of one pass. */
 class Budget {
@@ -409,9 +413,10 @@ export class Reconciler extends DurableObject<Env> {
       const data = await githubGraphql<ReviewsResponse>(mint.token, REVIEWS_QUERY, {
         owner: repo.owner, name: repo.repo, number: pull.number, author: BOT_LOGIN,
       });
-      // Manki's thread replies are reviews of the head too, with an empty body, so only a marked body counts, as in Manki.
+      // A review counts as Manki's `reviewCoversHead` counts it. Thread replies are reviews too, with an empty body.
       const reviewed = data.repository?.pullRequest?.reviews.nodes.some((review) =>
-        review.commit?.oid === pull.head.sha && review.body.includes(MANKI_COMMENT_MARKER));
+        review.commit?.oid === pull.head.sha && review.state !== 'DISMISSED'
+        && review.body.includes(MANKI_COMMENT_MARKER) && !review.body.includes(NO_VERDICT_MARKER));
       if (reviewed) {
         this.markChecked(repo, pull);
         continue;

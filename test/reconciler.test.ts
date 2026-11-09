@@ -68,7 +68,7 @@ function fakeGitHub() {
     redelivered: [] as number[],
     pulls: new Map<string, Pull[]>(),
     /** Reviews as GraphQL returns them, keyed `<repo>#<number>`. */
-    reviews: new Map<string, Array<{ author: string; oid: string; body?: string }>>(),
+    reviews: new Map<string, Array<{ author: string; oid: string; body?: string; state?: string }>>(),
     pullsStatus: new Map<string, number>(),
     graphqlCalls: 0,
     calls: 0,
@@ -146,7 +146,7 @@ function fakeGitHub() {
         state.graphqlCalls++;
         // GraphQL filters by the REST login, `<slug>[bot]` for a bot. A review given no body gets Manki's review body.
         const reviews = (state.reviews.get(`${variables.name}#${variables.number}`) ?? []).filter((review) => `${review.author}[bot]` === variables.author);
-        const nodes = reviews.map((review) => ({ commit: { oid: review.oid }, body: review.body ?? 'Changes requested.\n<!-- manki-bot -->' }));
+        const nodes = reviews.map((review) => ({ commit: { oid: review.oid }, state: review.state ?? 'CHANGES_REQUESTED', body: review.body ?? 'Changes requested.\n<!-- manki-bot -->' }));
         return Response.json({ data: { repository: { pullRequest: { reviews: { nodes } } } } });
       }
       return Response.json(workflowsReply({ 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML }).body);
@@ -628,6 +628,8 @@ describe('Reconciler catch-up', () => {
     ['of an older commit', [{ author: 'manki-review', oid: SHA_2 }]],
     ['by another bot', [{ author: 'acme-review', oid: SHA_1 }]],
     ['a thread reply of Manki\'s', [{ author: 'manki-review', oid: SHA_1, body: '' }]],
+    ['Manki\'s dismissed review', [{ author: 'manki-review', oid: SHA_1, state: 'DISMISSED' }]],
+    ['Manki\'s review without a verdict', [{ author: 'manki-review', oid: SHA_1, body: 'Review incomplete.\n<!-- manki-bot -->\n<!-- manki-no-verdict -->' }]],
   ])('catches up a head whose only review is %s', async (_case, reviews) => {
     const { stub, repo } = setup();
     const target = repo();
