@@ -1,11 +1,11 @@
 import { DurableObject } from 'cloudflare:workers';
 import { dispatchInputs, runTitle } from './dispatch';
 import type { Env } from './env';
-import { githubApi, hasWriteAccess, isRateLimited, type MintResult, mintRepositoryToken } from './github';
+import { githubApi, githubGraphql, hasWriteAccess, isRateLimited, type MintResult, mintRepositoryToken } from './github';
 import { log } from './log';
 import {
-  type BaseConfig, BOT_LOGIN, boxLabels, type BoxChange, cancelledProgress, HELP_REPLY, isRunningProgress, MANKI_LOGINS, matchSkipRule, parseConfig,
-  REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes, settingsHead, skipRulesOf, withSettingsStatus,
+  type BaseConfig, BOT_LOGIN, boxLabels, type BoxChange, cancelledProgress, HELP_REPLY, isMankiGraphqlLogin, isRunningProgress, MANKI_LOGINS,
+  matchSkipRule, parseConfig, REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes, settingsHead, skipRulesOf, withSettingsStatus,
 } from './manki';
 import { type OptIn, readOptIn, type Repository } from './opt-in';
 import type { Permissions } from './permissions';
@@ -199,6 +199,17 @@ interface SettingsEdit {
 const editOf = (row: WorkRow): SettingsEdit => JSON.parse(row.boxes ?? '{"at":0,"changes":[]}') as SettingsEdit;
 
 const modesOf = (row: WorkRow): ReviewMode[] => (row.modes === null ? [] : JSON.parse(row.modes) as ReviewMode[]);
+
+// GitHub lists a PR's comments oldest first, so only `last` reaches the newest on a busy PR.
+const RECENT_COMMENTS_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) { comments(last: 100) { nodes { databaseId body author { login } } } }
+  }
+}`;
+
+interface RecentCommentsResponse {
+  repository: { pullRequest: { comments: { nodes: Array<{ databaseId: number; body: string; author: { login: string } | null }> } } | null } | null;
+}
 
 /** Returns why a push waits out the pause, from the reported `reason` and the Pause box, and what reviews it. */
 function pausedSummary(reason: string | null, paused: boolean): string {
@@ -920,13 +931,6 @@ export class PrCoordinator extends DurableObject<Env> {
   private async dispatch(item: WorkRow, workflow: string): Promise<void> {
     const target = await this.verifiedTarget();
     if (!target) throw new Error('the repository could not be read');
-    // Only a review nobody asked for waits out a pause. A request, a reply or a settings box review still runs.
-    const { pause, settings } = this.reported();
-    if (item.kind === 'review' && item.event.startsWith('pull_request.') && (pause !== null || settings.paused)) {
-      await this.reportPaused(item.head_sha, target);
-      if (this.isDispatching(item.id)) this.finish(item.id, 'skipped', 'pull request is paused');
-      return;
-    }
     if (item.kind === 'review' && !(await this.refreshReview(item, target))) return;
 
     const current = this.row(item.id);
@@ -1326,6 +1330,13 @@ export class PrCoordinator extends DurableObject<Env> {
         this.finish(item.id, 'skipped', `matches the skip rule for ${rule}`, 'skipped');
         return false;
       }
+      // Only a review nobody asked for waits out a pause. A request, a reply or a settings box review still runs.
+      const { pause, settings } = this.reported();
+      if (pause !== null || settings.paused) {
+        await this.reportPaused(pr.head.sha, target);
+        if (this.isDispatching(item.id)) this.finish(item.id, 'skipped', 'pull request is paused');
+        return false;
+      }
     }
     // A review of a PR that conflicts with its base would only end in a held approval, so none starts until a rebase.
     if (item.attempts === 0) {
@@ -1421,8 +1432,7 @@ export class PrCoordinator extends DurableObject<Env> {
    * Tells the PR's author that the push of `head` waits out a pause: one `Manki` check per head that says why and what
    * starts a review, and the status line of Manki's settings comment. A failure is logged and still skips the review.
    */
-  private async reportPaused(head: string | null, target: Target): Promise<void> {
-    if (head === null) return;
+  private async reportPaused(head: string, target: Target): Promise<void> {
     const { pause, settings } = this.reported();
     const failed = (part: string) => (error: unknown) => {
       log('coordinator_paused_report_failed', { ...this.logFields(), head_sha: head, part, error: error instanceof Error ? error.message : String(error) });
@@ -1433,24 +1443,23 @@ export class PrCoordinator extends DurableObject<Env> {
       await this.completeCheck(head, 'action_required', output, target)
         .then(() => this.setMeta('paused_head', head), failed('check'));
     }
-    // The settings comment was last edited when the pause began: by the run that reported it, or by the Pause tick.
-    const began = Math.min(pause?.at ?? Infinity, settings.paused ? this.getMeta<number>('pause_at') ?? 0 : Infinity);
-    await this.showPaused(head, began - MINUTE, target).catch(failed('comment'));
+    await this.showPaused(head, target).catch(failed('comment'));
   }
 
-  /** Sets the status line of Manki's newest settings comment edited since `since` to say that `head` waits. */
-  private async showPaused(head: string, since: number, target: Target): Promise<void> {
+  /** Sets the status line of Manki's newest settings comment, among the PR's newest comments, to say that `head` waits. */
+  private async showPaused(head: string, target: Target): Promise<void> {
     const token = await this.token({ issues: 'write', pull_requests: 'write' });
     if (token === null) return;
-    const repo = `/repos/${target.owner}/${target.repo}`;
-    const list = await githubApi(token, `${repo}/issues/${target.number}/comments?since=${new Date(since).toISOString()}&per_page=100`);
-    if (!list.ok) throw new Error(`listing the PR comments failed with ${list.status}`);
-    const comments = await list.json() as Array<IssueCommentRead & { id: number }>;
-    const settings = comments.reverse().find((c) => MANKI_LOGINS.includes(c.user?.login ?? '') && settingsHead(c.body ?? '') !== null);
-    if (!settings?.body) return;
+    const data = await githubGraphql<RecentCommentsResponse>(token, RECENT_COMMENTS_QUERY, {
+      owner: target.owner, name: target.repo, number: target.number,
+    });
+    const settings = (data.repository?.pullRequest?.comments.nodes ?? []).reverse()
+      .find((c) => isMankiGraphqlLogin(c.author?.login) && settingsHead(c.body) !== null);
+    if (!settings) return;
     const body = withSettingsStatus(settings.body, `automatic review paused, \`${head.slice(0, 7)}\` waits`, []);
     if (body === settings.body) return;
-    const response = await githubApi(token, `${repo}/issues/comments/${settings.id}`, { method: 'PATCH', body: { body } });
+    const path = `/repos/${target.owner}/${target.repo}/issues/comments/${settings.databaseId}`;
+    const response = await githubApi(token, path, { method: 'PATCH', body: { body } });
     if (!response.ok) throw new Error(`showing the paused push failed with ${response.status}`);
   }
 

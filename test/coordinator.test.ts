@@ -60,6 +60,7 @@ import {
 const SHA_1 = '1'.repeat(40);
 const SHA_2 = '2'.repeat(40);
 const SHA_3 = '3'.repeat(40);
+const SHA_4 = '4'.repeat(40);
 const MINUTE = 60_000;
 const DAY = 24 * 60 * MINUTE;
 
@@ -753,8 +754,16 @@ function fakeGitHub(number: number) {
       return Response.json(state.repository, { status: state.repositoryStatus });
     }
     if (route === 'POST /graphql') {
+      const { query, variables } = await request.json() as { query: string; variables: Record<string, string> };
+      if (query.includes('comments(last: 100)')) {
+        if (state.commentListStatus !== 200) return Response.json({ message: 'no' }, { status: state.commentListStatus });
+        const nodes = [...state.issueComments].sort(([a], [b]) => a - b).slice(-100).map(([id, body]) => ({
+          databaseId: id, body, author: { login: (state.commentAuthors.get(id) ?? 'manki-review[bot]').replace(/\[bot\]$/, '') },
+        }));
+        return Response.json({ data: { repository: { pullRequest: { comments: { nodes } } } } });
+      }
       state.graphqlCalls++;
-      state.graphqlVariables.push(((await request.json()) as { variables: Record<string, string> }).variables);
+      state.graphqlVariables.push(variables);
       return Response.json(workflowsReply(state.workflows).body);
     }
     if (route === `GET ${repo}/pulls/${number}`) {
@@ -1124,7 +1133,7 @@ describe('PrCoordinator dispatch', () => {
       `Last reviewed \`${SHA_1.slice(0, 7)}\` · head \`${SHA_1.slice(0, 7)}\` · ${status}`,
       '- [ ] Pause automatic reviews <!-- manki-box:pause -->', '<!-- manki-settings -->'].join('\n');
     github.issueComments.set(1500, notice('automatic review paused'));
-    github.checkRunStatus = 502;
+    Object.assign(github, { head: SHA_2, checkRunStatus: 502 });
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches).toHaveLength(1);
     expect((await workRows(pr.stub)).at(-1)).toMatchObject({ head_sha: SHA_2, status: 'skipped', note: 'pull request is paused' });
@@ -1721,6 +1730,17 @@ describe('PrCoordinator dispatch', () => {
       }]);
       expect(github.issueComments.get(1400)).toBe(notice(`automatic review paused, \`${SHA_1.slice(0, 7)}\` waits`));
       expect(github.issueComments.get(1600)).toBe(notice('up to date'));
+      // A draft is still dropped and a skip rule still gets its skipped check, so neither is told it waits.
+      Object.assign(github, { head: SHA_3, draft: true });
+      await pr.send('pull_request', pr.push(SHA_3));
+      await runDurableObjectAlarm(pr.stub);
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ head_sha: SHA_3, status: 'dropped', note: 'pull request is a draft' });
+      Object.assign(github, { head: SHA_4, draft: false, config: 'skip_labels: [dependencies]', labels: ['dependencies'] });
+      await pr.send('pull_request', pr.push(SHA_4));
+      await runDurableObjectAlarm(pr.stub);
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ head_sha: SHA_4, status: 'skipped', conclusion: 'skipped' });
+      expect(github.checkRuns.map((check) => [check.head_sha, check.conclusion])).toEqual([[SHA_1, 'action_required'], [SHA_4, 'skipped']]);
+      Object.assign(github, { config: null, labels: [] });
       await edit(['pause'], ['pause', 'again']);
       expect(github.dispatches.at(-1)?.inputs).toMatchObject({ event: 'issue_comment', action: 'edited', comment_id: String(SETTINGS) });
       expect(await state()).toMatchObject({ active: [{ kind: 'review', run_id: 9000, modes: ['again'] }], settings: { paused: true } });
@@ -1732,8 +1752,8 @@ describe('PrCoordinator dispatch', () => {
       await pr.send('pull_request', pr.push(SHA_2));
       await runDurableObjectAlarm(pr.stub);
       expect(github.dispatches.at(-1)?.inputs).toMatchObject({ event: 'pull_request', head_sha: SHA_2 });
-      expect(github.checkRuns.map((check) => check.head_sha)).toEqual([SHA_1]);
-      expect((await workRows(pr.stub)).filter((row) => row.kind === 'settings').map((row) => row.note)).toEqual(['paused', 'again review work 4', 'resumed']);
+      expect(github.checkRuns.map((check) => check.head_sha)).toEqual([SHA_1, SHA_4]);
+      expect((await workRows(pr.stub)).filter((row) => row.kind === 'settings').map((row) => row.note)).toEqual(['paused', 'again review work 6', 'resumed']);
     });
 
     it('turns a queued push review into one review with every mode ticked, which a pause cannot drop', async () => {
