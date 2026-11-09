@@ -56,14 +56,32 @@ interface Match {
 }
 
 /**
- * Writes one issue line. The issue is public, so a line about a repository not known to be public names no repository,
- * PR or work, and leaves out the detail, which can quote it.
+ * Returns the names in `names` that GitHub shows as public, reading each with `read`. A name that is malformed, cannot
+ * be read, or reads as anything but public counts as private.
+ */
+export async function publicRepositories(names: string[], read: (repo: string) => Promise<Response>): Promise<Set<string>> {
+  const visible = await Promise.all(names.map(async (repo) => {
+    if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return false;
+    try {
+      const response = await read(repo);
+      return response.ok && (await response.json() as { private?: unknown }).private === false;
+    } catch {
+      return false;
+    }
+  }));
+  return new Set(names.filter((_, index) => visible[index]));
+}
+
+/**
+ * Writes one issue line. The issue is public, so only a line naming a repository known to be public shows the
+ * repository, PR, work and detail. Any other line, also one naming no repository, whose detail can still quote one,
+ * shows only its time and message.
  */
 function line({ event, detail }: Match, publicRepos: ReadonlySet<string>): string {
   const at = new Date(event.timestamp).toISOString().slice(11, 19);
   const head = `${at} \`${text(event.source.msg)}\``;
   const repo = repositoryOf(event.source);
-  if (repo !== '' && !publicRepos.has(repo)) return `${head} in a private repository`;
+  if (!publicRepos.has(repo)) return repo === '' ? head : `${head} in a private repository`;
   const pr = event.source.pr === undefined ? '' : `#${text(event.source.pr)}`;
   const work = event.source.work_id === undefined ? '' : ` work ${text(event.source.work_id)}`;
   const place = `${repo}${pr}${work}`.trim();

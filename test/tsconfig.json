@@ -1,8 +1,7 @@
 {
   "extends": "../tsconfig.json",
   "compilerOptions": {
-    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-plugin/types"],
-    "allowImportingTsExtensions": true
+    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-plugin/types"]
   },
-  "include": ["./**/*.ts", "../src/**/*.ts", "../scripts/**/*.ts"]
+  "include": ["./**/*.ts", "../src/**/*.ts"]
 }

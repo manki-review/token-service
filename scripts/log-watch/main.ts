@@ -1,4 +1,6 @@
-import { findings, ISSUE_MARKER, issueBody, type LogEvent, QUEUE_MESSAGES, repositories, SIGNAL_MESSAGES } from './findings.ts';
+import { findings, ISSUE_MARKER, issueBody, type LogEvent, publicRepositories, QUEUE_MESSAGES, repositories, SIGNAL_MESSAGES } from './findings.ts';
+
+declare const process: { env: Record<string, string | undefined> };
 
 // Each run reads a bit more than the hour since the last, so a late scheduled run leaves no gap.
 const WINDOW_MS = 75 * 60_000;
@@ -62,12 +64,6 @@ async function github(path: string, init: { method?: string; body?: unknown } = 
   return response.json();
 }
 
-/** Whether GitHub shows `repo` as public. A repository the token cannot read counts as private. */
-async function isPublic(repo: string): Promise<boolean> {
-  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return false;
-  const response = await githubFetch(`/repos/${repo}`);
-  return response.ok && (await response.json() as { private?: boolean }).private === false;
-}
 
 const to = Date.now();
 const from = to - WINDOW_MS;
@@ -89,9 +85,8 @@ const signals = await query([{
   ],
 }], from, to);
 const queue = await query([{ key: 'msg', operation: 'in', type: 'string', value: QUEUE_MESSAGES.join(',') }], to - QUEUE_SPAN_MS, to);
-const named = repositories([...signals, ...queue]);
-const visible = await Promise.all(named.map(isPublic));
-const found = findings(signals, queue, to, new Set(named.filter((_, index) => visible[index])));
+const publicRepos = await publicRepositories(repositories([...signals, ...queue]), (repo) => githubFetch(`/repos/${repo}`));
+const found = findings(signals, queue, to, publicRepos);
 
 const issues = await github(`/issues?state=open&creator=${encodeURIComponent('github-actions[bot]')}&per_page=100`) as Array<{ number: number; body: string | null }>;
 const open = issues.find((issue) => issue.body?.includes(ISSUE_MARKER));

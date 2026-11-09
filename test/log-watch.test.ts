@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { findings, ISSUE_MARKER, issueBody, type LogEvent, repositories, STUCK_AFTER_MS } from '../scripts/log-watch/findings';
+import { describe, expect, it, vi } from 'vitest';
+import { findings, ISSUE_MARKER, issueBody, type LogEvent, publicRepositories, repositories, STUCK_AFTER_MS } from '../scripts/log-watch/findings';
 
 const NOW = Date.parse('2026-11-09T09:00:00Z');
 const MINUTE = 60_000;
@@ -73,17 +73,50 @@ describe('findings', () => {
     expect(crowded.moreRequestIds).toBe(2);
   });
 
-  it('names no repository, PR, work or detail of a repository not known to be public', () => {
+  it('shows the repository, PR, work and detail of a line only for a repository known to be public', () => {
+    const noRepo = { repo: undefined, pr: undefined };
     const signals = [
       event(10, { msg: 'coordinator_start_error', repo: 'acme/secret', pr: 7, work_id: 2, error: 'Error: reading acme/secret failed with 403' }),
       event(9, { msg: 'request_failed', repo: undefined, repository: 'acme/secret', status: 502, error: 'Memory append failed' }),
-      event(8, { msg: 'coordinator_start_error', work_id: 3, error: 'Error: x' }),
+      // A line naming no repository can still quote one, as the cron's own catch-up error does.
+      event(8, { msg: 'reconciler_catch_up_error', ...noRepo, error: 'Error: listing pull requests of acme/secret failed with 502' }),
+      event(7, { msg: 'coordinator_start_error', ...noRepo, pr: 7, work_id: 4, error: 'Error: acme/secret' }),
+      event(6, { msg: 'coordinator_start_error', work_id: 3, error: 'Error: x' }),
     ];
-    expect(repositories(signals)).toEqual(['acme/secret', 'manki-review/manki']);
-    expect(findings(signals, [], NOW, PUBLIC).map((entry) => entry.lines)).toEqual([
-      ['08:50:00 `coordinator_start_error` in a private repository', '08:52:00 `coordinator_start_error` manki-review/manki#1289 work 3: Error: x'],
-      ['08:51:00 `request_failed` in a private repository'],
+    const queue = [
+      event(40, { msg: 'coordinator_receive', repo: 'acme/secret', pr: 7, effect: 'queued work 5' }),
+      event(30, { msg: 'coordinator_receive', ...noRepo, pr: 7, effect: 'queued work 6' }),
+    ];
+    expect(repositories([...signals, ...queue])).toEqual(['acme/secret', 'manki-review/manki']);
+    const found = findings(signals, queue, NOW, PUBLIC);
+    expect(found.map((entry) => [entry.title, entry.lines])).toEqual([
+      ['Start errors (3)', [
+        '08:50:00 `coordinator_start_error` in a private repository',
+        '08:53:00 `coordinator_start_error`',
+        '08:54:00 `coordinator_start_error` manki-review/manki#1289 work 3: Error: x',
+      ]],
+      ['5xx statuses (2)', ['08:51:00 `request_failed` in a private repository', '08:52:00 `reconciler_catch_up_error`']],
+      ['Work queued over 20 minutes without a dispatch (2)', ['08:20:00 `coordinator_receive` in a private repository', '08:30:00 `coordinator_receive`']],
     ]);
+    // The request ids, which name nothing, are kept for every line.
+    expect(found.flatMap((entry) => entry.requestIds)).toHaveLength(7);
+    const body = issueBody(found, NOW - 75 * MINUTE, NOW);
+    for (const leak of ['acme', 'secret', '#7', 'work 2', 'work 4', 'work 5', 'work 6', 'listing']) expect(body).not.toContain(leak);
+  });
+
+  it('counts a repository as public only when GitHub reads it as public', async () => {
+    const read = vi.fn(async (repo: string): Promise<Response> => {
+      if (repo === 'acme/open') return Response.json({ private: false });
+      if (repo === 'acme/closed') return Response.json({ private: true });
+      if (repo === 'acme/odd') return Response.json({});
+      if (repo === 'acme/flaky') throw new TypeError('Network connection lost');
+      if (repo === 'acme/broken') return new Response('{', { status: 200 });
+      if (repo === 'acme/down') return Response.json({ private: false }, { status: 502 });
+      return Response.json({ message: 'Not Found' }, { status: 404 });
+    });
+    const names = ['acme/open', 'acme/closed', 'acme/odd', 'acme/flaky', 'acme/broken', 'acme/down', 'acme/gone', 'acme/../x y'];
+    expect(await publicRepositories(names, read)).toEqual(new Set(['acme/open']));
+    expect(read).not.toHaveBeenCalledWith('acme/../x y');
   });
 
   it('reports work queued longer than 20 minutes that no dispatch, end or close followed', () => {
