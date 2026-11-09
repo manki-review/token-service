@@ -1351,20 +1351,7 @@ export class PrCoordinator extends DurableObject<Env> {
       // The note only explains the skip, so a failure to post it never holds the lane.
       log('coordinator_conflict_note_failed', { ...this.logFields(), error: String(error) });
     }
-    const checks = await this.token({ checks: 'write' });
-    if (checks === null) return;
-    const response = await githubApi(checks, `/repos/${target.owner}/${target.repo}/check-runs`, {
-      method: 'POST',
-      body: {
-        name: 'Manki',
-        head_sha: pr.head.sha,
-        status: 'completed',
-        conclusion: 'action_required',
-        ...(pr.html_url && { details_url: pr.html_url }),
-        output: { title: 'Rebase needed', summary: text },
-      },
-    });
-    if (!response.ok) throw new Error(`creating the rebase check failed with ${response.status}`);
+    await this.completeCheck(pr.head.sha, 'action_required', { title: 'Rebase needed', summary: text }, target, pr.html_url);
   }
 
   /** Posts the conflict note, or edits the one an earlier skip posted. */
@@ -1416,19 +1403,21 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /** Completes a `Manki` check on `head` as skipped, as Manki does for a PR it skips. */
   private async reportSkipped(head: string, rule: string, target: Target): Promise<void> {
+    const summary = `This PR matches the skip rule for ${rule} in \`.manki.yml\` on the base branch.`;
+    await this.completeCheck(head, 'skipped', { title: 'Review skipped', summary }, target);
+  }
+
+  /** Creates a completed `Manki` check on `head`. Without `checks: write` on the installation, it creates none. */
+  private async completeCheck(
+    head: string, conclusion: string, output: { title: string; summary: string }, target: Target, detailsUrl?: string,
+  ): Promise<void> {
     const token = await this.token({ checks: 'write' });
     if (token === null) return;
     const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/check-runs`, {
       method: 'POST',
-      body: {
-        name: 'Manki',
-        head_sha: head,
-        status: 'completed',
-        conclusion: 'skipped',
-        output: { title: 'Review skipped', summary: `This PR matches the skip rule for ${rule} in \`.manki.yml\` on the base branch.` },
-      },
+      body: { name: 'Manki', head_sha: head, status: 'completed', conclusion, ...(detailsUrl && { details_url: detailsUrl }), output },
     });
-    if (!response.ok) throw new Error(`creating the skipped check failed with ${response.status}`);
+    if (!response.ok) throw new Error(`creating the ${output.title} check failed with ${response.status}`);
   }
 
   private markRunning(item: WorkRow, runId: number | null, note: string): void {
