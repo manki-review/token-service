@@ -1,11 +1,11 @@
 import { DurableObject } from 'cloudflare:workers';
 import { dispatchInputs, runTitle } from './dispatch';
 import type { Env } from './env';
-import { githubApi, hasWriteAccess, isRateLimited, type MintResult, mintRepositoryToken } from './github';
+import { githubApi, githubGraphql, hasWriteAccess, isRateLimited, type MintResult, mintRepositoryToken } from './github';
 import { log } from './log';
 import {
-  type BaseConfig, BOT_LOGIN, boxLabels, type BoxChange, cancelledProgress, HELP_REPLY, isRunningProgress, MANKI_LOGINS, matchSkipRule, parseConfig,
-  REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes, settingsHead, skipRulesOf, withSettingsStatus,
+  type BaseConfig, BOT_LOGIN, boxLabels, type BoxChange, cancelledProgress, HELP_REPLY, isMankiGraphqlLogin, isRunningProgress, MANKI_LOGINS,
+  matchSkipRule, parseConfig, REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes, settingsHead, skipRulesOf, withSettingsStatus,
 } from './manki';
 import { type OptIn, readOptIn, type Repository } from './opt-in';
 import type { Permissions } from './permissions';
@@ -64,6 +64,7 @@ export const CONFLICT_NOTE_MARKER = '<!-- manki-conflict-note -->';
 const NOT_STARTED = new Set(['queued', 'requested', 'waiting', 'pending']);
 /** A larger `.manki.yml` is not parsed for skip rules, as it costs too much CPU in an alarm. */
 const MAX_CONFIG_BYTES = 64 * 1024;
+const PAUSED_NOTE = 'pull request is paused';
 
 export type WorkStatus = 'queued' | 'dispatching' | 'running' | 'done' | 'failed' | 'timed_out' | 'dropped' | 'skipped';
 
@@ -199,6 +200,31 @@ interface SettingsEdit {
 const editOf = (row: WorkRow): SettingsEdit => JSON.parse(row.boxes ?? '{"at":0,"changes":[]}') as SettingsEdit;
 
 const modesOf = (row: WorkRow): ReviewMode[] => (row.modes === null ? [] : JSON.parse(row.modes) as ReviewMode[]);
+
+// GitHub lists a PR's comments oldest first, so only `last` reaches the newest on a busy PR. Anyone can comment, so
+// the query leaves out the bodies, which can each hold 64 KB.
+const RECENT_COMMENTS_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) { comments(last: 100) { nodes { fullDatabaseId createdAt author { login } } } }
+  }
+}`;
+
+interface RecentCommentsResponse {
+  repository: {
+    pullRequest: { comments: { nodes: Array<{ fullDatabaseId: string | null; createdAt: string; author: { login: string } | null }> } } | null;
+  } | null;
+}
+
+/** How many of Manki's newest comments are read to find the one sought, since answers and notes can follow it. */
+const MANKI_COMMENT_READS = 5;
+
+/** Returns why a push waits out the pause, from the reported `reason` and the Pause box, and what reviews it. */
+function pausedSummary(reason: string | null, paused: boolean): string {
+  const box = paused ? ' by the **Pause automatic reviews** box' : '';
+  // While the Action's pause holds, unticking Pause alone reviews nothing.
+  const how = paused && reason === null ? 'Tick **Review again** or untick **Pause automatic reviews**' : 'Tick **Review again**';
+  return `${reason ? `${reason} ` : ''}Automatic review is paused${box}, so this commit waits. ${how} on Manki's settings comment to review it.`;
+}
 
 // Each entry runs once, in order. Append new entries; never edit a shipped one.
 export const MIGRATIONS = [
@@ -911,12 +937,6 @@ export class PrCoordinator extends DurableObject<Env> {
   private async dispatch(item: WorkRow, workflow: string): Promise<void> {
     const target = await this.verifiedTarget();
     if (!target) throw new Error('the repository could not be read');
-    // Only a review nobody asked for waits out a pause. A request, a reply or a settings box review still runs.
-    const { pause, settings } = this.reported();
-    if (item.kind === 'review' && item.event.startsWith('pull_request.') && (pause !== null || settings.paused)) {
-      this.finish(item.id, 'skipped', 'pull request is paused');
-      return;
-    }
     if (item.kind === 'review' && !(await this.refreshReview(item, target))) return;
 
     const current = this.row(item.id);
@@ -1051,7 +1071,7 @@ export class PrCoordinator extends DurableObject<Env> {
         const state = this.reported();
         if (state.settings.paused === ticked) continue;
         this.setMeta('pr_state', { ...state, settings: { paused: ticked } });
-        effects.push(ticked ? 'paused' : 'resumed');
+        effects.push(ticked ? 'paused' : state.pause === null ? this.resume(item) : 'resumed');
       } else if (ticked && (REVIEW_MODES as readonly string[]).includes(box)) {
         effects.push(await this.reviewBox(item, box as ReviewMode, at));
       } else if (ticked && box === 'cancel') {
@@ -1059,6 +1079,30 @@ export class PrCoordinator extends DurableObject<Env> {
       }
     }
     if (this.isDispatching(item.id)) this.finish(item.id, 'done', effects.join(', ') || 'nothing changed');
+  }
+
+  /**
+   * Lifts the Pause box. When no review ran or waits since the last push the pause skipped, one review of that push is
+   * queued as if it had just arrived. A later push a skip rule or a conflict handled counts as a review. A later review
+   * that started no run otherwise, or waits for its sender's write access, does not count, since the lookup can drop it.
+   */
+  private resume(item: WorkRow): string {
+    const [waiting] = this.sql.exec<WorkRow>(
+      `SELECT * FROM work WHERE kind = 'review' AND status = 'skipped' AND note = ? ORDER BY id DESC LIMIT 1`, PAUSED_NOTE,
+    ).toArray();
+    if (!waiting) return 'resumed';
+    const since = this.sql.exec(
+      `SELECT 1 FROM work WHERE kind = 'review' AND id > ?
+         AND (status IN ('running', 'done', 'failed') OR (status IN ('queued', 'dispatching') AND writer = 1)
+           OR conclusion IN ('cancelled', 'skipped', 'conflict'))`,
+      waiting.id,
+    ).toArray();
+    if (since.length > 0) return 'resumed';
+    const work: Work = {
+      lane: 'state', kind: 'review', event: waiting.event, headSha: waiting.head_sha, objectId: null, sender: '',
+      trusted: true, acknowledge: false, writer: true,
+    };
+    return `resumed, ${this.enqueue(work, item.delivery, Date.now())}`;
   }
 
   /**
@@ -1231,12 +1275,27 @@ export class PrCoordinator extends DurableObject<Env> {
         throw new Error(`reading the settings comment failed with ${read.status}`);
       }
     }
-    // GitHub lists the comments edited since the run started, oldest first.
-    const list = await githubApi(token, `${repo}/issues/${target.number}/comments?since=${new Date(since).toISOString()}&per_page=100`);
-    if (!list.ok) throw new Error(`listing the PR comments failed with ${list.status}`);
-    const comments = await list.json() as Array<IssueCommentRead & { id: number }>;
-    const newest = comments.reverse().find((c) => MANKI_LOGINS.includes(c.user?.login ?? '') && isOwn(c));
-    return newest ? { id: newest.id, body: newest.body! } : null;
+    return this.newestMankiComment(token, target, isRunningProgress, since);
+  }
+
+  /**
+   * Returns Manki's newest comment posted since `since` whose body `matches`, among the PR's newest 100 comments, or
+   * null. Anyone can comment, so the list leaves out the bodies, and only Manki's newest few are read.
+   */
+  private async newestMankiComment(
+    token: string, target: Target, matches: (body: string) => boolean, since = 0,
+  ): Promise<{ id: number; body: string } | null> {
+    const repo = `/repos/${target.owner}/${target.repo}`;
+    const data = await githubGraphql<RecentCommentsResponse>(token, RECENT_COMMENTS_QUERY, {
+      owner: target.owner, name: target.repo, number: target.number,
+    });
+    const mankis = (data.repository?.pullRequest?.comments.nodes ?? [])
+      .filter((c) => c.fullDatabaseId !== null && isMankiGraphqlLogin(c.author?.login) && Date.parse(c.createdAt) >= since);
+    for (const { fullDatabaseId } of mankis.reverse().slice(0, MANKI_COMMENT_READS)) {
+      const comment = await this.readComment(token, repo, Number(fullDatabaseId));
+      if (comment && matches(comment.body)) return comment;
+    }
+    return null;
   }
 
   /** Puts back the boxes someone without write access changed: Pause as it applies, and every other box unticked. */
@@ -1316,6 +1375,20 @@ export class PrCoordinator extends DurableObject<Env> {
         this.finish(item.id, 'skipped', `matches the skip rule for ${rule}`, 'skipped');
         return false;
       }
+      // Only a review nobody asked for waits out a pause. A request, a reply or a settings box review still runs.
+      const paused = () => {
+        const { pause, settings } = this.reported();
+        return pause !== null || settings.paused;
+      };
+      if (first && paused()) {
+        await this.reportPaused(pr, target);
+        if (!this.isDispatching(item.id)) return false;
+        // An untick applied meanwhile saw this review in flight and queued none, so the review goes on.
+        if (paused()) {
+          this.finish(item.id, 'skipped', PAUSED_NOTE);
+          return false;
+        }
+      }
     }
     // A review of a PR that conflicts with its base would only end in a held approval, so none starts until a rebase.
     if (item.attempts === 0) {
@@ -1351,20 +1424,7 @@ export class PrCoordinator extends DurableObject<Env> {
       // The note only explains the skip, so a failure to post it never holds the lane.
       log('coordinator_conflict_note_failed', { ...this.logFields(), error: String(error) });
     }
-    const checks = await this.token({ checks: 'write' });
-    if (checks === null) return;
-    const response = await githubApi(checks, `/repos/${target.owner}/${target.repo}/check-runs`, {
-      method: 'POST',
-      body: {
-        name: 'Manki',
-        head_sha: pr.head.sha,
-        status: 'completed',
-        conclusion: 'action_required',
-        ...(pr.html_url && { details_url: pr.html_url }),
-        output: { title: 'Rebase needed', summary: text },
-      },
-    });
-    if (!response.ok) throw new Error(`creating the rebase check failed with ${response.status}`);
+    await this.completeCheck(pr.head.sha, 'action_required', { title: 'Rebase needed', summary: text }, target, pr.html_url);
   }
 
   /** Posts the conflict note, or edits the one an earlier skip posted. */
@@ -1416,19 +1476,53 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /** Completes a `Manki` check on `head` as skipped, as Manki does for a PR it skips. */
   private async reportSkipped(head: string, rule: string, target: Target): Promise<void> {
+    const summary = `This PR matches the skip rule for ${rule} in \`.manki.yml\` on the base branch.`;
+    await this.completeCheck(head, 'skipped', { title: 'Review skipped', summary }, target);
+  }
+
+  /**
+   * Tells the PR's author that the push of its head waits out a pause: one `Manki` check per head that says why and what
+   * starts a review, and the status line of Manki's settings comment. A failure is logged and still skips the review.
+   */
+  private async reportPaused(pr: PullRequestRead, target: Target): Promise<void> {
+    const head = pr.head.sha;
+    const { pause, settings } = this.reported();
+    const failed = (part: string) => (error: unknown) => {
+      log('coordinator_paused_report_failed', { ...this.logFields(), head_sha: head, part, error: error instanceof Error ? error.message : String(error) });
+    };
+    // A catch-up of a head whose push was skipped asks again, and must not add a second check.
+    if (this.getMeta<string>('paused_head') !== head) {
+      const output = { title: 'Automatic review paused', summary: pausedSummary(pause?.reason ?? null, settings.paused) };
+      await this.completeCheck(head, 'action_required', output, target, pr.html_url)
+        .then(() => this.setMeta('paused_head', head), failed('check'));
+    }
+    await this.showPaused(head, target).catch(failed('comment'));
+  }
+
+  /** Sets the status line of Manki's newest settings comment, among the PR's newest comments, to say that `head` waits. */
+  private async showPaused(head: string, target: Target): Promise<void> {
+    const token = await this.token({ issues: 'write', pull_requests: 'write' });
+    if (token === null) return;
+    const settings = await this.newestMankiComment(token, target, (body) => settingsHead(body) !== null);
+    // A progress comment still in progress belongs to its run, which may edit it at any time.
+    if (!settings || isRunningProgress(settings.body)) return;
+    const body = withSettingsStatus(settings.body, `automatic review paused, \`${head.slice(0, 7)}\` waits`, []);
+    if (body === settings.body) return;
+    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/comments/${settings.id}`, { method: 'PATCH', body: { body } });
+    if (!response.ok) throw new Error(`showing the paused push failed with ${response.status}`);
+  }
+
+  /** Creates a completed `Manki` check on `head`. Without `checks: write` on the installation, it creates none. */
+  private async completeCheck(
+    head: string, conclusion: string, output: { title: string; summary: string }, target: Target, detailsUrl?: string,
+  ): Promise<void> {
     const token = await this.token({ checks: 'write' });
     if (token === null) return;
     const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/check-runs`, {
       method: 'POST',
-      body: {
-        name: 'Manki',
-        head_sha: head,
-        status: 'completed',
-        conclusion: 'skipped',
-        output: { title: 'Review skipped', summary: `This PR matches the skip rule for ${rule} in \`.manki.yml\` on the base branch.` },
-      },
+      body: { name: 'Manki', head_sha: head, status: 'completed', conclusion, ...(detailsUrl && { details_url: detailsUrl }), output },
     });
-    if (!response.ok) throw new Error(`creating the skipped check failed with ${response.status}`);
+    if (!response.ok) throw new Error(`creating the ${output.title} check failed with ${response.status}`);
   }
 
   private markRunning(item: WorkRow, runId: number | null, note: string): void {
