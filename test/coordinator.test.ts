@@ -491,7 +491,7 @@ describe('PrCoordinator.alarm', () => {
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped', errors: 0 }]);
   });
 
-  it('starts nothing else in a lane while an item there is dispatching', async () => {
+  it('starts nothing else in a lane while its oldest item waits to retry a failed start, which a newer push merges into', async () => {
     stubGitHub({ api: { 'POST /graphql': { status: 502, body: {} } } });
     const pr = pullRequest();
     await pr.send('pull_request', pr.push(SHA_1));
@@ -499,7 +499,10 @@ describe('PrCoordinator.alarm', () => {
     await runDurableObjectAlarm(pr.stub);
     advanceClock(30_000);
     await runDurableObjectAlarm(pr.stub);
-    expect((await workRows(pr.stub)).map((row) => row.status)).toEqual(['dispatching', 'queued']);
+    expect((await workRows(pr.stub)).map((row) => [row.kind, row.status])).toEqual([['review', 'queued'], ['review_state', 'queued']]);
+
+    await pr.send('pull_request', pr.push(SHA_2));
+    expect(await workRows(pr.stub)).toMatchObject([{ kind: 'review', head_sha: SHA_2, errors: 1 }, { kind: 'review_state' }]);
   });
 
   it('drops an item that a close lands on while the alarm waits for GitHub', async () => {
@@ -1392,18 +1395,25 @@ describe('PrCoordinator dispatch', () => {
     expect(github.checkRuns.map((check) => check.head_sha)).toEqual([SHA_1, SHA_1, SHA_2]);
   });
 
-  it('still skips a conflicting PR when posting the note failed once, since no dispatch was tried', async () => {
+  it('skips a conflicting PR at once when its note cannot be posted, and posts the note on the next skip', async () => {
     const pr = pullRequest();
-    const github = Object.assign(fakeGitHub(pr.number), { mergeable: [false] as Array<boolean | null>, mergeableState: 'dirty', commentStatus: 502 });
+    const github = Object.assign(fakeGitHub(pr.number), { mergeable: [false] as Array<boolean | null>, mergeableState: 'dirty', commentStatus: 403 });
     await pr.send('pull_request', pr.push(SHA_1));
     await runDurableObjectAlarm(pr.stub);
-    expect(await workRows(pr.stub)).toMatchObject([{ status: 'dispatching', attempts: 0, errors: 1 }]);
-    github.commentStatus = 201;
-    advanceClock(backoff(0));
-    await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches).toEqual([]);
-    expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped', conclusion: 'conflict' }]);
-    expect(github.mints).toContainEqual({ permissions: { issues: 'write' }, repository_ids: [REPOSITORY_ID] });
+    expect(github.checkRuns.map((check) => check.head_sha)).toEqual([SHA_1]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped', conclusion: 'conflict', errors: 0 }]);
+    expect(logged(log, 'coordinator_conflict_note_failed')).toMatchObject([{ error: 'Error: posting the conflict note failed with 403' }]);
+    // A comment on a pull request needs `pull_requests: write`.
+    expect(github.mints).toContainEqual({ permissions: { issues: 'write', pull_requests: 'write' }, repository_ids: [REPOSITORY_ID] });
+
+    github.commentStatus = 201;
+    await pr.send('pull_request', pr.push(SHA_2));
+    github.head = SHA_2;
+    github.mergeable = [false];
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.comments).toHaveLength(2);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped' }, { status: 'skipped', conclusion: 'conflict' }]);
   });
 
   it('reviews a PR GitHub has not computed mergeability for after reading it twice more, and a clean one at once', async () => {
@@ -1481,13 +1491,13 @@ describe('PrCoordinator dispatch', () => {
     github.configStatus = 502;
     github.head = SHA_2;
     await runDurableObjectAlarm(pr.stub);
-    expect(await workRows(pr.stub)).toMatchObject([{ status: 'dispatching', head_sha: SHA_1, errors: 1 }]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'queued', head_sha: SHA_1, errors: 1 }]);
     // The next try stores the newer head and fails to mint its dispatch token, so a retry must not see the bot's push.
     github.configStatus = 200;
     github.mintFailures = [{ permission: 'actions', reply: 502 }];
     advanceClock(backoff(0));
     await runDurableObjectAlarm(pr.stub);
-    expect(await workRows(pr.stub)).toMatchObject([{ status: 'dispatching', head_sha: SHA_2, sender: '', attempts: 0 }]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'queued', head_sha: SHA_2, sender: '', attempts: 0 }]);
     github.dispatchStatuses = [502];
     advanceClock(backoff(1));
     await runDurableObjectAlarm(pr.stub);
@@ -1536,7 +1546,7 @@ describe('PrCoordinator dispatch', () => {
     github.commentStatus = 502;
     await pr.send('issue_comment', pr.comment('@manki help'));
     await runDurableObjectAlarm(pr.stub);
-    expect(await workRows(pr.stub)).toMatchObject([{ status: 'dispatching', errors: 1 }]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'queued', errors: 1 }]);
     github.commentStatus = 201;
     advanceClock(backoff(0));
     await runDurableObjectAlarm(pr.stub);
@@ -1720,7 +1730,7 @@ describe('PrCoordinator dispatch', () => {
       github.cancelStatuses = [500];
       await edit([], ['cancel'], 'alice', new Date().toISOString(), progress);
       expect(github.cancels).toEqual([9000, 9001]);
-      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'dispatching', errors: 1 });
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'queued', errors: 1 });
       expect(github.issueComments.get(SETTINGS)).toBe(progress(['cancel']));
       advanceClock(backoff(0));
       await runDurableObjectAlarm(pr.stub);
@@ -2396,7 +2406,7 @@ describe('PrCoordinator dispatch', () => {
     github.mintFailures = [{ permission: 'contents', reply }];
     await pr.send('issue_comment', pr.comment('@manki explain'));
     await runDurableObjectAlarm(pr.stub);
-    expect(await workRows(pr.stub)).toMatchObject([{ status: 'dispatching', errors: 1 }]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'queued', errors: 1 }]);
     expect(logged(log, 'coordinator_opt_in')).toEqual([]);
     advanceClock(backoff(0));
     await runDurableObjectAlarm(pr.stub);
@@ -2410,7 +2420,7 @@ describe('PrCoordinator dispatch', () => {
     github.mintFailures = [{ permission: 'actions', reply }];
     await pr.send('issue_comment', pr.comment('@manki explain'));
     await runDurableObjectAlarm(pr.stub);
-    expect(await workRows(pr.stub)).toMatchObject([{ status: 'dispatching', errors: 1 }]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'queued', errors: 1 }]);
     expect(logged(log, 'coordinator_lacks_actions_write')).toEqual([]);
     advanceClock(backoff(0));
     await runDurableObjectAlarm(pr.stub);
@@ -2500,7 +2510,7 @@ describe('PrCoordinator dispatch', () => {
     otherGitHub.repositoryStatus = 502;
     await other.send('issue_comment', other.comment('@manki explain'));
     await runDurableObjectAlarm(other.stub);
-    expect(await workRows(other.stub)).toMatchObject([{ status: 'dispatching', errors: 1 }]);
+    expect(await workRows(other.stub)).toMatchObject([{ status: 'queued', errors: 1 }]);
     otherGitHub.repositoryStatus = 200;
     advanceClock(backoff(0));
     await runDurableObjectAlarm(other.stub);
