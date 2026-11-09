@@ -757,8 +757,8 @@ function fakeGitHub(number: number) {
       const { query, variables } = await request.json() as { query: string; variables: Record<string, string> };
       if (query.includes('comments(last: 100)')) {
         if (state.commentListStatus !== 200) return Response.json({ message: 'no' }, { status: state.commentListStatus });
-        const nodes = [...state.issueComments].sort(([a], [b]) => a - b).slice(-100).map(([id, body]) => ({
-          databaseId: id, body, author: { login: (state.commentAuthors.get(id) ?? 'manki-review[bot]').replace(/\[bot\]$/, '') },
+        const nodes = [...state.issueComments.keys()].sort((a, b) => a - b).slice(-100).map((id) => ({
+          databaseId: id, author: { login: (state.commentAuthors.get(id) ?? 'manki-review[bot]').replace(/\[bot\]$/, '') },
         }));
         return Response.json({ data: { repository: { pullRequest: { comments: { nodes } } } } });
       }
