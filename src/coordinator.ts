@@ -853,10 +853,16 @@ export class PrCoordinator extends DurableObject<Env> {
       if (item.kind === 'help') await this.answerHelp(item);
       else await this.dispatch(item, optIn.workflow);
     } catch (error) {
-      // The lease runs out after the backoff, and the next pass takes the item again.
+      const retryAt = Date.now() + backoff(item.errors);
+      // An item with no dispatch attempt waits in the queue, so a newer push merges into it instead of queueing behind it.
+      this.sql.exec(
+        `UPDATE work SET status = 'queued', lease_until = NULL, check_at = ?, errors = errors + 1 WHERE id = ? AND status = 'dispatching' AND attempts = 0`,
+        retryAt, item.id,
+      );
+      // One with an attempt keeps its delivery id, which `findRun` looks for, so it waits out its lease instead.
       this.sql.exec(
         `UPDATE work SET lease_until = ?, errors = errors + 1 WHERE id = ? AND status = 'dispatching'`,
-        Date.now() + backoff(item.errors), item.id,
+        retryAt, item.id,
       );
       log('coordinator_start_error', { ...this.logFields(), work_id: item.id, error: String(error) });
     }
