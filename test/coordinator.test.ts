@@ -1143,7 +1143,7 @@ describe('PrCoordinator dispatch', () => {
     expect(github.issueComments.get(1500)).toBe(notice(`automatic review paused, \`${SHA_2.slice(0, 7)}\` waits`));
     github.checkRunStatus = 201;
     const pausedCheck = {
-      name: 'Manki', head_sha: SHA_2, status: 'completed', conclusion: 'action_required',
+      name: 'Manki', head_sha: SHA_2, status: 'completed', conclusion: 'action_required', details_url: `https://github.com/${OWNER}/${REPO}/pull/${pr.number}`,
       output: {
         title: 'Automatic review paused',
         summary: "Round cap reached. Automatic review is paused, so this commit waits. Tick **Review again** on Manki's settings comment to review it.",
@@ -1540,7 +1540,7 @@ describe('PrCoordinator dispatch', () => {
     expect(github.checkRuns).toEqual([]);
   });
 
-  it('keeps judging a retried skip by the queued push, and applies skip rules only before the first dispatch attempt', async () => {
+  it('keeps judging a retried skip by the queued push, and applies skip rules and a pause only before the first dispatch attempt', async () => {
     const pr = pullRequest();
     const github = Object.assign(fakeGitHub(pr.number), { config: 'skip_authors: [renovate-bot]\nskip_labels: [dependencies]', author: 'renovate-bot' });
     const push = pr.push(SHA_1);
@@ -1560,14 +1560,21 @@ describe('PrCoordinator dispatch', () => {
     advanceClock(backoff(1));
     await runDurableObjectAlarm(pr.stub);
     expect(github.checkRuns).toEqual([]);
-    // A label added after a dispatch attempt skips nothing, since that attempt's run may have started.
+    // A label or a Pause tick after a dispatch attempt skips nothing, since that attempt's run may have started.
     github.labels = ['dependencies'];
+    github.permissions = { alice: 'write' };
+    const settings = (pause: boolean) => ['---', 'Last reviewed `1111111` · head `1111111` · up to date',
+      `- [${pause ? 'x' : ' '}] Pause automatic reviews <!-- manki-box:pause -->`, '<!-- manki-settings -->'].join('\n');
+    await pr.send('issue_comment', issueCommentEvent(settings(true), {
+      number: pr.number, action: 'edited', author: MANKI_AUTHOR, sender: { login: 'alice', type: 'User' }, previousBody: settings(false),
+    }));
+    await runDurableObjectAlarm(pr.stub);
     advanceClock(DISPATCH_BACKOFF_MS[0]);
     await runDurableObjectAlarm(pr.stub);
     expect(github.configReads).toHaveLength(3);
     expect(github.checkRuns).toEqual([]);
     expect(github.dispatches).toHaveLength(2);
-    expect(await workRows(pr.stub)).toMatchObject([{ status: 'running', head_sha: SHA_2 }]);
+    expect(await workRows(pr.stub)).toMatchObject([{ status: 'running', head_sha: SHA_2 }, { kind: 'settings', status: 'done', note: 'paused' }]);
   });
 
   it('applies no skip rule to a review request, which only a push review reads', async () => {
@@ -1721,7 +1728,7 @@ describe('PrCoordinator dispatch', () => {
       expect(github.dispatches).toEqual([]);
       expect((await workRows(pr.stub)).at(-1)).toMatchObject({ status: 'skipped', note: 'pull request is paused' });
       expect(github.checkRuns).toEqual([{
-        name: 'Manki', head_sha: SHA_1, status: 'completed', conclusion: 'action_required',
+        name: 'Manki', head_sha: SHA_1, status: 'completed', conclusion: 'action_required', details_url: `https://github.com/${OWNER}/${REPO}/pull/${pr.number}`,
         output: {
           title: 'Automatic review paused',
           summary: "Automatic review is paused by the **Pause automatic reviews** box on Manki's settings comment, so this commit waits. "

@@ -1332,8 +1332,8 @@ export class PrCoordinator extends DurableObject<Env> {
       }
       // Only a review nobody asked for waits out a pause. A request, a reply or a settings box review still runs.
       const { pause, settings } = this.reported();
-      if (pause !== null || settings.paused) {
-        await this.reportPaused(pr.head.sha, target);
+      if (first && (pause !== null || settings.paused)) {
+        await this.reportPaused(pr, target);
         if (this.isDispatching(item.id)) this.finish(item.id, 'skipped', 'pull request is paused');
         return false;
       }
@@ -1429,10 +1429,11 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Tells the PR's author that the push of `head` waits out a pause: one `Manki` check per head that says why and what
+   * Tells the PR's author that the push of its head waits out a pause: one `Manki` check per head that says why and what
    * starts a review, and the status line of Manki's settings comment. A failure is logged and still skips the review.
    */
-  private async reportPaused(head: string, target: Target): Promise<void> {
+  private async reportPaused(pr: PullRequestRead, target: Target): Promise<void> {
+    const head = pr.head.sha;
     const { pause, settings } = this.reported();
     const failed = (part: string) => (error: unknown) => {
       log('coordinator_paused_report_failed', { ...this.logFields(), head_sha: head, part, error: error instanceof Error ? error.message : String(error) });
@@ -1440,7 +1441,7 @@ export class PrCoordinator extends DurableObject<Env> {
     // A catch-up of a head whose push was skipped asks again, and must not add a second check.
     if (this.getMeta<string>('paused_head') !== head) {
       const output = { title: 'Automatic review paused', summary: pausedSummary(pause?.reason ?? null, settings.paused) };
-      await this.completeCheck(head, 'action_required', output, target)
+      await this.completeCheck(head, 'action_required', output, target, pr.html_url)
         .then(() => this.setMeta('paused_head', head), failed('check'));
     }
     await this.showPaused(head, target).catch(failed('comment'));
