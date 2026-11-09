@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { findings, ISSUE_MARKER, issueBody, type LogEvent, publicRepositories, repositories, STUCK_AFTER_MS } from '../scripts/log-watch/findings';
+import { findings, ISSUE_MARKER, issueBody, type LogEvent, LOOKBACK_MS, publicRepositories, repositories, STUCK_AFTER_MS, windowStart } from '../scripts/log-watch/findings';
 
 const NOW = Date.parse('2026-11-09T09:00:00Z');
 const MINUTE = 60_000;
@@ -147,17 +147,41 @@ describe('findings', () => {
       event(49, { msg: 'coordinator_held', work_id: 1, pr: 1294, until: NOW - 10 * MINUTE }),
       // A run that never started is queued again and waits anew.
       event(30, { msg: 'coordinator_requeued', work_id: 1, pr: 1295, reason: 'run never started' }),
+      // A run in one lane holds only that lane. The routed `webhook` line names the lane of a delivery, and work in a lane
+      // no line names waits while any lane of its PR runs.
+      event(50, { msg: 'coordinator_dispatched', work_id: 1, pr: 1296, lane: 'state' }),
+      event(45, { msg: 'webhook', route: 'chat', delivery: 'd-chat', pr: 1296, repo: undefined }),
+      event(45, { msg: 'coordinator_receive', effect: 'queued work 2', delivery: 'd-chat', pr: 1296 }),
+      event(44, { msg: 'webhook', route: 'state', delivery: 'd-reply', pr: 1296, repo: undefined }),
+      event(44, { msg: 'coordinator_receive', effect: 'queued work 3', delivery: 'd-reply', pr: 1296 }),
+      event(43, { msg: 'coordinator_receive', effect: 'queued work 4', delivery: 'd-unknown', pr: 1296 }),
+      // A settings box queues its review in the state lane, named only in the settings item's note.
+      event(40, { msg: 'coordinator_finished', work_id: 1, pr: 1297, status: 'done', note: 'paused, again review work 2' }),
+      event(38, { msg: 'coordinator_finished', work_id: 3, pr: 1297, status: 'done', note: 'deeper review work 4' }),
+      event(37, { msg: 'coordinator_dispatched', work_id: 4, pr: 1297, lane: 'state' }),
+      event(36, { msg: 'coordinator_finished', work_id: 4, pr: 1297, status: 'done' }),
     ];
     const [stuck] = findings([], queue, NOW, PUBLIC);
-    expect(stuck.title).toBe('Work queued over 20 minutes without a dispatch (6)');
+    expect(stuck.title).toBe('Work queued over 20 minutes without a dispatch (8)');
     expect(stuck.lines).toEqual([
       '08:15:00 `coordinator_receive` manki-review/manki#1293: work 2 waiting 45 minutes',
+      '08:15:00 `coordinator_receive` manki-review/manki#1296: work 2 waiting 45 minutes',
       '08:20:00 `coordinator_receive` manki-review/manki#1289: work 3 waiting 40 minutes',
+      '08:20:00 `coordinator_finished` manki-review/manki#1297 work 1: work 2 waiting 40 minutes',
       '08:26:00 `coordinator_receive` manki-review/manki#1291: work 8 waiting 34 minutes',
       '08:30:00 `coordinator_receive` manki-review/manki#1290: work 1 waiting 30 minutes',
       '08:30:00 `coordinator_requeued` manki-review/manki#1295 work 1: waiting 30 minutes',
       '08:39:00 `reconciler_caught_up` manki-review/manki#1289: work 4 waiting 21 minutes',
     ]);
+  });
+
+  it('reads back to the last successful run, at least 75 minutes and at most the lookback', () => {
+    expect(windowStart(NOW, null)).toBe(NOW - 75 * MINUTE);
+    expect(windowStart(NOW, NOW - 60 * MINUTE)).toBe(NOW - 75 * MINUTE);
+    expect(windowStart(NOW, NOW - 10 * MINUTE)).toBe(NOW - 75 * MINUTE);
+    // After a late or dropped run, the window reaches back to the run before it, so no line goes unread.
+    expect(windowStart(NOW, NOW - 3 * 60 * MINUTE)).toBe(NOW - 195 * MINUTE);
+    expect(windowStart(NOW, NOW - 10 * 60 * MINUTE)).toBe(NOW - LOOKBACK_MS);
   });
 
   it('writes an issue body with the window, each sign and the marker the watcher finds the issue by', () => {

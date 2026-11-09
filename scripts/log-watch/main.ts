@@ -1,12 +1,11 @@
-import { findings, ISSUE_MARKER, issueBody, type LogEvent, publicRepositories, QUEUE_MESSAGES, repositories, SIGNAL_MESSAGES } from './findings.ts';
+import {
+  findings, ISSUE_MARKER, issueBody, LANES, type LogEvent, LOOKBACK_MS, publicRepositories, QUEUE_MESSAGES, repositories, SIGNAL_MESSAGES, windowStart,
+} from './findings.ts';
 
 declare const process: { env: Record<string, string | undefined> };
 
-// Each run reads a bit more than the hour since the last, so a late scheduled run leaves no gap.
-const WINDOW_MS = 75 * 60_000;
-// Stuck work is looked for over a longer span, so work queued before the window still shows while it waits.
-const QUEUE_SPAN_MS = 6 * 60 * 60_000;
 const PAGE = 2000;
+const WORKFLOW = 'log-watch.yml';
 const SERVICE = 'manki-token-service';
 const TITLE = 'Worker logs show warning signs';
 
@@ -37,10 +36,15 @@ async function query(filters: unknown[], from: number, to: number): Promise<LogE
       }),
     });
     if (!response.ok) throw new Error(`the log query failed with ${response.status}: ${(await response.text()).slice(0, 300)}`);
-    const page = (await response.json() as { result: { events?: { events?: Array<LogEvent & { $metadata: { id: string } }> } } }).result.events?.events ?? [];
-    events.push(...page);
+    // A reply of another shape would read as a clean window and close the issue, so it fails the run.
+    const reply = await response.json() as { success?: boolean; result?: { events?: { events?: unknown } } };
+    const page = reply.result?.events?.events;
+    if (reply.success !== true || !Array.isArray(page)) throw new Error('the log query returned no list of events');
+    events.push(...page as LogEvent[]);
     if (page.length < PAGE) return events;
-    offset = page[page.length - 1].$metadata.id;
+    const last = (page.at(-1) as { $metadata?: { id?: unknown } }).$metadata?.id;
+    if (typeof last !== 'string' || last === '') throw new Error('a full page of log events has no id to read on from');
+    offset = last;
   }
 }
 
@@ -65,8 +69,16 @@ async function github(path: string, init: { method?: string; body?: unknown } = 
 }
 
 
+/** Returns when the last successful run of this workflow started, or null when it has none. */
+async function lastRunStart(): Promise<number | null> {
+  const { workflow_runs: runs } = await github(`/actions/workflows/${WORKFLOW}/runs?status=success&per_page=1`) as { workflow_runs?: Array<{ run_started_at?: string }> };
+  if (!Array.isArray(runs)) throw new Error('the list of earlier runs has no runs');
+  const started = Date.parse(runs[0]?.run_started_at ?? '');
+  return Number.isNaN(started) ? null : started;
+}
+
 const to = Date.now();
-const from = to - WINDOW_MS;
+const from = windowStart(to, await lastRunStart());
 const signals = await query([{
   kind: 'group',
   filterCombination: 'or',
@@ -84,7 +96,21 @@ const signals = await query([{
     { key: 'error', operation: 'regex', type: 'string', value: 'with 5[0-9][0-9]' },
   ],
 }], from, to);
-const queue = await query([{ key: 'msg', operation: 'in', type: 'string', value: QUEUE_MESSAGES.join(',') }], to - QUEUE_SPAN_MS, to);
+const queue = await query([{
+  kind: 'group',
+  filterCombination: 'or',
+  filters: [
+    { key: 'msg', operation: 'in', type: 'string', value: QUEUE_MESSAGES.join(',') },
+    {
+      kind: 'group',
+      filterCombination: 'and',
+      filters: [
+        { key: 'msg', operation: 'eq', type: 'string', value: 'webhook' },
+        { key: 'route', operation: 'in', type: 'string', value: LANES.join(',') },
+      ],
+    },
+  ],
+}], to - LOOKBACK_MS, to);
 const publicRepos = await publicRepositories(repositories([...signals, ...queue]), (repo) => githubFetch(`/repos/${repo}`));
 const found = findings(signals, queue, to, publicRepos);
 

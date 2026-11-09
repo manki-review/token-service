@@ -16,6 +16,19 @@ export interface Finding {
 /** Work queued longer than this without a dispatch or an end counts as stuck. */
 export const STUCK_AFTER_MS = 20 * 60_000;
 
+// A run reads back to the start of the last successful run, less this much for lines that reached the logs late. So the
+// hourly run reads 75 minutes, and a late or dropped run leaves no gap.
+const OVERLAP_MS = 15 * 60_000;
+const HOUR_MS = 60 * 60_000;
+/** The furthest back any query reads, also for stuck work. */
+export const LOOKBACK_MS = 6 * HOUR_MS;
+
+/** Returns where the window ending at `to` starts, given the start of the last successful run, if any. */
+export function windowStart(to: number, lastRunStart: number | null): number {
+  const usual = to - HOUR_MS - OVERLAP_MS;
+  return Math.max(to - LOOKBACK_MS, lastRunStart === null ? usual : Math.min(usual, lastRunStart - OVERLAP_MS));
+}
+
 export const ISSUE_MARKER = '<!-- log-watch -->';
 
 const FAILED_WRITES = new Set([
@@ -33,6 +46,9 @@ export const SIGNAL_MESSAGES = ['coordinator_start_error', ...FAILED_WRITES, 'co
 export const QUEUE_MESSAGES = [
   'coordinator_receive', 'reconciler_caught_up', 'coordinator_held', 'coordinator_dispatched', 'coordinator_requeued', 'coordinator_finished',
 ];
+
+/** The coordinator's lanes, each of which runs one item at a time. A routed `webhook` line names its lane as `route`. */
+export const LANES = ['state', 'chat', 'help', 'settings'];
 
 const MAX_LINES = 10;
 const MAX_REQUEST_IDS = 50;
@@ -126,15 +142,26 @@ export function findings(signals: LogEvent[], queue: LogEvent[], now: number, pu
   ].filter((entry): entry is Finding => entry !== null);
 }
 
+interface Waiting {
+  event: LogEvent;
+  since: number;
+  lane: string | null;
+}
+
 /**
  * Returns the work queued over `STUCK_AFTER_MS` that no dispatch, end or close of its PR followed. Work waiting while its
- * PR has a run going waits by design, and a review held by the hourly cap waits until the cap releases it.
+ * lane on the PR has a run going waits by design, and a review held by the hourly cap waits until the cap releases it.
+ * `queue` holds the routed `webhook` lines too, which name the lane of each delivery. Work whose lane is unknown waits
+ * by design while any lane of its PR has a run going.
  */
 function stuck(queue: LogEvent[], now: number): Match[] {
-  const waiting = new Map<string, { event: LogEvent; since: number }>();
-  const running = new Set<string>();
+  const lanes = new Map(queue.filter((event) => event.source.msg === 'webhook' && LANES.includes(text(event.source.route)))
+    .map((event) => [text(event.source.delivery), text(event.source.route)]));
+  const waiting = new Map<string, Waiting>();
+  const running = new Map<string, string | null>();
   for (const event of [...queue].sort((a, b) => a.timestamp - b.timestamp)) {
     const { source } = event;
+    if (source.msg === 'webhook') continue;
     const pr = `${repositoryOf(source)}#${text(source.pr)}`;
     const effect = text(source.effect);
     // A close drops the PR's queued work and can queue the work of a merge in the same line.
@@ -142,30 +169,40 @@ function stuck(queue: LogEvent[], now: number): Match[] {
       for (const key of waiting.keys()) if (key.startsWith(`${pr} `)) waiting.delete(key);
     }
     const queued = effect.match(/queued work (\d+)/);
-    if (queued) waiting.set(`${pr} ${queued[1]}`, { event, since: event.timestamp });
+    if (queued) {
+      const lane = source.msg === 'reconciler_caught_up' ? 'state' : lanes.get(text(source.delivery)) ?? null;
+      waiting.set(`${pr} ${queued[1]}`, { event, since: event.timestamp, lane });
+    }
     if (source.work_id === undefined) continue;
     const key = `${pr} ${text(source.work_id)}`;
     if (source.msg === 'coordinator_dispatched') {
       waiting.delete(key);
-      running.add(key);
+      running.set(key, LANES.includes(text(source.lane)) ? text(source.lane) : null);
     } else if (source.msg === 'coordinator_finished') {
       waiting.delete(key);
       running.delete(key);
+      // A settings box queues its review in the state lane, which only the settings item's note names.
+      for (const [, id] of text(source.note).matchAll(/\b(?:again|deeper|draft) review work (\d+)/g)) {
+        waiting.set(`${pr} ${id}`, { event, since: event.timestamp, lane: 'state' });
+      }
     } else if (source.msg === 'coordinator_requeued') {
+      waiting.set(key, { event, since: event.timestamp, lane: running.get(key) ?? null });
       running.delete(key);
-      waiting.set(key, { event, since: event.timestamp });
     } else if (source.msg === 'coordinator_held') {
-      const entry = waiting.get(key) ?? { event, since: event.timestamp };
+      const entry = waiting.get(key) ?? { event, since: event.timestamp, lane: null };
       waiting.set(key, { ...entry, since: Math.max(entry.since, Number(source.until) || 0) });
     }
   }
-  const busy = new Set([...running].map((key) => key.slice(0, key.lastIndexOf(' '))));
+  const prOf = (key: string) => key.slice(0, key.lastIndexOf(' '));
+  const busy = (key: string, lane: string | null) => [...running.entries()]
+    .some(([runningKey, runningLane]) => prOf(runningKey) === prOf(key) && (lane === null || runningLane === null || runningLane === lane));
   return [...waiting.entries()]
-    .filter(([key, { since }]) => now - since > STUCK_AFTER_MS && !busy.has(key.slice(0, key.lastIndexOf(' '))))
+    .filter(([key, { since, lane }]) => now - since > STUCK_AFTER_MS && !busy(key, lane))
     .map(([key, { event }]) => {
+      const id = key.slice(key.lastIndexOf(' ') + 1);
       const minutes = `waiting ${Math.round((now - event.timestamp) / 60_000)} minutes`;
-      // A line that queued the work names it only in its effect.
-      return { event, detail: event.source.work_id === undefined ? `work ${key.slice(key.lastIndexOf(' ') + 1)} ${minutes}` : minutes };
+      // The line that queued the work names it only in its effect or note, unless it is the work's own line.
+      return { event, detail: text(event.source.work_id) === id ? minutes : `work ${id} ${minutes}` };
     });
 }
 

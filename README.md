@@ -208,17 +208,17 @@ To rotate the token, create a new one with the same permissions (My Profile, API
 
 ## Log watch
 
-`.github/workflows/log-watch.yml` runs `scripts/log-watch/main.ts` every hour. It reads the last 75 minutes of Workers Logs for warning signs:
+`.github/workflows/log-watch.yml` runs `scripts/log-watch/main.ts` every hour. It reads Workers Logs back to 15 minutes before the start of its last successful run, at least 75 minutes and at most 6 hours, so a late or dropped run leaves no gap. A log query reply without a list of events fails the run rather than reading as a clean window. It looks for these warning signs:
 
 - `coordinator_start_error`.
 - Failed writes of a note or comment: the conflict note, the starting status, a cancelled review's report and the eyes reaction.
 - Runs the safety poll cancelled (`timed_out`) or queued again.
 - Any line with a 5xx status or an error naming one.
-- Work queued over 20 minutes ago that no dispatch, end or close of its PR has followed, looked for over the last 6 hours. Work waiting while its PR has a run going is not stuck, and a review held by the hourly cap counts from when the cap releases it.
+- Work queued over 20 minutes ago that no dispatch, end or close of its PR has followed, looked for over the last 6 hours. That includes a review a settings box queued. Work waiting while its lane on the PR has a run going is not stuck, and work in a lane no routed `webhook` line names waits while any lane of its PR runs. A review held by the hourly cap counts from when the cap releases it.
 
 It keeps one issue titled "Worker logs show warning signs", marked `<!-- log-watch -->`. A window with warning signs opens the issue, or replaces the body of the open one with that window's lines and Workers Logs request ids, at most 10 lines and 50 ids per sign. The issue is public, so only a line naming a repository that GitHub shows as public to the job's token names its repository, PR, work and error. Any other line shows only its time, its message and its request id. That covers a private repository, one whose visibility could not be read, and a line naming no repository, whose error can still quote one. A clean window comments on the open issue and closes it. The next warning sign opens a new one.
 
-It reads the logs with the repository secret `CF_LOGS_READ_TOKEN`, a Cloudflare API token with only Account, Workers Observability, Read on the account that runs the Worker. Its job holds `contents: read` and `issues: write`. It changes nothing in the Worker, so it needs no deploy.
+It reads the logs with the repository secret `CF_LOGS_READ_TOKEN`, a Cloudflare API token with only Account, Workers Observability, Read on the account that runs the Worker. Its job holds `actions: read`, to find its last successful run, `contents: read` and `issues: write`. It changes nothing in the Worker, so it needs no deploy.
 
 ## Development
 
