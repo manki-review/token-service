@@ -1375,11 +1375,18 @@ export class PrCoordinator extends DurableObject<Env> {
         return false;
       }
       // Only a review nobody asked for waits out a pause. A request, a reply or a settings box review still runs.
-      const { pause, settings } = this.reported();
-      if (first && (pause !== null || settings.paused)) {
+      const paused = () => {
+        const { pause, settings } = this.reported();
+        return pause !== null || settings.paused;
+      };
+      if (first && paused()) {
         await this.reportPaused(pr, target);
-        if (this.isDispatching(item.id)) this.finish(item.id, 'skipped', PAUSED_NOTE);
-        return false;
+        if (!this.isDispatching(item.id)) return false;
+        // An untick applied meanwhile saw this review in flight and queued none, so the review goes on.
+        if (paused()) {
+          this.finish(item.id, 'skipped', PAUSED_NOTE);
+          return false;
+        }
       }
     }
     // A review of a PR that conflicts with its base would only end in a held approval, so none starts until a rebase.
