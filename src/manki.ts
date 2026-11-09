@@ -13,7 +13,7 @@ export const MANKI_LOGINS: readonly string[] = [BOT_LOGIN, 'github-actions[bot]'
 /** The marker every comment and review comment Manki writes carries. */
 export const MANKI_COMMENT_MARKER = '<!-- manki';
 
-/** The marker in the body of Manki's review and its progress comment. A thread reply's review has an empty body. */
+/** The marker of Manki's progress comment. */
 export const BOT_MARKER = '<!-- manki-bot -->';
 
 /** The answer to a help command, as Manki's `handleHelp` posts it. */

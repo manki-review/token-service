@@ -8,7 +8,6 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { RUN_DEADLINE_MS } from '../src/coordinator';
-import { BOT_MARKER } from '../src/manki';
 import {
   CATCH_UP_WINDOW_MS,
   MAX_DELIVERY_PAGES,
@@ -147,7 +146,7 @@ function fakeGitHub() {
         state.graphqlCalls++;
         // GraphQL filters by the REST login, `<slug>[bot]` for a bot. A review given no body gets Manki's review body.
         const reviews = (state.reviews.get(`${variables.name}#${variables.number}`) ?? []).filter((review) => `${review.author}[bot]` === variables.author);
-        const nodes = reviews.map((review) => ({ commit: { oid: review.oid }, body: review.body ?? `Changes requested.\n${BOT_MARKER}` }));
+        const nodes = reviews.map((review) => ({ commit: { oid: review.oid }, body: review.body ?? 'Changes requested.\n<!-- manki-bot -->' }));
         return Response.json({ data: { repository: { pullRequest: { reviews: { nodes } } } } });
       }
       return Response.json(workflowsReply({ 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML }).body);
@@ -612,7 +611,11 @@ describe('Reconciler catch-up', () => {
     const github = fakeGitHub();
     github.pulls.set(target.repo, [pull(1, SHA_1, { repo: target.repo }), pull(2, SHA_2, { repo: target.repo })]);
     github.reviews.set(`${target.repo}#1`, [{ author: 'manki-review', oid: SHA_1 }]);
-    github.reviews.set(`${target.repo}#2`, [{ author: 'alice', oid: SHA_1 }, { author: 'manki-review', oid: SHA_2 }]);
+    // Manki approves a rebased head on its unchanged verdict with a review of its own markers.
+    github.reviews.set(`${target.repo}#2`, [
+      { author: 'alice', oid: SHA_1 },
+      { author: 'manki-review', oid: SHA_2, body: 'Approved.\n<!-- manki -->\n<!-- manki-auto-approve -->' },
+    ]);
     await stub.reconcile();
     expect(logged(log, 'reconciler_caught_up')).toEqual([]);
     // No coordinator state is created for a PR that needed nothing.

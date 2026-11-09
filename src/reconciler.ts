@@ -3,7 +3,7 @@ import { createAppJWT } from './app-jwt';
 import { allowedAccounts, type Env } from './env';
 import { githubApi, githubGraphql, isRateLimited, mintRepositoryToken } from './github';
 import { log } from './log';
-import { BOT_LOGIN, BOT_MARKER } from './manki';
+import { BOT_LOGIN, MANKI_COMMENT_MARKER } from './manki';
 import { STALE_COMMENT_MS, type Target } from './routing';
 
 const MINUTE = 60_000;
@@ -409,9 +409,9 @@ export class Reconciler extends DurableObject<Env> {
       const data = await githubGraphql<ReviewsResponse>(mint.token, REVIEWS_QUERY, {
         owner: repo.owner, name: repo.repo, number: pull.number, author: BOT_LOGIN,
       });
-      // Manki's thread replies are reviews of the head too, so only one with Manki's review body counts.
+      // Manki's thread replies are reviews of the head too, with an empty body, so only a marked body counts, as in Manki.
       const reviewed = data.repository?.pullRequest?.reviews.nodes.some((review) =>
-        review.commit?.oid === pull.head.sha && review.body.includes(BOT_MARKER));
+        review.commit?.oid === pull.head.sha && review.body.includes(MANKI_COMMENT_MARKER));
       if (reviewed) {
         this.markChecked(repo, pull);
         continue;
