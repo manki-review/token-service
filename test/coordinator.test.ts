@@ -684,10 +684,14 @@ function fakeGitHub(number: number) {
     /** The base branch's `.manki.yml`, or null when it has none. */
     config: null as string | null,
     configStatus: 200,
-    /** The refs `.manki.yml` was read at, and the check runs created. */
+    /** The refs `.manki.yml` was read at, and the completed check runs created. */
     configReads: [] as string[],
     checkRuns: [] as Array<Record<string, unknown>>,
     checkRunStatus: 201,
+    /** The checks the Worker created as queued, with the status and report they have now. The first gets id 500. */
+    waitingChecks: [] as Array<{ id: number; head_sha: string; status: string; conclusion?: string; output: { title: string; summary: string } }>,
+    /** The status the next reads or edits of a waiting check answer with, in order. Afterwards 200. */
+    waitingCheckStatuses: [] as number[],
     /** Runs while a check-run creation is in flight, before GitHub answers it. */
     onCheckRun: null as (() => void) | null,
     /** Replies the next dispatches get, in order. Afterwards 200 with a new run id. */
@@ -802,7 +806,13 @@ function fakeGitHub(number: number) {
     if (route === `POST ${repo}/check-runs`) {
       state.onCheckRun?.();
       if (state.checkRunStatus !== 201) return Response.json({ message: 'no' }, { status: state.checkRunStatus });
-      state.checkRuns.push(await request.json() as Record<string, unknown>);
+      const created = await request.json() as Record<string, unknown>;
+      if (created.status === 'queued') {
+        const { name: _name, ...waiting } = created as (typeof state.waitingChecks)[number] & { name: string };
+        state.waitingChecks.push({ ...waiting, id: 500 + state.waitingChecks.length });
+        return Response.json({ id: state.waitingChecks.at(-1)!.id }, { status: 201 });
+      }
+      state.checkRuns.push(created);
       return Response.json({ id: 1 }, { status: 201 });
     }
     const dispatched = route.match(new RegExp(`^POST ${repo}/actions/workflows/([^/]+)/dispatches$`));
@@ -838,11 +848,22 @@ function fakeGitHub(number: number) {
       return Response.json({});
     }
     const checksOf = url.pathname.match(new RegExp(`^${repo}/commits/([0-9a-f]+)/check-runs$`));
-    if (checksOf && request.method === 'GET' && url.searchParams.get('check_name') === 'Manki' && url.searchParams.get('status') === 'in_progress') {
+    if (checksOf && request.method === 'GET' && url.searchParams.get('check_name') === 'Manki') {
       const app = url.searchParams.get('app_id');
-      return Response.json({ check_runs: state.openChecks.filter((check) => check.head_sha === checksOf[1] && (app === null || String(check.app_id ?? APP_ID) === app)) });
+      const open = state.openChecks.filter((check) => check.head_sha === checksOf[1] && (app === null || String(check.app_id ?? APP_ID) === app));
+      if (url.searchParams.get('status') === 'in_progress') return Response.json({ check_runs: open });
+      // With `filter=all`, every check of the head: the Worker's reports, its waiting checks and the Action's open ones.
+      const all = [...state.checkRuns, ...state.waitingChecks].filter((check) => check.head_sha === checksOf[1]).length + open.length;
+      return Response.json({ total_count: all, check_runs: [] });
     }
     const check = url.pathname.match(new RegExp(`^${repo}/check-runs/(\\d+)$`));
+    const waiting = check && state.waitingChecks.find((entry) => entry.id === Number(check[1]));
+    if (waiting && state.waitingCheckStatuses.length > 0) return Response.json({ message: 'no' }, { status: state.waitingCheckStatuses.shift() });
+    if (waiting && request.method === 'GET') return Response.json(waiting);
+    if (waiting && request.method === 'PATCH') {
+      Object.assign(waiting, await request.json());
+      return Response.json({});
+    }
     if (check && request.method === 'PATCH') {
       state.checkEdits.push({ id: Number(check[1]), body: await request.json() as Record<string, unknown> });
       state.openChecks = state.openChecks.filter((open) => open.id !== Number(check[1]));
@@ -920,6 +941,7 @@ describe('PrCoordinator dispatch', () => {
       { permissions: { contents: 'read', metadata: 'read' }, repository_ids: [REPOSITORY_ID] },
       { permissions: { pull_requests: 'read' }, repository_ids: [REPOSITORY_ID] },
       { permissions: { actions: 'write' }, repository_ids: [REPOSITORY_ID] },
+      { permissions: { checks: 'write' }, repository_ids: [REPOSITORY_ID] },
     ]);
     const audit = { msg: 'token_minted', purpose: 'coordinator', repository: `${OWNER}/${REPO}`, repository_id: REPOSITORY_ID, installation_id: INSTALLATION_ID };
     expect(logged(log, 'token_minted')).toEqual(github.mints.map(({ permissions }) => ({ ...audit, permissions })));
@@ -1750,6 +1772,258 @@ describe('PrCoordinator dispatch', () => {
     expect(github.mints).toContainEqual({ permissions: { metadata: 'read' }, repository_ids: [REPOSITORY_ID] });
   });
 
+  describe('waiting check', () => {
+    const WAITING = {
+      id: 500, head_sha: SHA_1, status: 'queued',
+      output: { title: 'Waiting for a runner', summary: 'Manki started the review run for `1111111`. It begins when GitHub Actions gives the run a runner.' },
+    };
+    /** A PR whose review of `SHA_1` was dispatched as run 9000, and `/token` as that run asks it, with the body's extra fields. */
+    const dispatched = async () => {
+      const pr = pullRequest();
+      const github = fakeGitHub(pr.number);
+      await pr.send('pull_request', pr.push(SHA_1), 'd-push');
+      await runDurableObjectAlarm(pr.stub);
+      const ask = async (extra: Record<string, unknown> = {}) => {
+        const workflow_ref = `${OWNER}/${REPO}/.github/workflows/manki-dispatch.yml@refs/heads/main`;
+        const token = await oidcToken({ claims: { repository_id: String(REPOSITORY_ID), workflow_ref } });
+        return (await postToken({ token, body: { owner: OWNER, repo: REPO, ...extra } })).json() as Promise<Record<string, unknown>>;
+      };
+      const end = async (conclusion = 'success') => {
+        await pr.stub.runCompleted(key(crypto.randomUUID()), 9000, conclusion);
+        await runDurableObjectAlarm(pr.stub);
+      };
+      return { pr, github, ask, end };
+    };
+
+    it('shows a queued `Manki` check before the dispatch, and hands it to a run that takes it over', async () => {
+      const pr = pullRequest();
+      const github = fakeGitHub(pr.number);
+      // The check is there although GitHub has not taken the dispatch yet.
+      github.dispatchStatuses = [502];
+      await pr.send('pull_request', pr.push(SHA_1), 'd-push');
+      await runDurableObjectAlarm(pr.stub);
+      expect(await workRows(pr.stub)).toMatchObject([{ status: 'dispatching', check_id: 500, check_head: SHA_1 }]);
+      expect(github.waitingChecks).toEqual([WAITING]);
+      expect(github.checkRuns).toEqual([]);
+
+      // The retry dispatches the run and keeps the one check.
+      advanceClock(DISPATCH_BACKOFF_MS[0]);
+      await runDurableObjectAlarm(pr.stub);
+      expect(await workRows(pr.stub)).toMatchObject([{ status: 'running', run_id: 9000, check_id: 500 }]);
+      expect(github.waitingChecks).toHaveLength(1);
+
+      const workflow_ref = `${OWNER}/${REPO}/.github/workflows/manki-dispatch.yml@refs/heads/main`;
+      const token = await oidcToken({ claims: { repository_id: String(REPOSITORY_ID), workflow_ref } });
+      const reply = await (await postToken({ token, body: { owner: OWNER, repo: REPO, takes_over_check: true } })).json();
+      expect(reply).toMatchObject({ token: 'ghs_repo', check_run: { id: 500, head_sha: SHA_1 } });
+      expect(github.waitingChecks).toEqual([WAITING]);
+
+      // The run completes the check it took over, so the Worker leaves it alone and forgets it.
+      Object.assign(github.waitingChecks[0], { status: 'completed', conclusion: 'success', output: { title: 'Approved', summary: 'Looks good' } });
+      await pr.stub.runCompleted(key('d-end'), 9000, 'success');
+      await runDurableObjectAlarm(pr.stub);
+      expect(github.waitingChecks).toMatchObject([{ conclusion: 'success', output: { title: 'Approved' } }]);
+      expect(await workRows(pr.stub)).toMatchObject([{ status: 'done', check_id: null, check_head: null }]);
+    });
+
+    it('ends the waiting check before the token leaves for a run that reports in a check of its own', async () => {
+      const { pr, github, ask, end } = await dispatched();
+      // The token mint that follows the hand-over finds the check ended already.
+      const atMint: string[] = [];
+      const mints = github.mints.length;
+      const fetched = vi.mocked(globalThis.fetch).getMockImplementation()!;
+      vi.mocked(globalThis.fetch).mockImplementation(async (input, init) => {
+        if (new Request(input, init).url.endsWith('/access_tokens') && github.mints.length > mints) atMint.push(github.waitingChecks[0].status);
+        return fetched(input, init);
+      });
+
+      expect(await ask()).not.toHaveProperty('check_run');
+      expect(atMint.at(-1)).toBe('completed');
+      const ended = {
+        ...WAITING, status: 'completed', conclusion: 'cancelled',
+        output: { title: 'Review run started', summary: 'The review reports in a `Manki` check of its own.' },
+      };
+      expect(github.waitingChecks).toEqual([ended]);
+      expect(await workRows(pr.stub)).toMatchObject([{ status: 'running', check_id: null }]);
+
+      // Neither a later token request nor the run's end touches the check again.
+      expect(await ask({ takes_over_check: true })).not.toHaveProperty('check_run');
+      await end();
+      expect(github.waitingChecks).toEqual([ended]);
+
+      // While GitHub fails to end the check, the run gets no token, so it cannot create its own check first.
+      const failing = await dispatched();
+      failing.github.waitingCheckStatuses = [502];
+      expect(await failing.ask()).toMatchObject({ error: 'Token generation failed' });
+      expect(failing.github.waitingChecks).toEqual([WAITING]);
+      expect(await failing.ask()).toMatchObject({ token: 'ghs_repo' });
+      expect(failing.github.waitingChecks).toMatchObject([{ status: 'completed', output: { title: 'Review run started' } }]);
+
+      // A run that ended without its token has no check of its own, and its waiting check says so.
+      const ended502 = await dispatched();
+      ended502.github.waitingCheckStatuses = [502];
+      await ended502.ask();
+      await ended502.end('failure');
+      expect(ended502.github.waitingChecks).toMatchObject([{ status: 'completed', conclusion: 'failure', output: { title: 'Review did not run' } }]);
+    });
+
+    it.each<[string, (github: ReturnType<typeof fakeGitHub>) => void, string, Record<string, string>]>([
+      ['a run that ended without a review', () => {}, 'success', {
+        conclusion: 'cancelled', title: 'Review did not run',
+        summary: "The review run ended without reviewing `1111111`. Tick **Review again** on Manki's settings comment to review it.",
+      }],
+      ['a run that failed before its review', () => {}, 'failure', { conclusion: 'failure', title: 'Review did not run' }],
+      ['a run whose head a newer commit replaced', (github) => { github.head = SHA_2; }, 'success', {
+        conclusion: 'cancelled', title: 'Superseded by a newer commit',
+        summary: '`1111111` is no longer the head of this pull request, so it was not reviewed. Manki reviews the new head.',
+      }],
+      ['a run that took the check over and was cancelled', (github) => { github.waitingChecks[0].status = 'in_progress'; }, 'cancelled', {
+        conclusion: 'cancelled', title: 'Review stopped', summary: 'The run ended before the review finished.',
+      }],
+      ['a run that took the check over and failed', (github) => { github.waitingChecks[0].status = 'in_progress'; }, 'failure', {
+        conclusion: 'failure', title: 'Review stopped',
+      }],
+    ])('ends the waiting check of %s', async (_case, change, conclusion, { conclusion: ended, ...output }) => {
+      const { pr, github, end } = await dispatched();
+      change(github);
+      await end(conclusion);
+      expect(github.waitingChecks).toMatchObject([{ id: 500, status: 'completed', conclusion: ended, output }]);
+      expect(await workRows(pr.stub)).toMatchObject([{ status: 'done', check_id: null }]);
+      // A waiting check never ends as a pass.
+      expect(['success', 'neutral', 'skipped']).not.toContain(github.waitingChecks[0].conclusion);
+    });
+
+    it('ends the waiting check of a review that never got a run: a refused dispatch, no runner, a closed PR', async () => {
+      const refused = pullRequest();
+      const refusedGitHub = fakeGitHub(refused.number);
+      refusedGitHub.dispatchStatuses = [422];
+      await refused.send('pull_request', refused.push(SHA_1));
+      await runDurableObjectAlarm(refused.stub);
+      expect(refusedGitHub.waitingChecks).toMatchObject([{
+        status: 'completed', conclusion: 'failure',
+        output: { title: 'Review could not start', summary: 'Manki could not start the review run of `1111111`: dispatch refused with 422: {"message":"no"}.' },
+      }]);
+
+      // The check waits on through the second dispatch of a run no runner picked up, and times out with it.
+      const stuck = pullRequest();
+      const stuckGitHub = fakeGitHub(stuck.number);
+      await stuck.send('pull_request', stuck.push(SHA_1));
+      await runDurableObjectAlarm(stuck.stub);
+      advanceClock(QUEUED_RUN_TIMEOUT_MS + 1);
+      await runDurableObjectAlarm(stuck.stub);
+      expect(await workRows(stuck.stub)).toMatchObject([{ status: 'running', run_id: 9001, requeues: 1, check_id: 500 }]);
+      expect(stuckGitHub.waitingChecks).toEqual([WAITING]);
+      advanceClock(QUEUED_RUN_TIMEOUT_MS + 1);
+      await runDurableObjectAlarm(stuck.stub);
+      expect(stuckGitHub.waitingChecks).toMatchObject([{
+        status: 'completed', conclusion: 'timed_out',
+        output: { title: 'Review could not start', summary: 'No runner picked up the review run of `1111111` in time.' },
+      }]);
+
+      // A close drops a review still waiting for its dispatch to go through.
+      const closed = pullRequest();
+      const closedGitHub = fakeGitHub(closed.number);
+      closedGitHub.dispatchStatuses = [502];
+      await closed.send('pull_request', closed.push(SHA_1));
+      await runDurableObjectAlarm(closed.stub);
+      await closed.send('pull_request', closed.close(false));
+      await runDurableObjectAlarm(closed.stub);
+      expect(closedGitHub.waitingChecks).toMatchObject([{
+        status: 'completed', conclusion: 'cancelled',
+        output: { title: 'Review not started', summary: 'Manki did not start the review of `1111111`: pull request closed.' },
+      }]);
+    });
+
+    it('creates none on a head that has a `Manki` check, without checks: write or when GitHub fails, and still dispatches', async () => {
+      // The Action's check from an earlier review of the head would be read behind a new one.
+      const reviewed = pullRequest();
+      const reviewedGitHub = fakeGitHub(reviewed.number);
+      reviewedGitHub.openChecks = [{ id: 70, head_sha: SHA_1 }];
+      await reviewed.send('issue_comment', reviewed.comment('@manki review'));
+      await runDurableObjectAlarm(reviewed.stub);
+      expect(reviewedGitHub.waitingChecks).toEqual([]);
+      expect(reviewedGitHub.dispatches).toHaveLength(1);
+      // Another app's check of the same name does not count.
+      const other = pullRequest();
+      const otherGitHub = fakeGitHub(other.number);
+      otherGitHub.openChecks = [{ id: 69, head_sha: SHA_1, app_id: 15368 }];
+      await other.send('pull_request', other.push(SHA_1));
+      await runDurableObjectAlarm(other.stub);
+      expect(otherGitHub.waitingChecks).toHaveLength(1);
+
+      const denied = pullRequest();
+      const deniedGitHub = fakeGitHub(denied.number);
+      deniedGitHub.mintFailures = [{ permission: 'checks', reply: 422 }];
+      await denied.send('pull_request', denied.push(SHA_1));
+      await runDurableObjectAlarm(denied.stub);
+      expect(deniedGitHub.waitingChecks).toEqual([]);
+      expect(await workRows(denied.stub)).toMatchObject([{ status: 'running', check_id: null }]);
+
+      const failing = pullRequest();
+      const failingGitHub = fakeGitHub(failing.number);
+      failingGitHub.checkRunStatus = 502;
+      await failing.send('pull_request', failing.push(SHA_1));
+      await runDurableObjectAlarm(failing.stub);
+      expect(await workRows(failing.stub)).toMatchObject([{ status: 'running', check_id: null }]);
+      expect(logged(log, 'coordinator_waiting_check_failed')).toMatchObject([{ pr: failing.number, error: 'creating the waiting check failed with 502' }]);
+    });
+
+    it('reuses the waiting check of a review dispatched again, for its skip report or on its new head', async () => {
+      const again = async () => {
+        const pr = pullRequest();
+        const github = fakeGitHub(pr.number);
+        await pr.send('pull_request', pr.push(SHA_1));
+        await runDurableObjectAlarm(pr.stub);
+        advanceClock(QUEUED_RUN_TIMEOUT_MS + 1);
+        return { pr, github };
+      };
+      // The run never started, and the PR matches a skip rule by the second dispatch: the one check becomes the skip report.
+      const skipped = await again();
+      Object.assign(skipped.github, { config: 'skip_labels: [no-review]', labels: ['no-review'] });
+      await runDurableObjectAlarm(skipped.pr.stub);
+      await runDurableObjectAlarm(skipped.pr.stub);
+      expect(skipped.github.checkRuns).toEqual([]);
+      expect(skipped.github.waitingChecks).toMatchObject([{ id: 500, status: 'completed', conclusion: 'skipped', output: { title: 'Review skipped' } }]);
+      expect(await workRows(skipped.pr.stub)).toMatchObject([{ status: 'skipped', check_id: null }]);
+
+      // The head moved by the second dispatch: the old head's check ends, and the new head gets its own.
+      const moved = await again();
+      moved.github.head = SHA_2;
+      await runDurableObjectAlarm(moved.pr.stub);
+      await runDurableObjectAlarm(moved.pr.stub);
+      expect(moved.github.waitingChecks).toMatchObject([
+        { id: 500, head_sha: SHA_1, status: 'completed', conclusion: 'cancelled', output: { title: 'Superseded by a newer commit' } },
+        { id: 501, head_sha: SHA_2, status: 'queued', output: { title: 'Waiting for a runner' } },
+      ]);
+      expect(await workRows(moved.pr.stub)).toMatchObject([{ status: 'running', check_id: 501, check_head: SHA_2 }]);
+    });
+
+    it('tries a waiting check GitHub fails to end again and starts no review meanwhile, and forgets one GitHub refuses to show', async () => {
+      const { pr, github, end } = await dispatched();
+      await pr.send('issue_comment', pr.comment('@manki review'));
+      // An alarm pass ends waiting checks before it starts a review and once more at its end, so both tries fail.
+      github.waitingCheckStatuses = [502, 502];
+      await end();
+      expect(github.waitingChecks).toEqual([WAITING]);
+      // The next run could create its own check before this one ends, so it waits.
+      expect(await workRows(pr.stub)).toMatchObject([{ status: 'done', check_id: 500 }, { status: 'queued' }]);
+      expect(github.dispatches).toHaveLength(1);
+      expect(await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm())).toBe(Date.now() + POLL_MS);
+      advanceClock(POLL_MS);
+      await runDurableObjectAlarm(pr.stub);
+      expect(github.waitingChecks).toMatchObject([{ status: 'completed', conclusion: 'cancelled', output: { title: 'Review did not run' } }]);
+      expect(await workRows(pr.stub)).toMatchObject([{ check_id: null }, { status: 'running', check_id: null }]);
+      expect(github.dispatches).toHaveLength(2);
+
+      const gone = await dispatched();
+      gone.github.waitingCheckStatuses = [404];
+      await gone.end();
+      expect(gone.github.waitingChecks).toEqual([WAITING]);
+      expect(await workRows(gone.pr.stub)).toMatchObject([{ status: 'done', check_id: null }]);
+      expect(logged(log, 'coordinator_waiting_check_refused')).toMatchObject([{ pr: gone.pr.number, check_id: 500, status: 404 }]);
+    });
+  });
+
   describe('settings boxes', () => {
     const SETTINGS = 1500;
     const boxes = (ticked: string[] = []) => ['Last reviewed `1111111` · head `1111111` · up to date', '',
@@ -1984,6 +2258,17 @@ describe('PrCoordinator dispatch', () => {
       // With nothing running, a Cancel tick changes nothing.
       await edit([], ['cancel']);
       expect(github.cancels).toEqual([9000, 9001, 9001]);
+
+      // A review cancelled while its run waits for a runner has only its waiting check, which ends as cancelled too.
+      const waiting = setup();
+      await waiting.pr.send('pull_request', waiting.pr.push(SHA_1));
+      await runDurableObjectAlarm(waiting.pr.stub);
+      await waiting.edit([], ['cancel'], 'alice', new Date().toISOString(), progress);
+      expect(waiting.github.waitingChecks).toMatchObject([{
+        id: 500, status: 'completed', conclusion: 'cancelled',
+        output: { title: 'Review not started', summary: 'Manki did not start the review of `1111111`: cancelled by alice, cancel requested.' },
+      }]);
+      expect((await workRows(waiting.pr.stub))[0]).toMatchObject({ check_id: null });
       expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'done', note: 'no review to cancel' });
     });
 

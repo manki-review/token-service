@@ -1,7 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import { dispatchInputs, runTitle } from './dispatch';
 import type { Env } from './env';
-import { githubApi, githubGraphql, hasWriteAccess, isRateLimited, type MintResult, mintRepositoryToken } from './github';
+import { githubApi, githubGraphql, hasWriteAccess, isRateLimited, isRefusal, type MintResult, mintRepositoryToken } from './github';
 import { log } from './log';
 import {
   type BaseConfig, BOT_LOGIN, boxLabels, type BoxChange, cancelledProgress, HELP_REPLY, isMankiGraphqlLogin, isRunningProgress, MANKI_COMMENT_MARKER, MANKI_LOGINS,
@@ -113,6 +113,23 @@ export interface WorkRow extends Record<string, string | number | null> {
   passed_at: number | null;
   /** How often a review read the PR again because GitHub had not computed its mergeability. */
   merge_checks: number;
+  /** The queued `Manki` check the Worker created for the review, and the commit it sits on. Null without one, and once it ended. */
+  check_id: number | null;
+  check_head: string | null;
+  /** 1 once a run that reports in a check of its own started, so the waiting check ends at once. */
+  check_own: number;
+}
+
+/** The waiting `Manki` check of a review, as `/token` names it to the review's run. */
+export interface WaitingCheck {
+  id: number;
+  head_sha: string;
+}
+
+interface CheckReport {
+  conclusion: string;
+  title: string;
+  summary: string;
 }
 
 /** The fields of `GET /repos/{owner}/{repo}/pulls/{number}` a review start reads. */
@@ -280,11 +297,46 @@ export const MIGRATIONS = [
   `ALTER TABLE work ADD COLUMN passed_at INTEGER;`,
   `ALTER TABLE work ADD COLUMN merge_checks INTEGER NOT NULL DEFAULT 0;`,
   `ALTER TABLE work ADD COLUMN run_head TEXT;`,
+  `ALTER TABLE work ADD COLUMN check_id INTEGER;
+   ALTER TABLE work ADD COLUMN check_head TEXT;
+   ALTER TABLE work ADD COLUMN check_own INTEGER NOT NULL DEFAULT 0;`,
 ];
 
 const ACTIVE = `status IN ('dispatching', 'running')`;
+/** A waiting check to end: its review ended, or its run reports in a check of its own. */
+const CHECK_TO_END = `check_id IS NOT NULL AND (check_own = 1 OR NOT (status = 'queued' OR ${ACTIVE}))`;
 /** The event of a review command in a new comment. A settings box review is always an edit, so it never has this event. */
 const REVIEW_COMMAND_EVENT = 'issue_comment.created';
+
+/**
+ * Returns how a waiting check ends once the review of `item` will not complete it. `status` is the check's own, and
+ * `superseded` whether the PR's head left the check's commit. No report passes a required check.
+ */
+function waitingCheckEnd(item: WorkRow, status: string, superseded: boolean): CheckReport {
+  const sha = `\`${item.check_head?.slice(0, 7)}\``;
+  const failed = item.conclusion === 'failure' ? 'failure' : 'cancelled';
+  if (item.check_own && item.status === 'running') {
+    return { conclusion: 'cancelled', title: 'Review run started', summary: 'The review reports in a `Manki` check of its own.' };
+  }
+  if (superseded) {
+    return { conclusion: 'cancelled', title: 'Superseded by a newer commit', summary: `${sha} is no longer the head of this pull request, so it was not reviewed. Manki reviews the new head.` };
+  }
+  if (status !== 'queued') return { conclusion: failed, title: 'Review stopped', summary: 'The run ended before the review finished.' };
+  if (item.status === 'failed') {
+    return { conclusion: 'failure', title: 'Review could not start', summary: `Manki could not start the review run of ${sha}: ${item.note}.` };
+  }
+  if (item.status === 'timed_out') {
+    return { conclusion: 'timed_out', title: 'Review could not start', summary: `No runner picked up the review run of ${sha} in time.` };
+  }
+  if (item.status === 'done') {
+    return {
+      conclusion: failed,
+      title: 'Review did not run',
+      summary: `The review run ended without reviewing ${sha}. Tick **Review again** on Manki's settings comment to review it.`,
+    };
+  }
+  return { conclusion: 'cancelled', title: 'Review not started', summary: `Manki did not start the review of ${sha}: ${item.note ?? 'it was dropped'}.` };
+}
 
 /** The wait before the next try after `errors` failures in a row: 2, 4, 8, then at most 16 minutes. */
 export function backoff(errors: number): number {
@@ -382,6 +434,28 @@ export class PrCoordinator extends DurableObject<Env> {
     const branch = this.getMeta<CachedOptIn>('opt_in')?.repository?.defaultBranch ?? this.target().defaultBranch;
     if (ref !== `refs/heads/${branch}`) return `run ${runId} is not on ${branch}`;
     if (row.run_id === null) this.sql.exec('UPDATE work SET run_id = ? WHERE id = ?', runId, row.id);
+    return null;
+  }
+
+  /**
+   * Returns the waiting `Manki` check of the review that run `runId` is, for a run that takes it over. A run that does
+   * not (`takesOver` false) reports in a check of its own, so its waiting check ends before this returns. Throws when
+   * GitHub fails to end it, so the run gets no token to create its check with: a check that ends after a newer one
+   * could be read ahead of it.
+   */
+  async handOverCheck(runId: number, takesOver: boolean): Promise<WaitingCheck | null> {
+    if (!this.hasState()) return null;
+    this.ensureSchema();
+    const row = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE ${ACTIVE} AND run_id = ? AND check_id IS NOT NULL`, runId).toArray()[0];
+    if (!row?.check_id || !row.check_head) return null;
+    this.sql.exec('UPDATE work SET check_own = ? WHERE id = ?', Number(!takesOver), row.id);
+    if (takesOver) return { id: row.check_id, head_sha: row.check_head };
+    // The alarm tries again when the call below fails.
+    await this.scheduleNext();
+    const target = await this.verifiedTarget();
+    const token = target && await this.token({ checks: 'write' });
+    if (target && token) await this.endWaitingCheck({ ...row, check_own: 1 }, target, token);
+    else this.forgetCheck(row.id);
     return null;
   }
 
@@ -794,6 +868,8 @@ export class PrCoordinator extends DurableObject<Env> {
         const running = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'running'`, lane).toArray()[0];
         if (running && (running.check_at ?? 0) <= now) await this.poll(running);
         if (this.sql.exec(`SELECT 1 FROM work WHERE lane = ? AND ${ACTIVE}`, lane).toArray().length > 0) return;
+        // The next run can create a `Manki` check, and a waiting check that ends after a newer one could be read ahead of it.
+        if (lane === 'state' && this.checksToEnd().length > 0 && !(await this.endWaitingChecks())) return;
         const next = this.nextQueued(lane);
         // A queued item's `check_at` holds it until the dispatch cap allows another run.
         if (!next || (next.check_at ?? 0) > now) return;
@@ -808,6 +884,8 @@ export class PrCoordinator extends DurableObject<Env> {
         log('coordinator_lane_error', { ...this.logFields(), lane, error: String(error) });
       }
     }));
+    // A review that ended in this pass has its waiting check ended at once.
+    await this.endWaitingChecks();
   }
 
   /**
@@ -996,6 +1074,13 @@ export class PrCoordinator extends DurableObject<Env> {
       return;
     }
 
+    if (current.kind === 'review') {
+      await this.showWaiting(current, target).catch((error: unknown) => {
+        log('coordinator_waiting_check_failed', { ...this.logFields(), work_id: item.id, error: error instanceof Error ? error.message : String(error) });
+      });
+      if (!this.isDispatching(item.id)) return;
+    }
+
     const now = Date.now();
     this.sql.exec(
       'UPDATE work SET attempts = attempts + 1, first_attempt_at = COALESCE(first_attempt_at, ?), workflow = ? WHERE id = ?',
@@ -1041,6 +1126,86 @@ export class PrCoordinator extends DurableObject<Env> {
       this.sql.exec(`DELETE FROM meta WHERE key = 'opt_in'`);
       this.finish(item.id, 'failed', `dispatch refused with ${response.status}: ${failure.slice(0, 200)}`);
     }
+  }
+
+  /**
+   * Creates the queued `Manki` check that shows a review of `item.run_head` is ordered, while its run waits for a
+   * runner. A head that has a `Manki` check gets none, since GitHub would read the new check ahead of the verdict the
+   * head shows. A check the review left behind on an earlier head ends first. Throws on a failure.
+   */
+  private async showWaiting(item: WorkRow, target: Target): Promise<void> {
+    const head = item.run_head;
+    if (head === null || item.check_head === head) return;
+    const token = await this.token({ checks: 'write' });
+    if (token === null) return;
+    const repo = `/repos/${target.owner}/${target.repo}`;
+    if (item.check_id !== null) await this.endWaitingCheck(item, target, token, true);
+    const list = await githubApi(token, `${repo}/commits/${head}/check-runs?check_name=Manki&app_id=${this.env.APP_ID}&filter=all&per_page=1`);
+    if (!list.ok) throw new Error(`listing the Manki checks failed with ${list.status}`);
+    if (((await list.json()) as { total_count: number }).total_count > 0) return;
+    const output = {
+      title: 'Waiting for a runner',
+      summary: `Manki started the review run for \`${head.slice(0, 7)}\`. It begins when GitHub Actions gives the run a runner.`,
+    };
+    const created = await githubApi(token, `${repo}/check-runs`, { method: 'POST', body: { name: 'Manki', head_sha: head, status: 'queued', output } });
+    if (!created.ok) throw new Error(`creating the waiting check failed with ${created.status}`);
+    const { id } = await created.json() as { id: number };
+    this.sql.exec('UPDATE work SET check_id = ?, check_head = ?, check_own = 0 WHERE id = ?', id, head, item.id);
+  }
+
+  /** Returns the reviews whose waiting check is still to end. */
+  private checksToEnd(): WorkRow[] {
+    return this.sql.exec<WorkRow>(`SELECT * FROM work WHERE ${CHECK_TO_END}`).toArray();
+  }
+
+  /**
+   * Ends every waiting check whose review ended or whose run reports in a check of its own. A failure is logged and
+   * tried again. Returns whether none is left to end.
+   */
+  private async endWaitingChecks(): Promise<boolean> {
+    const rows = this.checksToEnd();
+    if (rows.length === 0) return true;
+    try {
+      const target = await this.verifiedTarget();
+      const token = target && await this.token({ checks: 'write' });
+      for (const row of rows) {
+        if (target && token) await this.endWaitingCheck(row, target, token);
+        else this.forgetCheck(row.id);
+      }
+      return true;
+    } catch (error) {
+      log('coordinator_waiting_check_failed', { ...this.logFields(), error: error instanceof Error ? error.message : String(error) });
+      return false;
+    }
+  }
+
+  /**
+   * Completes the waiting check of `item` unless its run completed it, and forgets it. Without `superseded`, the PR is
+   * read to see whether its head left the check's commit. A check GitHub refuses to show or change is forgotten too.
+   * Throws on any other failure, which keeps the check for the next try.
+   */
+  private async endWaitingCheck(item: WorkRow, target: Target, token: string, superseded?: boolean): Promise<void> {
+    const repo = `/repos/${target.owner}/${target.repo}`;
+    const call = async (path: string, init?: { method: string; body: unknown }): Promise<Response | null> => {
+      const response = await githubApi(token, path, init);
+      if (response.ok) return response;
+      if (!isRefusal(response, await response.text())) throw new Error(`ending the waiting check failed with ${response.status}`);
+      log('coordinator_waiting_check_refused', { ...this.logFields(), work_id: item.id, check_id: item.check_id, status: response.status });
+      return null;
+    };
+    const read = await call(`${repo}/check-runs/${item.check_id}`);
+    const { status } = read ? await read.json() as { status: string } : { status: 'completed' };
+    if (status !== 'completed') {
+      const pr = superseded === undefined && !item.check_own ? await call(`${repo}/pulls/${target.number}`) : null;
+      const left = superseded ?? (pr !== null && ((await pr.json()) as PullRequestRead).head.sha !== item.check_head);
+      const { conclusion, ...output } = waitingCheckEnd(this.row(item.id) ?? item, status, left);
+      await call(`${repo}/check-runs/${item.check_id}`, { method: 'PATCH', body: { status: 'completed', conclusion, output } });
+    }
+    this.forgetCheck(item.id);
+  }
+
+  private forgetCheck(id: number): void {
+    this.sql.exec('UPDATE work SET check_id = NULL, check_head = NULL, check_own = 0 WHERE id = ?', id);
   }
 
   /**
@@ -1544,17 +1709,23 @@ export class PrCoordinator extends DurableObject<Env> {
     if (!response.ok) throw new Error(`showing the paused push failed with ${response.status}`);
   }
 
-  /** Creates a completed `Manki` check on `head`. Without `checks: write` on the installation, it creates none. */
+  /** Completes a `Manki` check on `head` with `output`. Without `checks: write` on the installation, it creates none. */
   private async completeCheck(
     head: string, conclusion: string, output: { title: string; summary: string }, target: Target, detailsUrl?: string,
   ): Promise<void> {
     const token = await this.token({ checks: 'write' });
     if (token === null) return;
-    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/check-runs`, {
-      method: 'POST',
-      body: { name: 'Manki', head_sha: head, status: 'completed', conclusion, ...(detailsUrl && { details_url: detailsUrl }), output },
-    });
+    const repo = `/repos/${target.owner}/${target.repo}`;
+    const body = { status: 'completed', conclusion, ...(detailsUrl && { details_url: detailsUrl }), output };
+    // The waiting check of the review being started becomes the report, so `head` never gets a second, newer check.
+    const [waiting] = this.sql.exec<{ id: number; check_id: number }>(
+      `SELECT id, check_id FROM work WHERE status = 'dispatching' AND check_id IS NOT NULL AND check_head = ?`, head,
+    ).toArray();
+    const response = waiting
+      ? await githubApi(token, `${repo}/check-runs/${waiting.check_id}`, { method: 'PATCH', body })
+      : await githubApi(token, `${repo}/check-runs`, { method: 'POST', body: { name: 'Manki', head_sha: head, ...body } });
     if (!response.ok) throw new Error(`creating the ${output.title} check failed with ${response.status}`);
+    if (waiting) this.forgetCheck(waiting.id);
   }
 
   private markRunning(item: WorkRow, runId: number | null, note: string): void {
@@ -1782,11 +1953,14 @@ export class PrCoordinator extends DurableObject<Env> {
   private async scheduleNext(): Promise<void> {
     const now = Date.now();
     const times: number[] = [];
+    // A waiting check that could not be ended is tried again, and holds the state lane until then.
+    const checkToEnd = this.checksToEnd().length > 0;
+    if (checkToEnd) times.push(now + POLL_MS);
     for (const lane of LANES) {
       const active = this.sql.exec<{ at: number | null }>(
         `SELECT COALESCE(lease_until, check_at) AS at FROM work WHERE lane = ? AND ${ACTIVE}`, lane,
       ).toArray()[0];
-      const next = active ? undefined : this.nextQueued(lane);
+      const next = active || (checkToEnd && lane === 'state') ? undefined : this.nextQueued(lane);
       if (active?.at) times.push(active.at);
       else if (next) times.push(next.check_at ?? now);
     }

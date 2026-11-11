@@ -12,7 +12,7 @@ Workflows authenticate via [GitHub's OIDC provider](https://docs.github.com/en/a
 4. It answers `429` once the token's account (the `repository_owner_id` claim) has made 120 `/token` and `/state` requests in a minute, counted together per Cloudflare location by the `ACCOUNT_RATE_LIMIT` binding. Then it looks up the App's installation on the repository and answers `404` when there is none. A lookup, found or not, is reused for a minute, so repeated calls for one repository cost no GitHub request. A failed lookup is not reused and answers `500`
 5. Only the run a PR coordinator dispatched gets a token. The OIDC token must carry `event_name`, `workflow_ref`, `ref` and `run_id`. `event_name` must be `workflow_dispatch`, and `workflow_ref` must name a workflow file of the same repository on the run's branch `ref`. The service reads the run with an `actions: read` token (logged as `run_check`) and requires a `workflow_dispatch` run started by `manki-review[bot]` whose title names the PR. That PR's coordinator must hold the run as dispatching or running, from the workflow file it dispatched, on the default branch. A dispatch answered without its run id is matched by the delivery id in the run title, and the coordinator takes the run id. Anything else gets `403` and a `token_refused` log line with the reason, so no other workflow of an allowed repository, such as a branch workflow or a `pull_request` workflow, gets a review or memory token.
 6. It creates a GitHub App JWT and requests an installation token for the requesting repository only (`repository_ids` from the OIDC `repository_id` claim). The token holds only the permissions Manki uses (see `src/permissions.ts`), each at no more than the installation grants. `actions` never goes above `read`. `contents` never goes above `read`, so the run cannot push. GitHub requires `contents: write` to resolve a review thread, so the run resolves threads through `/resolve`. `checks` is capped at `write`, so a review in webhook mode can show a `Manki` check on the PR. An App or installation that grants only `checks: read` gets `read`. Like every other permission, both cover only the requesting repository.
-7. The installation token, its expiry and the permissions GitHub reports for it are returned to the workflow
+7. The installation token, its expiry and the permissions GitHub reports for it are returned to the workflow. For a review whose waiting check the run takes over, the reply also names that check as `check_run: { id, head_sha }` (see [Waiting check](#waiting-check))
 
 ### Audit log
 
@@ -43,6 +43,31 @@ Some decisions need no model, so the coordinator makes them without a run:
 - **Help.** `@manki help` on a PR, in a comment or a review comment, is answered by the coordinator itself with Manki's command table and a thumbs-up on the command. It has its own lane, so it never waits behind a run. Its token holds only `issues: write` and `pull_requests: write` on the one repository. A reply that fails to post is retried with the start backoff.
 - **Write access.** Manki only acts on a comment or submitted review whose sender has write access. The webhook handler settles it before the work is queued, for a comment or review its sender wrote. An `OWNER` has it. Anyone else is looked up with `GET /repos/{owner}/{repo}/collaborators/{login}/permission`, with a `writer_check` token holding `metadata: read`, since a read-only member shows as `MEMBER`, a read-only outside collaborator as `COLLABORATOR`, and a member with private membership as `NONE`, `CONTRIBUTOR` or even `FIRST_TIME_CONTRIBUTOR`. Only `admin` or `write` counts, and a writer counts as trusted too. The answer is reused for 5 minutes per installation, repository and login. A failed lookup counts as no write access and is not reused. A comment or review item still not known as a writer, or an edit of someone else's comment, has its sender looked up again before it starts. Without `admin` or `write` it ends skipped and starts no run. Such an item can neither take over a queued push review nor take on its head, so a refused comment never costs the push its review.
 - **Pause.** While the PR's reported `pause` is set, a review from a push, a ready for review or a catch-up ends skipped. The draft and skip rules above go first, so a draft is still dropped and a PR that matches a skip rule still gets its skipped check. Like them, a pause skips only before the first dispatch attempt, since a later try may find that attempt's run. Everything a person asks for still runs: a settings box review, a review request, thread replies, other commands and review state checks, so resolving the last thread can still lead to an approval. The skipped head gets one `Manki` check, completed as `action_required` with the title "Automatic review paused" and a link to the PR. Its summary gives the reported reason or names the Pause box, and says what reviews the commit: Review again, or unticking Pause when only the box pauses. The Worker also sets the status line of Manki's newest settings comment, among the PR's newest 100 comments, to "automatic review paused, `<sha>` waits". It lists those comments without their bodies, since anyone can fill one, and reads only the bodies of Manki's 5 newest. A settings comment whose review is still in progress belongs to its run and is left alone. The check needs `checks: write` and the comment edit `issues: write` and `pull_requests: write`. A failure in either is logged as `coordinator_paused_report_failed` and the review is still skipped. A check that failed to post is posted by the next skip of that head, such as a catch-up.
+
+### Waiting check
+
+A PR shows nothing of a review until its run reaches a runner, since the run belongs to the default branch. So the coordinator creates the `Manki` check itself, as `queued` with the title "Waiting for a runner", right before it dispatches a review. It does so once the review is certain to start: the PR is open, no draft, skip rule, pause or conflict holds it, and the head is read. A head that already has a `Manki` check of the App gets none, and so does an installation without `checks: write`. A failure to create the check is logged and the review starts without it. A review that waits behind another run of the PR shows no check until its own dispatch.
+
+The run takes the check over. Manki's `/token` request carries `takes_over_check: true`, and the reply names the check and its commit. The Action sets it in progress when it reviews that commit, and completes it with the verdict.
+
+GitHub does not say which of two `Manki` checks on one commit a required check reads when the older one completes last. So a waiting check always ends before another `Manki` check can appear on its head:
+
+- A run whose `/token` request lacks `takes_over_check` is an older Manki, which reports in a check of its own. Its waiting check is completed as `cancelled` ("Review run started") before the token leaves. While GitHub fails that call, `/token` answers `500`, so the run holds no token to create a check with.
+- When a review ends, its waiting check is ended before the next item of the state lane starts. The lane waits while GitHub fails the call, and the alarm tries again every 2 minutes.
+- A skip, pause or conflict report on the head of a review that is dispatched again completes the waiting check instead of creating a second one.
+
+Only the Worker cleans up. A check its run completed is left alone. Any other is completed with one of these, never as `success`, `neutral` or `skipped`, so a required `Manki` check keeps blocking:
+
+| Why the review did not complete the check | Conclusion | Title |
+|---|---|---|
+| The PR's head left the check's commit | `cancelled` | Superseded by a newer commit |
+| The dispatch was refused or failed for good, or no run turned up | `failure` | Review could not start |
+| No runner picked the run up, twice | `timed_out` | Review could not start |
+| The PR closed, or the review was cancelled or dropped, before its run started | `cancelled` | Review not started |
+| The run ended without reviewing the commit | `cancelled`, or `failure` when the run failed | Review did not run |
+| The run took the check over and ended without completing it | `cancelled`, or `failure` when the run failed | Review stopped |
+
+A check GitHub refuses to show or change (`403`, `404`, `422`) is forgotten. A check nothing ended would turn `stale` at GitHub after 14 days.
 
 ### Settings boxes
 
@@ -211,7 +236,7 @@ To rotate the token, create a new one with the same permissions (My Profile, API
 `.github/workflows/log-watch.yml` runs `scripts/log-watch/main.ts` every hour. It reads Workers Logs back to 15 minutes before the start of its last successful run, at least 75 minutes and at most 6 hours, so a late or dropped run leaves no gap. A log query reply without a list of events fails the run rather than reading as a clean window. It looks for these warning signs:
 
 - `coordinator_start_error`.
-- Failed writes of a note or comment: the conflict note, the starting status, a cancelled review's report and the eyes reaction.
+- Failed writes of a note, comment or check: the conflict note, the starting status, a cancelled review's report, the waiting check and the eyes reaction.
 - Runs the safety poll cancelled (`timed_out`) or queued again.
 - Any line with a 5xx status or an error naming one.
 - Work queued over 20 minutes ago that no dispatch, end or close of its PR has followed, looked for over the last 6 hours. That includes a review a settings box queued. Work waiting while its lane on the PR has a run going is not stuck, and work in a lane no routed `webhook` line names waits while any lane of its PR runs. A review held by the hourly cap counts from when the cap releases it.

@@ -35,6 +35,7 @@ const FAILED_WRITES = new Set([
   'coordinator_conflict_note_failed',
   'coordinator_starting_status_failed',
   'coordinator_cancel_report_failed',
+  'coordinator_waiting_check_failed',
   'coordinator_reaction_failed',
   'coordinator_reaction_error',
 ]);

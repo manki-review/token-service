@@ -292,6 +292,7 @@ export function dispatchedEnv(refusal: string | null = null, base: Env = TEST_EN
         checks.push([name, ...args]);
         return refusal;
       },
+      handOverCheck: async () => null,
     }),
   };
   return { env: { ...base, PR_COORDINATOR: coordinators as unknown as Env['PR_COORDINATOR'] }, checks };
