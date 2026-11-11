@@ -57,6 +57,11 @@ export const UNTRUSTED_DISPATCHES_PER_HOUR = 5;
 const TOKEN_EXPIRY_MARGIN_MS = 5 * MINUTE;
 /** How long a looked-up write access is reused for the same login. */
 const WRITER_CACHE_MS = 5 * MINUTE;
+/**
+ * GitHub calls one alarm spends on eyes reactions, next to at most two token mints. The lanes keep the other 30 of the
+ * Free plan's 50 subrequests per invocation.
+ */
+const REACTION_BUDGET = 18;
 /** How long a review waits before each new read of a PR whose mergeability GitHub has not computed yet. */
 const MERGEABILITY_RETRY_MS = [5_000, 15_000];
 /** Marks the Worker's note that a review waits for a rebase. Manki removes it once a review posts. */
@@ -676,7 +681,7 @@ export class PrCoordinator extends DurableObject<Env> {
   /**
    * Adds the eyes reaction to each comment `receive` queued a command or a reply in one of Manki's threads from, so
    * the commenter sees it was received before the run starts. Only a repository that takes dispatches gets one. A
-   * failure is logged and never retried.
+   * failure is logged and never retried. The comments past `REACTION_BUDGET` wait for the next alarm.
    */
   private async react(): Promise<void> {
     const pending = this.getMeta<PendingReaction[]>('reactions');
@@ -691,6 +696,12 @@ export class PrCoordinator extends DurableObject<Env> {
       return;
     }
     if (!target) return;
+    // A reply costs the read of the comment it answers and the reaction, a command the reaction alone.
+    let calls = 0;
+    const cut = pending.findIndex((reaction) => (calls += reaction.repliesTo === undefined ? 1 : 2) > REACTION_BUDGET);
+    const waiting = cut < 0 ? [] : pending.splice(cut);
+    // `receive` may have queued comments during the reads above. They go after the ones that waited longer.
+    if (waiting.length > 0) this.setMeta('reactions', [...waiting, ...(this.getMeta<PendingReaction[]>('reactions') ?? [])]);
     for (const { comments, commentId, repliesTo } of pending) {
       try {
         // A comment on a pull request needs `pull_requests: write` to take a reaction, one on a plain issue `issues: write`.
@@ -1783,6 +1794,8 @@ export class PrCoordinator extends DurableObject<Env> {
     const until = this.retainUntil();
     const pending = this.hasUnfinishedWork();
     if (until !== null && (until > now || !pending)) times.push(until);
+    // Comments still waiting for their reaction wake the alarm at once, since no lane's time stands for them.
+    if (this.getMeta<PendingReaction[]>('reactions')) times.push(now);
     if (times.length > 0) await this.ctx.storage.setAlarm(Math.max(now, Math.min(...times)));
   }
 }
