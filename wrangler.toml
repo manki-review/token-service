@@ -43,6 +43,8 @@ crons = ["*/5 * * * *"]
 
 [vars]
 DISPATCH_ENABLED = "true"
+# Off until a deploy with waiting checks is known good. Turning it off again stops new ones, and open ones still end.
+WAITING_CHECK_ENABLED = "false"
 # The manki-review and dashpay organizations and the xdustinface user.
 WEBHOOK_ACCOUNTS = "270828077,35775977,11511719"
 MEMORY_REPO = "manki-review/review-memory"

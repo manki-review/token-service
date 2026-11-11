@@ -6,6 +6,7 @@ import type { PrCoordinator, WorkRow } from '../src/coordinator';
 import type { Env } from '../src/env';
 import { INSTALLATION_CACHE_MS } from '../src/github';
 import worker from '../src/index';
+import { RECONCILER_NAME } from '../src/reconciler';
 
 export const OIDC_ISSUER = 'https://token.actions.githubusercontent.com';
 export const OIDC_AUDIENCE = 'manki-api.dustinface.me';
@@ -301,4 +302,16 @@ export function dispatchedEnv(refusal: string | null = null, base: Env = TEST_EN
 /** Switches dispatch on or off for the Durable Objects, which read `DISPATCH_ENABLED` from the runtime env. */
 export function setDispatchEnabled(enabled: boolean): void {
   RUNTIME_ENV.DISPATCH_ENABLED = enabled ? 'true' : 'false';
+}
+
+/** Switches waiting checks on or off for the Durable Objects, which read `WAITING_CHECK_ENABLED` from the runtime env. */
+export function setWaitingCheckEnabled(enabled: boolean): void {
+  RUNTIME_ENV.WAITING_CHECK_ENABLED = enabled ? 'true' : 'false';
+}
+
+/** Stores in the registry whether the runs of repository `repositoryId`, opted in, take over a waiting check. */
+export async function setTakesOverCheck(repositoryId: number, takesOver: boolean): Promise<void> {
+  const registry = RUNTIME_ENV.RECONCILER.getByName(RECONCILER_NAME);
+  await registry.recordOptIn({ installationId: INSTALLATION_ID, repositoryId, owner: OWNER, ownerId: OWNER_ID, repo: REPO, defaultBranch: 'main', number: 0 }, true);
+  await registry.recordCheckAbility(repositoryId, takesOver);
 }

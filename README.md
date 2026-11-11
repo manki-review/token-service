@@ -48,13 +48,19 @@ Some decisions need no model, so the coordinator makes them without a run:
 
 A PR shows nothing of a review until its run reaches a runner, since the run belongs to the default branch. So the coordinator creates the `Manki` check itself, as `queued` with the title "Waiting for a runner", right before it dispatches a review. It does so once the review is certain to start: the PR is open, no draft, skip rule, pause or conflict holds it, and the head is read. A head that already has a `Manki` check of the App gets none, and so does an installation without `checks: write`. A failure to create the check is logged and the review starts without it. A review that waits behind another run of the PR shows no check until its own dispatch.
 
+A check that nothing takes over would sit on the commit beside the review's own, so the coordinator creates one only when all of the following is certain. In doubt the review starts without a waiting check:
+
+- `WAITING_CHECK_ENABLED` in `wrangler.toml` is `"true"`. With anything else no waiting check is created, and the open ones still end as described below.
+- The repository's last Manki run said it takes a waiting check over. The coordinator stores what each `/token` request says in the reconciler's opt-in registry (`reconciler_check_ability`), and reads it together with the opt-in, so it is at most 5 minutes old. A repository new to the registry, one recorded before the registry held the answer and a registry call that fails all count as no. A run that takes checks over is believed only once the registry stored it. So the first review after a repository moves to such a Manki gets no waiting check, and the next one does.
+- For a review nobody asked for (a push, a ready for review or a catch-up), the base branch's `.manki.yml` leaves `auto_review` on: there is no file, no `auto_review` key, or `auto_review: true`. With it off the run reviews nothing. Any other value and a file that does not parse count as off. A review someone asked for gets its check whatever `auto_review` says.
+
 The run takes the check over. Manki's `/token` request carries `takes_over_check: true`, and the reply names the check and its commit. The Action sets it in progress when it reviews that commit, and completes it with the verdict.
 
 GitHub does not say which of two `Manki` checks on one commit a required check reads when the older one completes last. So a waiting check always ends before another `Manki` check can appear on its head:
 
-- A run whose `/token` request lacks `takes_over_check` is an older Manki, which reports in a check of its own. Its waiting check is completed as `cancelled` ("Review run started") before the token leaves. While GitHub fails that call, `/token` answers `500`, so the run holds no token to create a check with.
+- A run whose `/token` request lacks `takes_over_check` is an older Manki, which reports in a check of its own. Its waiting check is completed as `cancelled` ("Review run started") before the token leaves. While GitHub fails that call, `/token` answers `500`, so the run holds no token to create a check with. The registry then holds that the repository's runs take no check over, so its later reviews get none. Another PR's coordinator may create one more until it reads the registry again, at most 5 minutes later, and that check is cancelled the same way.
 - When a review ends, its waiting check is ended before the next item of the state lane starts. The lane waits while GitHub fails the call, and the alarm tries again every 2 minutes.
-- A skip, pause or conflict report on the head of a review that is dispatched again completes the waiting check instead of creating a second one.
+- A skip, pause or conflict report on the head of a review that is dispatched again completes the waiting check instead of creating a second one. A check whose create reply was lost (see below) is the exception: the report is a check of its own, and the lost one ends as `cancelled` when the review ends.
 
 Only the Worker cleans up. Naming the check in a `/token` reply hands nothing over: the check stays the Worker's to end until its run has completed it, however often the run asks for a token. A check its run completed is left alone. Any other is completed with one of these, never as `success`, `neutral` or `skipped`, so a required `Manki` check keeps blocking:
 
@@ -67,7 +73,9 @@ Only the Worker cleans up. Naming the check in a `/token` reply hands nothing ov
 | The run ended without reviewing the commit | `cancelled`, or `failure` when the run failed | Review did not run |
 | The run took the check over and ended without completing it | `cancelled`, or `failure` when the run failed | Review stopped |
 
-A check GitHub refuses to show or change (`403`, `404`, `422`) is forgotten. A check nothing ended would turn `stale` at GitHub after 14 days.
+The coordinator stores the check's `external_id`, the delivery id of the review, before it asks GitHub to create the check. A create GitHub refuses (`403`, `404`, `422`) made nothing and is forgotten. After any other failure GitHub may hold a check whose reply was lost. The review then gets no other waiting check, and the Worker looks for the lost one among the App's `Manki` checks of the commit by its `external_id`: when the run asks for its token, on each alarm pass after that, and when the review ends. A check found this way (`coordinator_waiting_check_found`) is ended like any other and never handed to a run, so the run reports in a check of its own. One that GitHub does not list by the end of the review is forgotten.
+
+A check GitHub refuses to show or change (`403`, `404`, `422`) is forgotten and logged as `coordinator_waiting_check_refused`. A check nothing ended would turn `stale` at GitHub after 14 days.
 
 ### Settings boxes
 
@@ -164,7 +172,7 @@ A cron trigger every 5 minutes runs one pass of the `Reconciler` Durable Object,
   - PRs opened by a bot are skipped, as Manki does not review them. A bot's push to a person's PR reaches the coordinator, which records the head as handled. If that delivery was lost, the catch-up cannot tell it from a person's push and reviews the head.
 - Each pass makes at most 40 calls, counting GitHub and coordinator calls together, within the Free plan's 50 subrequests. The next pass resumes with the next repository.
 
-With `DISPATCH_ENABLED` (in `wrangler.toml`) set to anything but `"true"`, the coordinators only log what they would dispatch.
+With `DISPATCH_ENABLED` (in `wrangler.toml`) set to anything but `"true"`, the coordinators only log what they would dispatch. `WAITING_CHECK_ENABLED` switches the [waiting check](#waiting-check) the same way.
 
 ### App events
 

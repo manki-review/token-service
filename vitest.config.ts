@@ -15,8 +15,9 @@ export default defineConfig({
         WEBHOOK_SECRET: 'test-webhook-secret',
         // `OWNER_ID` of `test/helpers.ts`, in place of the real ids in `wrangler.toml`.
         WEBHOOK_ACCOUNTS: '7070',
-        // Pinned so the value in `wrangler.toml` never changes the tests. A test that needs dispatch turns it on.
+        // Pinned so the values in `wrangler.toml` never change the tests. A test that needs dispatch or waiting checks turns them on.
         DISPATCH_ENABLED: 'false',
+        WAITING_CHECK_ENABLED: 'false',
       },
       ratelimits: {
         // Far above what the tests send, so the shared count of the test account never refuses a request.

@@ -4,8 +4,8 @@ import type { Env } from './env';
 import { githubApi, githubGraphql, hasWriteAccess, isRateLimited, isRefusal, type MintResult, mintRepositoryToken } from './github';
 import { log } from './log';
 import {
-  type BaseConfig, BOT_LOGIN, boxLabels, type BoxChange, cancelledProgress, HELP_REPLY, isMankiGraphqlLogin, isRunningProgress, MANKI_COMMENT_MARKER, MANKI_LOGINS,
-  matchSkipRule, parseConfig, REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes, settingsHead, skipRulesOf, withSettingsStatus,
+  autoReviewIsOn, type BaseConfig, BOT_LOGIN, boxLabels, type BoxChange, cancelledProgress, HELP_REPLY, isMankiGraphqlLogin, isRunningProgress, MANKI_COMMENT_MARKER,
+  MANKI_LOGINS, matchSkipRule, parseConfig, REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes, settingsHead, skipRulesOf, withSettingsStatus,
 } from './manki';
 import { type OptIn, readOptIn, type Repository } from './opt-in';
 import type { Permissions } from './permissions';
@@ -116,6 +116,11 @@ export interface WorkRow extends Record<string, string | number | null> {
   /** The queued `Manki` check the Worker created for the review, and the commit it sits on. Null without one, and once it ended. */
   check_id: number | null;
   check_head: string | null;
+  /**
+   * The `external_id` the check was created with, stored before the create. With `check_id` null, GitHub may hold a
+   * check whose create reply never arrived.
+   */
+  check_ref: string | null;
   /** 1 once a run that reports in a check of its own started, so the waiting check ends at once. */
   check_own: number;
 }
@@ -156,6 +161,8 @@ interface PullRequestRead {
 type CachedOptIn = OptIn & {
   expires: number;
   repository: Repository | null;
+  /** Whether the registry holds that the repository's runs take over a waiting check. Unknown counts as false. */
+  takesOverCheck?: boolean;
 };
 
 /** A delivery's id and the SHA-256 of its raw body. A delivery is a replay when either was seen before. */
@@ -299,12 +306,13 @@ export const MIGRATIONS = [
   `ALTER TABLE work ADD COLUMN run_head TEXT;`,
   `ALTER TABLE work ADD COLUMN check_id INTEGER;
    ALTER TABLE work ADD COLUMN check_head TEXT;
+   ALTER TABLE work ADD COLUMN check_ref TEXT;
    ALTER TABLE work ADD COLUMN check_own INTEGER NOT NULL DEFAULT 0;`,
 ];
 
 const ACTIVE = `status IN ('dispatching', 'running')`;
 /** A waiting check to end: its review ended, or its run reports in a check of its own. */
-const CHECK_TO_END = `check_id IS NOT NULL AND (check_own = 1 OR NOT (status = 'queued' OR ${ACTIVE}))`;
+const CHECK_TO_END = `check_ref IS NOT NULL AND (check_own = 1 OR NOT (status = 'queued' OR ${ACTIVE}))`;
 /** The event of a review command in a new comment. A settings box review is always an edit, so it never has this event. */
 const REVIEW_COMMAND_EVENT = 'issue_comment.created';
 
@@ -439,17 +447,19 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /**
    * Returns the waiting `Manki` check of the review that run `runId` is, for a run that takes it over. A run that does
-   * not (`takesOver` false) reports in a check of its own, so its waiting check ends before this returns. Throws when
-   * GitHub fails to end it, so the run gets no token to create its check with: a check that ends after a newer one
-   * could be read ahead of it.
+   * not (`takesOver` false) reports in a check of its own, so its waiting check ends before this returns. So does a
+   * check whose create reply was lost, which no run is told about. Throws when GitHub fails to end it, so the run gets
+   * no token to create its check with: a check that ends after a newer one could be read ahead of it.
    */
   async handOverCheck(runId: number, takesOver: boolean): Promise<WaitingCheck | null> {
     if (!this.hasState()) return null;
     this.ensureSchema();
-    const row = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE ${ACTIVE} AND run_id = ? AND check_id IS NOT NULL`, runId).toArray()[0];
-    if (!row?.check_id || !row.check_head) return null;
-    this.sql.exec('UPDATE work SET check_own = ? WHERE id = ?', Number(!takesOver), row.id);
-    if (takesOver) return { id: row.check_id, head_sha: row.check_head };
+    await this.rememberCheckAbility(takesOver);
+    const row = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE ${ACTIVE} AND run_id = ? AND check_ref IS NOT NULL`, runId).toArray()[0];
+    if (!row?.check_head) return null;
+    const own = !takesOver || row.check_id === null;
+    this.sql.exec('UPDATE work SET check_own = ? WHERE id = ?', Number(own), row.id);
+    if (!own) return { id: row.check_id!, head_sha: row.check_head };
     // The alarm tries again when the call below fails.
     await this.scheduleNext();
     const target = await this.verifiedTarget();
@@ -457,6 +467,24 @@ export class PrCoordinator extends DurableObject<Env> {
     if (target && token) await this.endWaitingCheck({ ...row, check_own: 1 }, target, token);
     else this.forgetCheck(row.id);
     return null;
+  }
+
+  /**
+   * Stores in the registry whether the repository's runs take over a waiting check, when that differs from what this
+   * coordinator last read there. A run that does not is believed at once. One that does counts only once the registry
+   * holds it, so a failed call leaves the repository without waiting checks.
+   */
+  private async rememberCheckAbility(takesOver: boolean): Promise<void> {
+    const cached = this.getMeta<CachedOptIn>('opt_in');
+    if (cached && (cached.takesOverCheck ?? false) === takesOver) return;
+    let stored = false;
+    try {
+      await this.env.RECONCILER.getByName(RECONCILER_NAME).recordCheckAbility(this.target().repositoryId, takesOver);
+      stored = true;
+    } catch (error) {
+      log('coordinator_record_check_ability_error', { ...this.logFields(), error: String(error) });
+    }
+    if (cached && (stored || !takesOver)) this.setMeta('opt_in', { ...cached, takesOverCheck: takesOver } satisfies CachedOptIn);
   }
 
   /** Records a routed delivery and queues its work. A delivery whose id or body was seen before is refused. */
@@ -1047,7 +1075,8 @@ export class PrCoordinator extends DurableObject<Env> {
   private async dispatch(item: WorkRow, workflow: string): Promise<void> {
     const target = await this.verifiedTarget();
     if (!target) throw new Error('the repository could not be read');
-    if (item.kind === 'review' && !(await this.refreshReview(item, target))) return;
+    const review = item.kind === 'review' ? await this.refreshReview(item, target) : undefined;
+    if (review === null) return;
 
     const current = this.row(item.id);
     if (current?.status !== 'dispatching') return;
@@ -1075,7 +1104,7 @@ export class PrCoordinator extends DurableObject<Env> {
     }
 
     if (current.kind === 'review') {
-      await this.showWaiting(current, target).catch((error: unknown) => {
+      await this.showWaiting(current, target, review?.waitingCheck ?? false).catch((error: unknown) => {
         log('coordinator_waiting_check_failed', { ...this.logFields(), work_id: item.id, error: error instanceof Error ? error.message : String(error) });
       });
       if (!this.isDispatching(item.id)) return;
@@ -1130,16 +1159,21 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /**
    * Creates the queued `Manki` check that shows a review of `item.run_head` is ordered, while its run waits for a
-   * runner. A head that has a `Manki` check gets none, since GitHub would read the new check ahead of the verdict the
-   * head shows. A check the review left behind on an earlier head ends first. Throws on a failure.
+   * runner. A check the review left behind on an earlier head ends first. A check is created only when all of this is
+   * certain: `create` allows it, `WAITING_CHECK_ENABLED` is on, the registry holds that the repository's runs take a
+   * waiting check over, and the head has no `Manki` check, since GitHub would read the new check ahead of the verdict
+   * the head shows. Throws on a failure.
    */
-  private async showWaiting(item: WorkRow, target: Target): Promise<void> {
+  private async showWaiting(item: WorkRow, target: Target, create: boolean): Promise<void> {
     const head = item.run_head;
-    if (head === null || item.check_head === head) return;
+    // A check whose create reply was lost is looked for when its run asks for a token and when the review ends. Until then the review gets no other.
+    const lost = item.check_ref !== null && item.check_id === null;
+    if (head === null || item.check_head === head || lost) return;
     const token = await this.token({ checks: 'write' });
     if (token === null) return;
     const repo = `/repos/${target.owner}/${target.repo}`;
     if (item.check_id !== null) await this.endWaitingCheck(item, target, token, true);
+    if (!create || this.env.WAITING_CHECK_ENABLED !== 'true' || this.getMeta<CachedOptIn>('opt_in')?.takesOverCheck !== true) return;
     const list = await githubApi(token, `${repo}/commits/${head}/check-runs?check_name=Manki&app_id=${this.env.APP_ID}&filter=all&per_page=1`);
     if (!list.ok) throw new Error(`listing the Manki checks failed with ${list.status}`);
     if (((await list.json()) as { total_count: number }).total_count > 0) return;
@@ -1147,10 +1181,18 @@ export class PrCoordinator extends DurableObject<Env> {
       title: 'Waiting for a runner',
       summary: `Manki started the review run for \`${head.slice(0, 7)}\`. It begins when GitHub Actions gives the run a runner.`,
     };
-    const created = await githubApi(token, `${repo}/check-runs`, { method: 'POST', body: { name: 'Manki', head_sha: head, status: 'queued', output } });
-    if (!created.ok) throw new Error(`creating the waiting check failed with ${created.status}`);
+    this.sql.exec('UPDATE work SET check_id = NULL, check_head = ?, check_ref = ?, check_own = 0 WHERE id = ?', head, item.delivery, item.id);
+    const created = await githubApi(token, `${repo}/check-runs`, {
+      method: 'POST',
+      body: { name: 'Manki', head_sha: head, status: 'queued', external_id: item.delivery, output },
+    });
+    if (!created.ok) {
+      // A refusal created nothing. After any other failure GitHub may hold the check, so `check_ref` stays to find it by.
+      if (isRefusal(created, await created.text())) this.forgetCheck(item.id);
+      throw new Error(`creating the waiting check failed with ${created.status}`);
+    }
     const { id } = await created.json() as { id: number };
-    this.sql.exec('UPDATE work SET check_id = ?, check_head = ?, check_own = 0 WHERE id = ?', id, head, item.id);
+    this.sql.exec('UPDATE work SET check_id = ? WHERE id = ?', id, item.id);
   }
 
   /** Returns the reviews whose waiting check is still to end. */
@@ -1182,7 +1224,9 @@ export class PrCoordinator extends DurableObject<Env> {
   /**
    * Completes the waiting check of `item` unless its run completed it, and forgets it. Without `superseded`, the PR is
    * read to see whether its head left the check's commit. A check GitHub refuses to show or change is forgotten too.
-   * Throws on any other failure, which keeps the check for the next try.
+   * A check without a stored id, whose create reply was lost, is found by its `external_id` among the `Manki` checks
+   * of its commit, and forgotten when the review ended and GitHub lists none. Throws on any other failure, which keeps
+   * the check for the next try.
    */
   private async endWaitingCheck(item: WorkRow, target: Target, token: string, superseded?: boolean): Promise<void> {
     const repo = `/repos/${target.owner}/${target.repo}`;
@@ -1193,19 +1237,32 @@ export class PrCoordinator extends DurableObject<Env> {
       log('coordinator_waiting_check_refused', { ...this.logFields(), work_id: item.id, check_id: item.check_id, status: response.status });
       return null;
     };
-    const read = await call(`${repo}/check-runs/${item.check_id}`);
+    let id = item.check_id;
+    if (id === null) {
+      const list = await call(`${repo}/commits/${item.check_head}/check-runs?check_name=Manki&app_id=${this.env.APP_ID}&filter=all&per_page=100`);
+      const runs = list ? (await list.json() as { check_runs: Array<{ id: number; external_id: string | null }> }).check_runs : [];
+      id = runs.find((run) => run.external_id === item.check_ref)?.id ?? null;
+      if (id === null) {
+        // GitHub may list a check late, so a review under way is looked at again on the next pass.
+        const review = this.row(item.id);
+        if (!review || !['queued', 'dispatching', 'running'].includes(review.status)) this.forgetCheck(item.id);
+        return;
+      }
+      log('coordinator_waiting_check_found', { ...this.logFields(), work_id: item.id, check_id: id });
+    }
+    const read = await call(`${repo}/check-runs/${id}`);
     const { status } = read ? await read.json() as { status: string } : { status: 'completed' };
     if (status !== 'completed') {
       const pr = superseded === undefined && !item.check_own ? await call(`${repo}/pulls/${target.number}`) : null;
       const left = superseded ?? (pr !== null && ((await pr.json()) as PullRequestRead).head.sha !== item.check_head);
       const { conclusion, ...output } = waitingCheckEnd(this.row(item.id) ?? item, status, left);
-      await call(`${repo}/check-runs/${item.check_id}`, { method: 'PATCH', body: { status: 'completed', conclusion, output } });
+      await call(`${repo}/check-runs/${id}`, { method: 'PATCH', body: { status: 'completed', conclusion, output } });
     }
     this.forgetCheck(item.id);
   }
 
   private forgetCheck(id: number): void {
-    this.sql.exec('UPDATE work SET check_id = NULL, check_head = NULL, check_own = 0 WHERE id = ?', id);
+    this.sql.exec('UPDATE work SET check_id = NULL, check_head = NULL, check_ref = NULL, check_own = 0 WHERE id = ?', id);
   }
 
   /**
@@ -1536,32 +1593,38 @@ export class PrCoordinator extends DurableObject<Env> {
     this.finish(item.id, 'done', 'answered help');
   }
 
-  /** Re-reads the PR before a review starts. Returns false when the review was dropped. */
-  private async refreshReview(item: WorkRow, target: Target): Promise<boolean> {
+  /**
+   * Re-reads the PR before a review starts. Returns null when the review does not start now, and otherwise whether its
+   * run may get a waiting check.
+   */
+  private async refreshReview(item: WorkRow, target: Target): Promise<{ waitingCheck: boolean } | null> {
     const token = await this.token({ pull_requests: 'read' });
     if (token === null) throw new Error('could not mint a token to read the pull request');
     const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/pulls/${target.number}`);
     if (!response.ok) throw new Error(`reading the pull request failed with ${response.status}`);
     const pr = await response.json() as PullRequestRead;
-    if (!this.isDispatching(item.id)) return false;
+    if (!this.isDispatching(item.id)) return null;
     if (pr.state !== 'open') {
       this.finish(item.id, 'dropped', 'pull request closed');
-      return false;
+      return null;
     }
+    let waitingCheck = true;
     if (item.event.startsWith('pull_request.')) {
       // A retry after a dispatch attempt may find that attempt's run, so only the first attempt can drop or skip.
       const first = item.attempts === 0;
       const config = first ? await this.baseConfig(pr, target) : null;
-      if (!this.isDispatching(item.id)) return false;
+      if (!this.isDispatching(item.id)) return null;
+      // With `auto_review` off the run of a push reviews nothing, so only a config read as leaving it on allows the check.
+      waitingCheck = first && autoReviewIsOn(config);
       // A draft is reviewed on request, such as by its settings box, unless the base config reviews drafts.
       if (first && pr.draft && !reviewsDrafts(config)) {
         this.finish(item.id, 'dropped', 'pull request is a draft');
-        return false;
+        return null;
       }
       const rule = first ? this.skipRule(config, pr, item.head_sha, item.sender, target) : null;
       if (rule !== null) {
         await this.reportSkipped(pr.head.sha, rule, target);
-        if (!this.isDispatching(item.id)) return false;
+        if (!this.isDispatching(item.id)) return null;
       }
       // Who pushed a newer head is unknown, so its sender goes with the queued head, also for a retry after a failure.
       this.sql.exec(
@@ -1570,7 +1633,7 @@ export class PrCoordinator extends DurableObject<Env> {
       );
       if (rule !== null) {
         this.finish(item.id, 'skipped', `matches the skip rule for ${rule}`, 'skipped');
-        return false;
+        return null;
       }
       // Only a review nobody asked for waits out a pause. A request, a reply or a settings box review still runs.
       const paused = () => {
@@ -1579,11 +1642,11 @@ export class PrCoordinator extends DurableObject<Env> {
       };
       if (first && paused()) {
         await this.reportPaused(pr, target);
-        if (!this.isDispatching(item.id)) return false;
+        if (!this.isDispatching(item.id)) return null;
         // An untick applied meanwhile saw this review in flight and queued none, so the review goes on.
         if (paused()) {
           this.finish(item.id, 'skipped', PAUSED_NOTE);
-          return false;
+          return null;
         }
       }
     }
@@ -1597,16 +1660,16 @@ export class PrCoordinator extends DurableObject<Env> {
           Date.now() + MERGEABILITY_RETRY_MS[item.merge_checks], item.id,
         );
         log('coordinator_mergeability_pending', { ...this.logFields(), work_id: item.id, merge_checks: item.merge_checks + 1 });
-        return false;
+        return null;
       }
       if (conflict) {
         await this.reportConflict(pr, target);
         if (this.isDispatching(item.id)) this.finish(item.id, 'skipped', `conflicts with ${pr.base.ref}`, 'conflict');
-        return false;
+        return null;
       }
     }
     this.sql.exec('UPDATE work SET run_head = ? WHERE id = ?', pr.head.sha, item.id);
-    return true;
+    return { waitingCheck };
   }
 
   /**
@@ -1643,14 +1706,15 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Reads `.manki.yml` from the PR's base branch, so a PR cannot change what applies to itself. A missing, oversized or
-   * unparsable file gives null, which sets nothing, as in Manki.
+   * Reads `.manki.yml` from the PR's base branch, so a PR cannot change what applies to itself. A missing file gives an
+   * empty config. A file that cannot be read, is oversized or does not parse gives null. Neither sets anything, as in
+   * Manki.
    */
   private async baseConfig(pr: PullRequestRead, target: Target): Promise<BaseConfig> {
     const token = await this.token({ contents: 'read', metadata: 'read' });
     if (token === null) return null;
     const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/contents/.manki.yml?ref=${encodeURIComponent(pr.base.ref)}`);
-    if (response.status === 404) return null;
+    if (response.status === 404) return {};
     if (!response.ok) throw new Error(`reading .manki.yml failed with ${response.status}`);
     const file = await response.json() as { type?: string; size?: number; encoding?: string; content?: string };
     if (file.type !== 'file' || file.encoding !== 'base64' || file.content === undefined || (file.size ?? 0) > MAX_CONFIG_BYTES) return null;
@@ -1918,6 +1982,7 @@ export class PrCoordinator extends DurableObject<Env> {
     if (!mint.ok && !mint.refused) throw new Error(`token mint failed with ${mint.status}`);
     let repository: Repository | null = null;
     let optIn: OptIn;
+    let takesOverCheck = false;
     if (!mint.ok) {
       optIn = { optedIn: false, reason: `token mint refused with ${mint.status}` };
     } else {
@@ -1931,22 +1996,26 @@ export class PrCoordinator extends DurableObject<Env> {
         repository = { owner: repo.owner.login, ownerId: repo.owner.id, repo: repo.name, defaultBranch: repo.default_branch };
         optIn = await readOptIn(mint.token, repository);
       }
-      await this.reportOptIn(repository === null ? target : { ...target, ...repository }, optIn.optedIn);
+      takesOverCheck = await this.reportOptIn(repository === null ? target : { ...target, ...repository }, optIn.optedIn);
     }
     log('coordinator_opt_in', { ...this.logFields(), opted_in: optIn.optedIn, reason: optIn.reason });
     if (optIn.optedIn && optIn.others) {
       log('coordinator_opt_in_warning', { ...this.logFields(), workflow: optIn.workflow, ignored: optIn.others, reason: 'several dispatch workflows qualify' });
     }
-    this.setMeta('opt_in', { ...optIn, expires: Date.now() + OPT_IN_TTL_MS, repository } satisfies CachedOptIn);
+    this.setMeta('opt_in', { ...optIn, expires: Date.now() + OPT_IN_TTL_MS, repository, takesOverCheck } satisfies CachedOptIn);
     return optIn;
   }
 
-  /** Tells the reconciler what the opt-in read found. A failure is logged and never blocks the coordinator. */
-  private async reportOptIn(target: Target, optedIn: boolean): Promise<void> {
+  /**
+   * Tells the reconciler what the opt-in read found, and returns whether it holds that the repository's runs take over
+   * a waiting check. A failure is logged, never blocks the coordinator and counts as false.
+   */
+  private async reportOptIn(target: Target, optedIn: boolean): Promise<boolean> {
     try {
-      await this.env.RECONCILER.getByName(RECONCILER_NAME).recordOptIn(target, optedIn);
+      return await this.env.RECONCILER.getByName(RECONCILER_NAME).recordOptIn(target, optedIn);
     } catch (error) {
       log('coordinator_record_opt_in_error', { ...this.logFields(), error: String(error) });
+      return false;
     }
   }
 
