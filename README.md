@@ -56,13 +56,13 @@ GitHub does not say which of two `Manki` checks on one commit a required check r
 - When a review ends, its waiting check is ended before the next item of the state lane starts. The lane waits while GitHub fails the call, and the alarm tries again every 2 minutes.
 - A skip, pause or conflict report on the head of a review that is dispatched again completes the waiting check instead of creating a second one.
 
-Only the Worker cleans up. A check its run completed is left alone. Any other is completed with one of these, never as `success`, `neutral` or `skipped`, so a required `Manki` check keeps blocking:
+Only the Worker cleans up. Naming the check in a `/token` reply hands nothing over: the check stays the Worker's to end until its run has completed it, however often the run asks for a token. A check its run completed is left alone. Any other is completed with one of these, never as `success`, `neutral` or `skipped`, so a required `Manki` check keeps blocking:
 
 | Why the review did not complete the check | Conclusion | Title |
 |---|---|---|
 | The PR's head left the check's commit | `cancelled` | Superseded by a newer commit |
 | The dispatch was refused or failed for good, or no run turned up | `failure` | Review could not start |
-| No runner picked the run up, twice | `timed_out` | Review could not start |
+| The Worker cancelled the run: no runner picked it up, twice, or it ran past its timeout | `timed_out` | Review timed out |
 | The PR closed, or the review was cancelled or dropped, before its run started | `cancelled` | Review not started |
 | The run ended without reviewing the commit | `cancelled`, or `failure` when the run failed | Review did not run |
 | The run took the check over and ended without completing it | `cancelled`, or `failure` when the run failed | Review stopped |

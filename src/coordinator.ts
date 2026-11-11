@@ -326,7 +326,7 @@ function waitingCheckEnd(item: WorkRow, status: string, superseded: boolean): Ch
     return { conclusion: 'failure', title: 'Review could not start', summary: `Manki could not start the review run of ${sha}: ${item.note}.` };
   }
   if (item.status === 'timed_out') {
-    return { conclusion: 'timed_out', title: 'Review could not start', summary: `No runner picked up the review run of ${sha} in time.` };
+    return { conclusion: 'timed_out', title: 'Review timed out', summary: `Manki stopped the review run of ${sha}: ${item.note}.` };
   }
   if (item.status === 'done') {
     return {
