@@ -77,6 +77,11 @@ export interface Work {
    */
   acknowledge: boolean;
   /**
+   * For a thread reply that is no command, the id of the review comment it answers. A writer's reply gets the eyes
+   * reaction as soon as it is queued, once that comment is known to start one of Manki's threads.
+   */
+  repliesTo?: number;
+  /**
    * Whether someone with write access caused the work: a push to a branch of the repository, a thread resolved on a
    * same-repository PR, a dismissed review, or a comment or review by an `OWNER`. For a `MEMBER` or `COLLABORATOR` it
    * is what the payload claims until `checkWriter` is settled.
@@ -356,7 +361,10 @@ function routeReviewComment(target: Target, payload: WebhookPayload): Route {
   if (!comment?.in_reply_to_id && !hasBotMention(body)) return ignore('comment is neither a reply nor a mention');
   if (parseCommandType(body) === 'help') return helpRoute(target, payload, 'pull_request_review_comment');
   // Every thread command ends with Manki's auto-approve check, so none may run beside a review.
-  return { type: 'work', target, work: work('state', 'thread', payload, 'pull_request_review_comment', comment?.id ?? null) };
+  const thread = work('state', 'thread', payload, 'pull_request_review_comment', comment?.id ?? null);
+  // A reply with a mention is a command, which `acknowledge` covers.
+  const repliesTo = hasBotMention(body) ? undefined : comment?.in_reply_to_id;
+  return { type: 'work', target, work: repliesTo === undefined ? thread : { ...thread, repliesTo } };
 }
 
 function routeIssueComment(target: Target, payload: WebhookPayload): Route {
