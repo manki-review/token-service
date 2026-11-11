@@ -60,6 +60,8 @@ import {
 const SHA_1 = '1'.repeat(40);
 const SHA_2 = '2'.repeat(40);
 /** The first comment of a review thread Manki started. */
+/** The Free plan's subrequests per invocation, which one alarm must stay under. */
+const SUBREQUEST_LIMIT = 50;
 const MANKI_THREAD = { user: { login: 'manki-review[bot]' }, body: 'The sum can overflow.\n\n<!-- manki-finding -->' };
 const SHA_3 = '3'.repeat(40);
 const SHA_4 = '4'.repeat(40);
@@ -951,6 +953,37 @@ describe('PrCoordinator dispatch', () => {
 
     await runDurableObjectAlarm(pr.stub);
     expect(github.reactions).toHaveLength(3);
+  });
+
+  it('reacts to as many comments as one alarm\'s budget allows, dispatches meanwhile, and leaves the rest to later alarms', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    github.reviewComments.set(1, MANKI_THREAD);
+    github.reactionStatus.pulls = 403;
+    const fetches = vi.mocked(fetch).mock.calls;
+    const alarmAt = () => runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm());
+    await pr.send('issue_comment', pr.comment('@manki explain'));
+    const replies = Array.from({ length: 30 }, (_, index) => 1001 + index);
+    for (const id of replies) await pr.send('pull_request_review_comment', pr.reply('Fixed', { id }));
+
+    await runDurableObjectAlarm(pr.stub);
+    // The command's reaction is one call, and each reply's read and reaction are two.
+    expect(github.reactions).toEqual(['issues/1001', ...replies.slice(0, 8).map((id) => `pulls/${id}`)]);
+    expect(github.dispatches.map((dispatch) => dispatch.inputs.event).sort()).toEqual(['issue_comment', 'pull_request_review_comment']);
+    expect(fetches.length).toBeLessThanOrEqual(SUBREQUEST_LIMIT);
+    expect(await alarmAt()).toBe(Date.now());
+
+    // A refused reaction is not tried again, and the comments that waited still get theirs.
+    github.reactionStatus.pulls = 201;
+    for (let alarm = 0; alarm < 3; alarm++) {
+      const before = fetches.length;
+      await runDurableObjectAlarm(pr.stub);
+      expect(fetches.length - before).toBeLessThanOrEqual(SUBREQUEST_LIMIT);
+    }
+    expect(github.reactions).toEqual(['issues/1001', ...replies.map((id) => `pulls/${id}`)]);
+    expect(logged(log, 'coordinator_reaction_failed').map((entry) => entry.comment_id)).toEqual(replies.slice(0, 8));
+    expect(github.dispatches).toHaveLength(2);
+    expect(await alarmAt()).toBeGreaterThan(Date.now());
   });
 
   it('reacts to no outsider, to no reply in a thread that is not certainly Manki\'s, and to nothing without dispatch', async () => {
