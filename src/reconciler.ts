@@ -39,6 +39,8 @@ interface OptInRow extends Record<string, string | number | null> {
   repo: string;
   default_branch: string;
   opted_in_at: number;
+  /** 1 while the repository's last Manki run said it takes over a waiting check. 0 until a run says so. */
+  takes_over_check: number;
 }
 
 interface HookDelivery {
@@ -123,6 +125,9 @@ export class Reconciler extends DurableObject<Env> {
     )`);
     const columns = this.sql.exec<{ name: string }>(`SELECT name FROM pragma_table_info('opt_ins')`).toArray();
     if (!columns.some((column) => column.name === 'owner_id')) this.sql.exec('ALTER TABLE opt_ins ADD COLUMN owner_id INTEGER');
+    if (!columns.some((column) => column.name === 'takes_over_check')) {
+      this.sql.exec('ALTER TABLE opt_ins ADD COLUMN takes_over_check INTEGER NOT NULL DEFAULT 0');
+    }
     // One row per delivery GUID a scan found failed, or `done` once any attempt of it succeeded.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS failed_deliveries (
       guid TEXT PRIMARY KEY,
@@ -145,25 +150,39 @@ export class Reconciler extends DurableObject<Env> {
 
   /**
    * Records what a coordinator's opt-in check found. The first sighting of the dispatch workflow sets `opted_in_at`,
-   * later ones keep it. Opting out forgets the repository, so opting in again starts a new timestamp.
+   * later ones keep it. Opting out forgets the repository, so opting in again starts a new timestamp. Returns whether
+   * the repository's runs take over a waiting check, as `recordCheckAbility` last stored it.
    */
-  async recordOptIn(target: Target, optedIn: boolean): Promise<void> {
+  async recordOptIn(target: Target, optedIn: boolean): Promise<boolean> {
     if (!optedIn) {
       if (this.sql.exec('DELETE FROM opt_ins WHERE repository_id = ? RETURNING repository_id', target.repositoryId).toArray().length > 0) {
         log('reconciler_opted_out', { repository_id: target.repositoryId, repo: `${target.owner}/${target.repo}` });
       }
-      return;
+      return false;
     }
     const now = Date.now();
-    const optedInAt = this.sql.exec<{ opted_in_at: number }>(
+    const row = this.sql.exec<{ opted_in_at: number; takes_over_check: number }>(
       `INSERT INTO opt_ins (repository_id, installation_id, owner, owner_id, repo, default_branch, opted_in_at) VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (repository_id) DO UPDATE SET
          installation_id = excluded.installation_id, owner = excluded.owner, owner_id = excluded.owner_id, repo = excluded.repo,
          default_branch = excluded.default_branch
-       RETURNING opted_in_at`,
+       RETURNING opted_in_at, takes_over_check`,
       target.repositoryId, target.installationId, target.owner, target.ownerId, target.repo, target.defaultBranch, now,
-    ).one().opted_in_at;
-    if (optedInAt === now) log('reconciler_opted_in', { repository_id: target.repositoryId, repo: `${target.owner}/${target.repo}` });
+    ).one();
+    if (row.opted_in_at === now) log('reconciler_opted_in', { repository_id: target.repositoryId, repo: `${target.owner}/${target.repo}` });
+    return row.takes_over_check === 1;
+  }
+
+  /**
+   * Records whether the last Manki run of an opted-in repository said it takes over a waiting check. A repository that
+   * is not opted in keeps no answer.
+   */
+  async recordCheckAbility(repositoryId: number, takesOver: boolean): Promise<void> {
+    const changed = this.sql.exec(
+      'UPDATE opt_ins SET takes_over_check = ? WHERE repository_id = ? AND takes_over_check != ? RETURNING repository_id',
+      Number(takesOver), repositoryId, Number(takesOver),
+    ).toArray().length > 0;
+    if (changed) log('reconciler_check_ability', { repository_id: repositoryId, takes_over_check: takesOver });
   }
 
   /**

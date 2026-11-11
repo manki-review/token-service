@@ -419,6 +419,8 @@ describe('Reconciler redelivery', () => {
       const upgraded = new Reconciler(state, RUNTIME_ENV);
       await upgraded.reconcile();
       expect(state.storage.sql.exec('SELECT owner_id, opted_in_at FROM opt_ins').toArray()).toEqual([{ owner_id: OWNER_ID, opted_in_at: optedInAt }]);
+      // A row from before the registry held the answer says that no run takes over a waiting check.
+      expect(await upgraded.recordOptIn(target, true)).toBe(false);
       expect(logged(log, 'reconciler_owner_backfilled')).toEqual([expect.objectContaining({ repository_id: target.repositoryId, owner_id: OWNER_ID })]);
       expect(github.redelivered).toEqual([1]);
       expect(github.pullListCalls).toEqual([target.repo]);
@@ -505,6 +507,30 @@ describe('Reconciler redelivery', () => {
     expect(await optedInAt()).toBeNull();
     await stub.recordOptIn(target, true);
     expect(await optedInAt()).toBe(start + MINUTE);
+  });
+
+  it('remembers whether a repository\'s runs take over a waiting check, until it opts out', async () => {
+    const { stub, repo } = setup();
+    const target = repo();
+    // Nothing is known of a new repository, and none is stored for one that is not opted in.
+    await stub.recordCheckAbility(target.repositoryId, true);
+    expect(await stub.recordOptIn(target, true)).toBe(false);
+
+    await stub.recordCheckAbility(target.repositoryId, true);
+    await stub.recordCheckAbility(target.repositoryId, true);
+    expect(await stub.recordOptIn(target, true)).toBe(true);
+    expect(await stub.recordOptIn(repo(), true)).toBe(false);
+    await stub.recordCheckAbility(target.repositoryId, false);
+    expect(await stub.recordOptIn(target, true)).toBe(false);
+    expect(logged(log, 'reconciler_check_ability')).toEqual([
+      expect.objectContaining({ repository_id: target.repositoryId, takes_over_check: true }),
+      expect.objectContaining({ repository_id: target.repositoryId, takes_over_check: false }),
+    ]);
+
+    // An opt-out forgets the answer.
+    await stub.recordCheckAbility(target.repositoryId, true);
+    expect(await stub.recordOptIn(target, false)).toBe(false);
+    expect(await stub.recordOptIn(target, true)).toBe(false);
   });
 });
 
