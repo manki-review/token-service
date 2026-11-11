@@ -244,7 +244,7 @@ To rotate the token, create a new one with the same permissions (My Profile, API
 `.github/workflows/log-watch.yml` runs `scripts/log-watch/main.ts` every hour. It reads Workers Logs back to 15 minutes before the start of its last successful run, at least 75 minutes and at most 6 hours, so a late or dropped run leaves no gap. A log query reply without a list of events fails the run rather than reading as a clean window. It looks for these warning signs:
 
 - `coordinator_start_error`.
-- Failed writes of a note, comment or check: the conflict note, the starting status, a cancelled review's report, the waiting check and the eyes reaction.
+- Failed writes of a note, comment or check: the conflict note, the starting status, a cancelled review's report, the waiting check and the eyes reaction. A waiting check GitHub forbids the Worker to end (`coordinator_waiting_check_refused` with `403`) counts too, since it stays queued on its commit.
 - Runs the safety poll cancelled (`timed_out`) or queued again.
 - Any line with a 5xx status or an error naming one.
 - Work queued over 20 minutes ago that no dispatch, end or close of its PR has followed, looked for over the last 6 hours. That includes a review a settings box queued. Work waiting while its lane on the PR has a run going is not stuck, and work in a lane no routed `webhook` line names waits while any lane of its PR runs. A review held by the hourly cap counts from when the cap releases it.
