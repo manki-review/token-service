@@ -59,6 +59,8 @@ import {
 
 const SHA_1 = '1'.repeat(40);
 const SHA_2 = '2'.repeat(40);
+/** The first comment of a review thread Manki started. */
+const MANKI_THREAD = { user: { login: 'manki-review[bot]' }, body: 'The sum can overflow.\n\n<!-- manki-finding -->' };
 const SHA_3 = '3'.repeat(40);
 const SHA_4 = '4'.repeat(40);
 const SHA_5 = '5'.repeat(40);
@@ -87,7 +89,7 @@ function pullRequest() {
     review: () => reviewEvent('submitted', {}, { number }),
     outsiderReview: (id = 3003) => reviewEvent('submitted', { id, author_association: 'NONE' }, { number }),
     resolve: (action = 'resolved') => reviewThreadEvent(action, { number }),
-    reply: (body: string) => reviewCommentEvent(body, { in_reply_to_id: 1 }, 'created', { number }),
+    reply: (body: string, comment: Record<string, unknown> = {}) => reviewCommentEvent(body, { in_reply_to_id: 1, ...comment }, 'created', { number }),
     close: (merged: boolean) => pullRequestEvent('closed', { number, merged }),
     async send(event: string, payload: WebhookPayload, delivery: string = crypto.randomUUID()) {
       const route = routeDelivery(event, payload);
@@ -720,6 +722,10 @@ function fakeGitHub(number: number) {
     /** Manki's comments by id, which a revert reads and edits, the author of any comment not Manki's, and the status of the GraphQL list. */
     issueComments: new Map<number, string>(),
     commentAuthors: new Map<number, string>(),
+    /** The review comments a reply answers, by id, and the status of their read. Any other id reads as a person's comment. */
+    reviewComments: new Map<number, { user?: { login: string }; body?: string; in_reply_to_id?: number }>(),
+    reviewCommentStatus: 200,
+    reviewCommentReads: [] as number[],
     /** When a comment was posted, by default at the request. */
     commentCreated: new Map<number, string>(),
     commentListStatus: 200,
@@ -840,6 +846,12 @@ function fakeGitHub(number: number) {
       state.openChecks = state.openChecks.filter((open) => open.id !== Number(check[1]));
       return Response.json({});
     }
+    const reviewComment = url.pathname.match(new RegExp(`^${repo}/pulls/comments/(\\d+)$`));
+    if (reviewComment && request.method === 'GET') {
+      const id = Number(reviewComment[1]);
+      state.reviewCommentReads.push(id);
+      return Response.json(state.reviewComments.get(id) ?? { user: { login: 'bob' }, body: 'Why not a map?' }, { status: state.reviewCommentStatus });
+    }
     const reaction = url.pathname.match(new RegExp(`^${repo}/(issues|pulls)/comments/(\\d+)/reactions$`));
     if (reaction && request.method === 'POST') {
       const { content } = await request.json() as { content: string };
@@ -912,9 +924,10 @@ describe('PrCoordinator dispatch', () => {
     expect(log.mock.calls.flat().join('\n')).not.toContain('ghs_repo');
   });
 
-  it('reacts to a queued command at once, with a token for that kind of comment alone', async () => {
+  it('reacts to a queued command and to a reply in a Manki thread at once, with a token for that kind of comment alone', async () => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
+    github.reviewComments.set(1, MANKI_THREAD);
     await pr.send('pull_request', pr.push(SHA_1));
     await runDurableObjectAlarm(pr.stub);
     github.mints = [];
@@ -922,27 +935,50 @@ describe('PrCoordinator dispatch', () => {
     await pr.send('issue_comment', pr.comment('@manki review'));
     await pr.send('issue_comment', pr.comment('@manki review this', 'edited'));
     await pr.send('pull_request_review_comment', reviewCommentEvent('@manki is this safe?', {}, 'created', { number: pr.number }));
+    // The review of the push still runs, and the reply names no command.
+    await pr.send('pull_request_review_comment', pr.reply('Fixed', { id: 1002 }));
     await runDurableObjectAlarm(pr.stub);
 
-    expect(github.reactions).toEqual(['issues/1001', 'pulls/1001']);
+    expect(github.reactions).toEqual(['issues/1001', 'pulls/1001', 'pulls/1002']);
+    // Only the plain reply reads the comment it answers, with the token its reaction takes.
+    expect(github.reviewCommentReads).toEqual([1]);
     expect(github.mints).toEqual([
       { permissions: { issues: 'write', pull_requests: 'write' }, repository_ids: [REPOSITORY_ID] },
       { permissions: { pull_requests: 'write' }, repository_ids: [REPOSITORY_ID] },
     ]);
     expect(github.dispatches).toHaveLength(1);
-    expect((await workRows(pr.stub)).map((row) => row.status)).toEqual(['running', 'queued', 'queued']);
+    expect((await workRows(pr.stub)).map((row) => row.status)).toEqual(['running', 'queued', 'queued', 'queued']);
 
     await runDurableObjectAlarm(pr.stub);
-    expect(github.reactions).toHaveLength(2);
+    expect(github.reactions).toHaveLength(3);
   });
 
-  it('reacts to no outsider, to no reply without a mention, and to nothing without dispatch', async () => {
+  it('reacts to no outsider, to no reply in a thread that is not certainly Manki\'s, and to nothing without dispatch', async () => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
+    github.reviewComments.set(1, MANKI_THREAD);
     await pr.send('issue_comment', pr.outsiderComment('@manki review'));
-    await pr.send('pull_request_review_comment', pr.reply('Fixed'));
+    // The run answers no outsider, so their reply in a Manki thread reads nothing and gets nothing.
+    await pr.send('pull_request_review_comment', pr.reply('Fixed', { author_association: 'NONE' }));
+    await runDurableObjectAlarm(pr.stub);
+    expect([github.reactions, github.reviewCommentReads]).toEqual([[], []]);
+
+    // A person's thread, a person's comment that copies the marker, another workflow's comment, and Manki's answer in a person's thread.
+    github.reviewComments.set(3, { user: { login: 'bob' }, body: MANKI_THREAD.body });
+    github.reviewComments.set(4, { user: { login: 'github-actions[bot]' }, body: 'Coverage dropped here.' });
+    github.reviewComments.set(5, { ...MANKI_THREAD, in_reply_to_id: 2 });
+    for (const [id, in_reply_to_id] of [[1002, 2], [1003, 3], [1004, 4], [1005, 5]]) {
+      await pr.send('pull_request_review_comment', pr.reply('Fixed', { id, in_reply_to_id }));
+    }
+    await runDurableObjectAlarm(pr.stub);
+    expect([github.reactions, github.reviewCommentReads]).toEqual([[], [2, 3, 4, 5]]);
+
+    // A comment that cannot be read settles nothing.
+    github.reviewCommentStatus = 404;
+    await pr.send('pull_request_review_comment', pr.reply('Fixed', { id: 1006 }));
     await runDurableObjectAlarm(pr.stub);
     expect(github.reactions).toEqual([]);
+    expect(logged(log, 'coordinator_reaction_error')).toMatchObject([{ comment_id: 1006, error: 'Error: reading review comment 1 failed with 404' }]);
 
     setDispatchEnabled(false);
     await pr.send('issue_comment', pr.comment('@manki explain'));
@@ -989,19 +1025,23 @@ describe('PrCoordinator dispatch', () => {
   });
 
   it.each([
-    ['a push, then a reply in the same second', ['push', 'reply']],
-    ['a reply, then a push in the same second', ['reply', 'push']],
-  ])('runs a thread reply before a review for %s, and the review right after it', async (_case, order) => {
+    ['a push, then a reply in the same second', ['push', 'reply'], 'pull_request'],
+    ['a reply, then a push in the same second', ['reply', 'push'], 'pull_request'],
+    ['a review state check, then a reply', ['check', 'reply'], 'pull_request_review'],
+    ['a review state check and a push, then a reply', ['check', 'push', 'reply'], 'pull_request_review'],
+  ])('runs a thread reply before a review or a review state check for %s, and the oldest of those right after it', async (_case, order, after) => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
     for (const item of order) {
-      await (item === 'push' ? pr.send('pull_request', pr.push(SHA_1)) : pr.send('pull_request_review_comment', pr.reply('Fixed')));
+      if (item === 'push') await pr.send('pull_request', pr.push(SHA_1));
+      else if (item === 'check') await pr.send('pull_request_review', pr.review());
+      else await pr.send('pull_request_review_comment', pr.reply('Fixed'));
     }
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request_review_comment']);
     await pr.stub.runCompleted(key('d-reply'), 9000, 'success');
     await runDurableObjectAlarm(pr.stub);
-    expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request_review_comment', 'pull_request']);
+    expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request_review_comment', after]);
   });
 
   it('starts a review at once when no reply is queued', async () => {
@@ -1012,19 +1052,22 @@ describe('PrCoordinator dispatch', () => {
     expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request']);
   });
 
-  it(`lets a review go before replies once replies went ahead of it for ${REPLY_FIRST_MS / MINUTE} minutes`, async () => {
+  it.each<[string, string, (pr: ReturnType<typeof pullRequest>, sha: string) => WebhookPayload]>([
+    ['review', 'pull_request', (pr, sha) => pr.push(sha)],
+    ['review state check', 'pull_request_review', (pr) => pr.review()],
+  ])(`lets a %s go before replies once replies went ahead of it for ${REPLY_FIRST_MS / MINUTE} minutes`, async (_kind, event, payload) => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
-    await pr.send('pull_request', pr.push(SHA_1));
+    await pr.send(event, payload(pr, SHA_1));
     await pr.send('pull_request_review_comment', pr.reply('Fixed'));
     await runDurableObjectAlarm(pr.stub);
-    // The reply runs long, a push lands on the queued review, and another reply is queued meanwhile.
+    // The reply runs long, a push or a review lands on the queued item, and another reply is queued meanwhile.
     advanceClock(REPLY_FIRST_MS);
-    await pr.send('pull_request', pr.push(SHA_2));
-    await pr.send('pull_request_review_comment', { ...pr.reply('Also fixed'), comment: { id: 1002, body: 'Also fixed', in_reply_to_id: 2, user: { login: 'alice', type: 'User' }, author_association: 'COLLABORATOR' } });
+    expect(await pr.send(event, payload(pr, SHA_2))).toEqual({ accepted: true, effect: 'merged into work 1' });
+    await pr.send('pull_request_review_comment', pr.reply('Also fixed', { id: 1002, in_reply_to_id: 2 }));
     await pr.stub.runCompleted(key('d-reply'), 9000, 'success');
     await runDurableObjectAlarm(pr.stub);
-    expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request_review_comment', 'pull_request']);
+    expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request_review_comment', event]);
   });
 
   it('runs a reply first although its review waited behind a long run', async () => {

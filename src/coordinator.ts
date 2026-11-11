@@ -4,7 +4,7 @@ import type { Env } from './env';
 import { githubApi, githubGraphql, hasWriteAccess, isRateLimited, type MintResult, mintRepositoryToken } from './github';
 import { log } from './log';
 import {
-  type BaseConfig, BOT_LOGIN, boxLabels, type BoxChange, cancelledProgress, HELP_REPLY, isMankiGraphqlLogin, isRunningProgress, MANKI_LOGINS,
+  type BaseConfig, BOT_LOGIN, boxLabels, type BoxChange, cancelledProgress, HELP_REPLY, isMankiGraphqlLogin, isRunningProgress, MANKI_COMMENT_MARKER, MANKI_LOGINS,
   matchSkipRule, parseConfig, REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes, settingsHead, skipRulesOf, withSettingsStatus,
 } from './manki';
 import { type OptIn, readOptIn, type Repository } from './opt-in';
@@ -30,7 +30,7 @@ export const OPT_IN_TTL_MS = 5 * MINUTE;
 export const FINISHED_RETENTION_MS = 7 * DAY;
 /** How long an alarm may hold an item in `dispatching` before another pass takes it back. */
 const LEASE_MS = 5 * MINUTE;
-/** How long a queued review lets thread replies go first. */
+/** How long a queued review or review state check lets thread replies go first. */
 export const REPLY_FIRST_MS = 5 * MINUTE;
 const LANES: readonly Lane[] = ['state', 'chat', 'help', 'settings'];
 
@@ -104,7 +104,7 @@ export interface WorkRow extends Record<string, string | number | null> {
   requeues: number;
   /** The workflow file the last dispatch attempt named. Null before the first attempt. */
   workflow: string | null;
-  /** For a queued review, when a thread reply first went ahead of it. */
+  /** For a queued review or review state check, when a thread reply first went ahead of it. */
   passed_at: number | null;
   /** How often a review read the PR again because GitHub had not computed its mergeability. */
   merge_checks: number;
@@ -143,10 +143,12 @@ export interface Delivery {
   bodyHash: string | null;
 }
 
-/** A comment `receive` queued a command from, waiting for its eyes reaction. `pulls` names a review comment. */
+/** A comment `receive` queued a command or a thread reply from, waiting for its eyes reaction. `pulls` names a review comment. */
 interface PendingReaction {
   comments: 'issues' | 'pulls';
   commentId: number;
+  /** Mirrors `Work.repliesTo`. The reaction is added only when that comment starts one of Manki's threads. */
+  repliesTo?: number;
 }
 
 export type ReceiveResult = { accepted: false; reason: string } | { accepted: true; effect: string };
@@ -217,6 +219,17 @@ interface RecentCommentsResponse {
 
 /** How many of Manki's newest comments are read to find the one sought, since answers and notes can follow it. */
 const MANKI_COMMENT_READS = 5;
+
+/**
+ * Whether the review comment `id` starts one of Manki's threads, as the reply run decides it, and stricter: Manki
+ * wrote it, it carries Manki's marker, and it answers no other comment. Throws when the comment cannot be read.
+ */
+async function startsMankiThread(token: string, target: Target, id: number): Promise<boolean> {
+  const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/pulls/comments/${id}`);
+  if (!response.ok) throw new Error(`reading review comment ${id} failed with ${response.status}`);
+  const { body, user, in_reply_to_id } = await response.json() as { body?: string; user?: { login?: string } | null; in_reply_to_id?: number };
+  return MANKI_LOGINS.includes(user?.login ?? '') && (body ?? '').includes(MANKI_COMMENT_MARKER) && !in_reply_to_id;
+}
 
 /** Returns why a push waits out the pause, from the reported `reason` and the Pause box, and what reviews it. */
 function pausedSummary(reason: string | null, paused: boolean): string {
@@ -408,10 +421,11 @@ export class PrCoordinator extends DurableObject<Env> {
         const state = this.reviewState(route.work.headSha);
         if (state !== null) return { accepted: true, effect: 'head already reviewed or under review' };
       }
-      if (route.work.acknowledge && route.work.writer && route.work.objectId !== null) {
+      if ((route.work.acknowledge || route.work.repliesTo !== undefined) && route.work.writer && route.work.objectId !== null) {
         const reaction: PendingReaction = {
           comments: route.work.event.startsWith('pull_request_review_comment.') ? 'pulls' : 'issues',
           commentId: route.work.objectId,
+          ...(route.work.repliesTo !== undefined && { repliesTo: route.work.repliesTo }),
         };
         const pending = this.getMeta<PendingReaction[]>('reactions') ?? [];
         if (!pending.some((entry) => entry.comments === reaction.comments && entry.commentId === reaction.commentId)) {
@@ -660,8 +674,9 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Adds the eyes reaction to each comment `receive` queued a command from, so the commenter sees it was received
-   * before the run starts. Only a repository that takes dispatches gets one. A failure is logged and never retried.
+   * Adds the eyes reaction to each comment `receive` queued a command or a reply in one of Manki's threads from, so
+   * the commenter sees it was received before the run starts. Only a repository that takes dispatches gets one. A
+   * failure is logged and never retried.
    */
   private async react(): Promise<void> {
     const pending = this.getMeta<PendingReaction[]>('reactions');
@@ -676,11 +691,12 @@ export class PrCoordinator extends DurableObject<Env> {
       return;
     }
     if (!target) return;
-    for (const { comments, commentId } of pending) {
+    for (const { comments, commentId, repliesTo } of pending) {
       try {
         // A comment on a pull request needs `pull_requests: write` to take a reaction, one on a plain issue `issues: write`.
         const token = await this.token(comments === 'pulls' ? { pull_requests: 'write' } : { issues: 'write', pull_requests: 'write' });
         if (token === null) continue;
+        if (repliesTo !== undefined && !(await startsMankiThread(token, target, repliesTo))) continue;
         const path = `/repos/${target.owner}/${target.repo}/${comments}/comments/${commentId}/reactions`;
         const response = await githubApi(token, path, { method: 'POST', body: { content: 'eyes' } });
         if (!response.ok) log('coordinator_reaction_failed', { ...this.logFields(), comment_id: commentId, status: response.status });
@@ -771,7 +787,10 @@ export class PrCoordinator extends DurableObject<Env> {
         // A queued item's `check_at` holds it until the dispatch cap allows another run.
         if (!next || (next.check_at ?? 0) > now) return;
         if (next.kind === 'thread') {
-          this.sql.exec(`UPDATE work SET passed_at = ? WHERE lane = ? AND status = 'queued' AND kind = 'review' AND id < ? AND passed_at IS NULL`, now, lane, next.id);
+          this.sql.exec(
+            `UPDATE work SET passed_at = ? WHERE lane = ? AND status = 'queued' AND kind IN ('review', 'review_state') AND id < ? AND passed_at IS NULL`,
+            now, lane, next.id,
+          );
         }
         await this.start(next);
       } catch (error) {
@@ -781,14 +800,16 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Returns the item a lane starts next: the oldest queued one, except that a queued thread reply goes before a review.
-   * The review then sees each thread as the reply leaves it, instead of requesting changes the reply withdraws a minute
-   * later. Once replies have gone ahead of a review for `REPLY_FIRST_MS`, the review goes first again, so a stream of
-   * replies cannot hold it back. Time spent waiting behind a run does not count.
+   * Returns the item a lane starts next: the oldest queued one, except that a queued thread reply goes before a review
+   * and before a review state check. The review then sees each thread as the reply leaves it, instead of requesting
+   * changes the reply withdraws a minute later. The check reads the PR when it runs, so it loses nothing, and a person
+   * waits for the reply. Once replies have gone ahead of a review or a check for `REPLY_FIRST_MS`, it goes first again,
+   * so a stream of replies cannot hold it back. Time spent waiting behind a run does not count.
    */
   private nextQueued(lane: Lane): WorkRow | undefined {
     const next = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'queued' ORDER BY id LIMIT 1`, lane).toArray()[0];
-    if (next?.kind !== 'review' || (next.passed_at !== null && Date.now() - next.passed_at >= REPLY_FIRST_MS)) return next;
+    const yields = next?.kind === 'review' || next?.kind === 'review_state';
+    if (!next || !yields || (next.passed_at !== null && Date.now() - next.passed_at >= REPLY_FIRST_MS)) return next;
     return this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'queued' AND kind = 'thread' ORDER BY id LIMIT 1`, lane).toArray()[0] ?? next;
   }
 

@@ -234,7 +234,7 @@ describe('routeDelivery', () => {
     expect(route.type === 'work' && route.work.trusted).toBe(trusted);
   });
 
-  it.each<[string, string, WebhookPayload, boolean]>([
+  it.each<[string, string, WebhookPayload, boolean, number?]>([
     ...['OWNER', 'MEMBER', 'COLLABORATOR'].map((association): [string, string, WebhookPayload, boolean] =>
       [`a review request by a ${association}`, 'issue_comment', issueCommentEvent('@manki review', { association }), true]),
     ['a question on an issue', 'issue_comment', issueCommentEvent('@manki explain this', { onIssue: true }), true],
@@ -244,14 +244,16 @@ describe('routeDelivery', () => {
     ['a review request by the PR author', 'issue_comment', issueCommentEvent('@manki review', { association: 'NONE', issueAuthor: 'Alice' }), false],
     ['a question by an outsider on their issue', 'issue_comment', issueCommentEvent('@manki help', { onIssue: true, association: 'NONE', issueAuthor: 'alice' }), false],
     ['an edit of a collaborator\'s command by someone else', 'issue_comment', issueCommentEvent('@manki review', { action: 'edited', sender: { login: 'mallory', type: 'User' } }), false],
-    ['a thread reply without a mention', 'pull_request_review_comment', reviewCommentEvent('Fixed', { in_reply_to_id: 1 }), false],
+    // A reply that is no command names the comment it answers, and the coordinator reacts once that comment is Manki's.
+    ['a thread reply without a mention', 'pull_request_review_comment', reviewCommentEvent('Fixed', { in_reply_to_id: 7 }), false, 7],
+    ['a command in a thread reply', 'pull_request_review_comment', reviewCommentEvent('@manki dismiss', { in_reply_to_id: 7 }), true],
     ['a mention in a review comment by an outsider', 'pull_request_review_comment', reviewCommentEvent('@manki is this safe?', { author_association: 'NONE' }), false],
     ['a help, which gets a thumbs-up with its answer instead', 'issue_comment', issueCommentEvent('@manki help'), false],
     ['a push', 'pull_request', pullRequestEvent('synchronize'), false],
-  ])('reacts to %s when it is queued or not', (_case, event, payload, acknowledge) => {
+  ])('reacts to %s when it is queued or not', (_case, event, payload, acknowledge, repliesTo) => {
     const route = routeDelivery(event, payload);
     expect(route.type).toBe('work');
-    expect(route.type === 'work' && route.work.acknowledge && route.work.writer).toBe(acknowledge);
+    expect(route.type === 'work' && [route.work.acknowledge && route.work.writer, route.work.repliesTo]).toEqual([acknowledge, repliesTo]);
   });
 
   it.each<[string, string, WebhookPayload, boolean, boolean]>([
