@@ -2,8 +2,8 @@ import { minimatch } from 'minimatch';
 import { parse } from 'yaml';
 
 // Ports of the pure checks Manki runs on an event before it does any work. Each mirrors the function of the same
-// name in manki `src/interaction.ts`, `src/index.ts` or `src/config.ts`. A change there must be made here too, or the
-// Worker drops an event the action would have handled.
+// name in manki `src/interaction.ts`, `src/index.ts`, `src/config.ts` or `src/review-record.ts`. A change there must be
+// made here too, or the Worker drops an event the action would have handled.
 
 export const BOT_LOGIN = 'manki-review[bot]';
 
@@ -20,6 +20,19 @@ export const MANKI_COMMENT_MARKER = '<!-- manki';
 
 /** The marker of Manki's progress comment. */
 export const BOT_MARKER = '<!-- manki-bot -->';
+
+/** Opens the round record of a review body. Manki writes it below all text that quotes code and model text. */
+const RECORD_OPENER = '<!-- manki-context';
+
+/**
+ * Whether Manki itself wrote the flag `marker` in the review `body`: on a line of its own below the last round record,
+ * or anywhere when the body holds no record. A marker above the record is quoted text.
+ */
+export function hasOwnMarker(body: string, marker: string): boolean {
+  const lines = body.split('\n');
+  const record = lines.map((line) => line.startsWith(RECORD_OPENER) && line.includes('-->')).lastIndexOf(true);
+  return lines.slice(record + 1).some((line) => line.trimEnd() === marker);
+}
 
 /** The answer to a help command, as Manki's `handleHelp` posts it. */
 export const HELP_REPLY = [

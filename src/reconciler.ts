@@ -3,7 +3,7 @@ import { createAppJWT } from './app-jwt';
 import { allowedAccounts, type Env } from './env';
 import { githubApi, githubGraphql, isRateLimited, mintRepositoryToken } from './github';
 import { log } from './log';
-import { BOT_LOGIN, MANKI_COMMENT_MARKER } from './manki';
+import { BOT_LOGIN, hasOwnMarker, MANKI_COMMENT_MARKER } from './manki';
 import { STALE_COMMENT_MS, type Target } from './routing';
 
 const MINUTE = 60_000;
@@ -432,10 +432,10 @@ export class Reconciler extends DurableObject<Env> {
       const data = await githubGraphql<ReviewsResponse>(mint.token, REVIEWS_QUERY, {
         owner: repo.owner, name: repo.repo, number: pull.number, author: BOT_LOGIN,
       });
-      // A review counts as Manki's `reviewCoversHead` counts it. Thread replies are reviews too, with an empty body.
+      // A review counts as Manki's `coveredCommit` counts it. Thread replies are reviews too, with an empty body.
       const reviewed = data.repository?.pullRequest?.reviews.nodes.some((review) =>
         review.commit?.oid === pull.head.sha && review.state !== 'DISMISSED'
-        && review.body.includes(MANKI_COMMENT_MARKER) && !review.body.includes(NO_VERDICT_MARKER));
+        && review.body.includes(MANKI_COMMENT_MARKER) && !hasOwnMarker(review.body, NO_VERDICT_MARKER));
       if (reviewed) {
         this.markChecked(repo, pull);
         continue;
