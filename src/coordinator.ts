@@ -345,6 +345,10 @@ const ACTIVE = `status IN ('dispatching', 'running')`;
 const CHECK_TO_END = `check_ref IS NOT NULL AND (check_own = 1 OR NOT (status = 'queued' OR ${ACTIVE}))`;
 /** The event of a review command in a new comment. A settings box review is always an edit, so it never has this event. */
 const REVIEW_COMMAND_EVENT = 'issue_comment.created';
+/** The event of a PR marked ready for review. */
+const READY_EVENT = 'pull_request.ready_for_review';
+/** The event the approval check of a PR marked ready is dispatched as. Manki answers it with its approval check and starts no review for it. */
+const APPROVAL_CHECK_EVENT = 'pull_request.approval_check';
 
 /**
  * Returns how a waiting check ends once the review of `item` will not complete it. `status` is the check's own, and
@@ -585,6 +589,12 @@ export class PrCoordinator extends DurableObject<Env> {
       }
       this.sql.exec(`DELETE FROM meta WHERE key = 'closed_at'`);
       if (route.work.kind === 'review' && route.work.event.startsWith('pull_request.')) {
+        // A review of a draft holds its approval. Once the PR is marked ready, the approval check decides on that review.
+        const after = route.work.event === READY_EVENT ? this.approvalCheckAfter(route.work.headSha) : null;
+        if (after !== null) {
+          const check: Work = { ...route.work, kind: 'review_state', event: APPROVAL_CHECK_EVENT };
+          return { accepted: true, effect: this.enqueue(check, delivery.id, now, after) };
+        }
         // A late redelivery of the push, after a catch-up already reviews this head, must not review it twice.
         const state = this.reviewState(route.work.headSha);
         if (state !== null) return { accepted: true, effect: 'head already reviewed or under review' };
@@ -621,6 +631,22 @@ export class PrCoordinator extends DurableObject<Env> {
     if (rows.some((row) => (row.status === 'done' && row.conclusion === 'success') || (row.status === 'skipped' && skipped.includes(row.conclusion ?? '')))) return 'handled';
     if (rows.some((row) => row.status === 'queued' || row.status === 'dispatching' || row.status === 'running')) return 'pending';
     return null;
+  }
+
+  /**
+   * Says whether a PR marked ready on `head` gets an approval check, and which review the check must wait for. Returns
+   * the id of the newest review of `head` that is queued or under way, or 0 when a review run of `head` succeeded and
+   * none is under way. Returns null when `head` has neither, so the event is no approval check. A review asked for by
+   * a box or a command has no `head_sha`, so `run_head`, the commit its run was started for, counts too.
+   */
+  private approvalCheckAfter(head: string | null): number | null {
+    if (head === null) return null;
+    const rows = this.sql.exec<{ id: number; status: WorkStatus; conclusion: string | null }>(
+      `SELECT id, status, conclusion FROM work WHERE kind = 'review' AND (head_sha = ? OR run_head = ?) ORDER BY id`, head, head,
+    ).toArray();
+    const pending = rows.filter((row) => row.status === 'queued' || row.status === 'dispatching' || row.status === 'running').at(-1);
+    if (pending) return pending.id;
+    return rows.some((row) => row.status === 'done' && row.conclusion === 'success') ? 0 : null;
   }
 
   /** Returns the PR's running state. Writes nothing, so asking about a PR without state creates none. */
@@ -732,8 +758,12 @@ export class PrCoordinator extends DurableObject<Env> {
     ).toArray();
   }
 
-  /** Queues `work`, merging it with what is already queued where one run covers both. */
-  private enqueue(work: Work, delivery: string, now: number): string {
+  /**
+   * Queues `work`, merging it with what is already queued where one run covers both. A review state check joins only a
+   * check queued after work `after`. Such a check runs after that work has ended: the lane starts its oldest queued
+   * item, only a thread reply goes ahead of an older item, and nothing starts while an item is under way.
+   */
+  private enqueue(work: Work, delivery: string, now: number, after = 0): string {
     if (work.event === 'issue_comment.edited' && work.objectId !== null && work.kind !== 'settings') {
       // The run reads the comment as it is then, so one queued item covers every edit of the comment. A settings edit
       // carries its own box changes, so each one is applied.
@@ -790,7 +820,9 @@ export class PrCoordinator extends DurableObject<Env> {
 
     if (work.kind === 'review_state') {
       // The check reads the PR when it runs, so one queued check covers every review and thread change before it.
-      const [check] = this.queued('state', ['review_state']);
+      // Manki runs the approval check of a PR marked ready only on the head it names, so it covers no other head's change.
+      const [check] = this.queued('state', ['review_state'])
+        .filter((row) => row.id > after && (row.event !== APPROVAL_CHECK_EVENT || row.head_sha === work.headSha));
       if (check) {
         // A review carries the id the dispatch names, so it replaces the queued trigger. An outsider's review never
         // replaces a trusted trigger. The sender of a trigger not known as a writer's is looked up before the check

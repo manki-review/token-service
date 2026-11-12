@@ -1453,6 +1453,149 @@ describe('PrCoordinator dispatch', () => {
     expect(await pr.send('pull_request', pr.push(SHA_2))).toEqual({ accepted: true, effect: 'queued work 2' });
   });
 
+  describe('a PR marked ready', () => {
+    const CHECK = { lane: 'state', kind: 'review_state', event: 'pull_request.approval_check' };
+    const ready = (pr: ReturnType<typeof pullRequest>, sha: string) => pr.push(sha, 'ready_for_review');
+    const resolve = (pr: ReturnType<typeof pullRequest>, sha: string) =>
+      reviewThreadEvent('resolved', { number: pr.number, head: { sha, repo: { full_name: 'manki-review/manki' } } });
+    const events = (github: ReturnType<typeof fakeGitHub>) => github.dispatches.map(({ inputs }) => `${inputs.event}.${inputs.action}`);
+    /** A PR whose push of `SHA_1` got a review run that ended in success. */
+    const reviewed = async (change: Record<string, unknown> = {}) => {
+      const pr = pullRequest();
+      const github = Object.assign(fakeGitHub(pr.number), change);
+      await pr.send('pull_request', pr.push(SHA_1));
+      await runDurableObjectAlarm(pr.stub);
+      await pr.stub.runCompleted(key('d-reviewed'), 9000, 'success');
+      return { pr, github };
+    };
+
+    it('gets the approval check on a head with a successful review run, which starts no review', async () => {
+      const { pr, github } = await reviewed({ draft: true, config: 'drafts: review' });
+      github.draft = false;
+      const [configReads, waitingChecks] = [github.configReads.length, github.waitingChecks.length];
+      expect(await pr.send('pull_request', ready(pr, SHA_1), 'd-ready')).toEqual({ accepted: true, effect: 'queued work 2' });
+      // The same delivery again queues nothing, and neither does a late `opened` or push of the head.
+      expect(await pr.send('pull_request', ready(pr, SHA_1), 'd-ready')).toEqual({ accepted: false, reason: 'duplicate delivery' });
+      for (const action of ['opened', 'synchronize']) {
+        expect(await pr.send('pull_request', pr.push(SHA_1, action))).toEqual({ accepted: true, effect: 'head already reviewed or under review' });
+      }
+      await runDurableObjectAlarm(pr.stub);
+      expect(github.dispatches.at(-1)?.inputs).toEqual({ event: 'pull_request', action: 'approval_check', pr: String(pr.number), head_sha: SHA_1, delivery_id: 'd-ready' });
+      // Only a review reads the config, shows a waiting check or reports a skip.
+      expect(github.configReads).toHaveLength(configReads);
+      expect(github.waitingChecks).toHaveLength(waitingChecks);
+      expect(github.checkRuns).toEqual([]);
+      expect(await workRows(pr.stub)).toMatchObject([{ kind: 'review', status: 'done' }, { ...CHECK, head_sha: SHA_1, status: 'running', run_id: 9001 }]);
+      // The check is no review of a head, so a head only it ran for is still reviewed.
+      await pr.stub.runCompleted(key('d-checked'), 9001, 'success');
+      expect(await pr.stub.catchUpState(SHA_2)).toBe('needed');
+      expect(await pr.send('pull_request', ready(pr, SHA_1))).toEqual({ accepted: true, effect: 'queued work 3' });
+    });
+
+    it('gets the approval check on a head a review command had reviewed, by the commit that run started for', async () => {
+      const pr = pullRequest();
+      const github = fakeGitHub(pr.number);
+      await pr.send('issue_comment', pr.comment('@manki review'));
+      await runDurableObjectAlarm(pr.stub);
+      expect(await workRows(pr.stub)).toMatchObject([{ kind: 'review', status: 'running', head_sha: null, run_head: SHA_1 }]);
+      await pr.stub.runCompleted(key('d-reviewed'), 9000, 'success');
+      // Another head has no review, so marking the PR ready on it starts one.
+      expect(await pr.send('pull_request', ready(pr, SHA_1))).toEqual({ accepted: true, effect: 'queued work 2' });
+      expect(await pr.send('pull_request', ready(pr, SHA_2))).toEqual({ accepted: true, effect: 'queued work 3' });
+      expect(await workRows(pr.stub)).toMatchObject([{ kind: 'review' }, { ...CHECK, head_sha: SHA_1 }, { kind: 'review', event: 'pull_request.ready_for_review', head_sha: SHA_2 }]);
+      expect(github.dispatches).toHaveLength(1);
+    });
+
+    it('gets the approval check of a reviewed head during a pause and under a skip rule, as a resolved thread does', async () => {
+      const paused = pullRequest();
+      const github = fakeGitHub(paused.number);
+      await paused.send('pull_request', paused.push(SHA_1));
+      await runDurableObjectAlarm(paused.stub);
+      expect(await paused.stub.report(9000, { pause: { reason: 'Round cap reached.' } })).toEqual({ accepted: true, changed: ['pause'] });
+      await paused.stub.runCompleted(key('d-reviewed'), 9000, 'success');
+      await paused.send('pull_request', ready(paused, SHA_1));
+      await runDurableObjectAlarm(paused.stub);
+      expect(events(github)).toEqual(['pull_request.synchronize', 'pull_request.approval_check']);
+      expect(github.checkRuns).toEqual([]);
+      // A head without a review still waits out the pause.
+      await paused.stub.runCompleted(key('d-checked'), 9001, 'success');
+      github.head = SHA_2;
+      await paused.send('pull_request', ready(paused, SHA_2));
+      await runDurableObjectAlarm(paused.stub);
+      expect(github.dispatches).toHaveLength(2);
+      expect((await workRows(paused.stub)).at(-1)).toMatchObject({ kind: 'review', status: 'skipped', note: 'pull request is paused' });
+
+      const skipped = await reviewed();
+      Object.assign(skipped.github, { config: 'skip_labels: [dependencies]', labels: ['dependencies'] });
+      await skipped.pr.send('pull_request', ready(skipped.pr, SHA_1));
+      await runDurableObjectAlarm(skipped.pr.stub);
+      expect(events(skipped.github)).toEqual(['pull_request.synchronize', 'pull_request.approval_check']);
+      expect(skipped.github.checkRuns).toEqual([]);
+    });
+
+    it('starts the first review of a head that has none, as for a draft that was dropped', async () => {
+      const pr = pullRequest();
+      const github = Object.assign(fakeGitHub(pr.number), { draft: true });
+      await pr.send('pull_request', pr.push(SHA_1));
+      await runDurableObjectAlarm(pr.stub);
+      github.draft = false;
+      await pr.send('pull_request', ready(pr, SHA_1));
+      await runDurableObjectAlarm(pr.stub);
+      expect(events(github)).toEqual(['pull_request.ready_for_review']);
+      expect(await workRows(pr.stub)).toMatchObject([
+        { kind: 'review', status: 'dropped', note: 'pull request is a draft' },
+        { kind: 'review', event: 'pull_request.ready_for_review', status: 'running', run_head: SHA_1 },
+      ]);
+    });
+
+    it('gets the approval check only after a review of the head that is queued or running has ended', async () => {
+      const running = pullRequest();
+      const github = fakeGitHub(running.number);
+      await running.send('pull_request', running.push(SHA_1));
+      await runDurableObjectAlarm(running.stub);
+      expect(await running.send('pull_request', ready(running, SHA_1))).toEqual({ accepted: true, effect: 'queued work 2' });
+      await runDurableObjectAlarm(running.stub);
+      expect(await workRows(running.stub)).toMatchObject([{ kind: 'review', status: 'running' }, { ...CHECK, status: 'queued' }]);
+      // A run that never started is queued again, and still goes before the check.
+      github.runs.set(9000, { status: 'queued' });
+      advanceClock(QUEUED_RUN_TIMEOUT_MS + 1);
+      await runDurableObjectAlarm(running.stub);
+      expect(await workRows(running.stub)).toMatchObject([{ kind: 'review', status: 'running', run_id: 9001, requeues: 1 }, { ...CHECK, status: 'queued' }]);
+      await running.stub.runCompleted(key('d-reviewed'), 9001, 'success');
+      await runDurableObjectAlarm(running.stub);
+      expect(events(github)).toEqual(['pull_request.synchronize', 'pull_request.synchronize', 'pull_request.approval_check']);
+
+      // A check queued before the review runs before it, so the ready event does not join that one.
+      const queued = pullRequest();
+      const other = fakeGitHub(queued.number);
+      await queued.send('pull_request_review_comment', queued.reply('Fixed'));
+      await runDurableObjectAlarm(queued.stub);
+      expect(await queued.send('pull_request_review_thread', resolve(queued, SHA_1))).toEqual({ accepted: true, effect: 'queued work 2' });
+      expect(await queued.send('pull_request', queued.push(SHA_1))).toEqual({ accepted: true, effect: 'queued work 3' });
+      expect(await queued.send('pull_request', ready(queued, SHA_1))).toEqual({ accepted: true, effect: 'queued work 4' });
+      // A second ready event joins the check behind the review.
+      expect(await queued.send('pull_request', ready(queued, SHA_1))).toEqual({ accepted: true, effect: 'merged into work 4' });
+      for (const run of [9000, 9001, 9002]) {
+        await queued.stub.runCompleted(key(`d-end-${run}`), run, 'success');
+        await runDurableObjectAlarm(queued.stub);
+      }
+      expect(events(other)).toEqual([
+        'pull_request_review_comment.created', 'pull_request_review_thread.resolved', 'pull_request.synchronize', 'pull_request.approval_check',
+      ]);
+    });
+
+    it('keeps the approval check apart from the review state check of another head', async () => {
+      const { pr } = await reviewed();
+      expect(await pr.send('pull_request', ready(pr, SHA_1))).toEqual({ accepted: true, effect: 'queued work 2' });
+      // Manki runs the approval check only while its head is the PR's, so a thread change on a newer head needs its own check.
+      expect(await pr.send('pull_request_review_thread', resolve(pr, SHA_2))).toEqual({ accepted: true, effect: 'queued work 3' });
+      expect(await pr.send('pull_request_review_thread', resolve(pr, SHA_1))).toEqual({ accepted: true, effect: 'merged into work 2' });
+      expect(await workRows(pr.stub)).toMatchObject([
+        { kind: 'review' }, { ...CHECK, head_sha: SHA_1 }, { kind: 'review_state', event: 'pull_request_review_thread.resolved', head_sha: SHA_2 },
+      ]);
+    });
+  });
+
   it.each([
     ['failed', 'failure'],
     ['was cancelled', 'cancelled'],
@@ -1572,6 +1715,7 @@ describe('PrCoordinator dispatch', () => {
     expect(logged(log, 'coordinator_finished')).toEqual(expect.arrayContaining([expect.objectContaining({ status: 'skipped', conclusion: 'conflict' })]));
     // The cron leaves the skipped head alone, so it posts the note again only on a new push or a review request.
     expect(await pr.stub.catchUpState(SHA_1)).toBe('handled');
+    expect(await pr.send('pull_request', pr.push(SHA_1, 'ready_for_review'))).toEqual({ accepted: true, effect: 'head already reviewed or under review' });
 
     // A review request on the still conflicting PR replaces the note instead of adding one.
     github.mergeable = [null, false];
@@ -1781,9 +1925,11 @@ describe('PrCoordinator dispatch', () => {
       output: { title: 'Review skipped', summary: `This PR matches the skip rule for ${rule} in \`.manki.yml\` on the base branch.` },
     }]);
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped', conclusion: 'skipped', note: `matches the skip rule for ${rule}` }]);
-    // The cron and a late redelivery of the push leave a skipped head alone.
+    // The cron and a late redelivery of the push leave a skipped head alone. It has no review, so marking the PR ready gets no approval check.
     expect(await pr.stub.catchUpState(SHA_1)).toBe('handled');
-    expect(await pr.send('pull_request', pr.push(SHA_1))).toEqual({ accepted: true, effect: 'head already reviewed or under review' });
+    for (const action of ['synchronize', 'ready_for_review']) {
+      expect(await pr.send('pull_request', pr.push(SHA_1, action))).toEqual({ accepted: true, effect: 'head already reviewed or under review' });
+    }
   });
 
   it.each([
@@ -2732,6 +2878,7 @@ describe('PrCoordinator dispatch', () => {
       expect(github.cancels).toEqual([9000]);
       expect((await workRows(pr.stub))[0]).toMatchObject({ status: 'skipped', conclusion: 'cancelled', note: 'cancelled by alice, cancel requested' });
       expect(await pr.stub.catchUpState(SHA_1)).toBe('handled');
+      expect(await pr.send('pull_request', pr.push(SHA_1, 'ready_for_review'))).toEqual({ accepted: true, effect: 'head already reviewed or under review' });
       expect(await state()).toMatchObject({ active: [] });
       // The run's post step cannot end its progress comment and check any more, so the Worker does.
       expect(github.issueComments.get(SETTINGS)).toBe(cancelled('alice'));

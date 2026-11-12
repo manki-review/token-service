@@ -62,6 +62,8 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['a PR opened as a draft', 'pull_request', pullRequestEvent('opened', { draft: true }), 'state:review'],
   ['a PR converted to a draft', 'pull_request', pullRequestEvent('converted_to_draft', { draft: true }), 'ignore'],
   ['a push to a fork PR', 'pull_request', forkPullRequestEvent('synchronize'), 'ignore'],
+  ['a fork PR marked ready', 'pull_request', forkPullRequestEvent('ready_for_review'), 'ignore'],
+  ['a PR marked ready by a bot', 'pull_request', pullRequestEvent('ready_for_review', {}, BOT_SENDER), 'state:bot_push'],
   ['a push to a PR whose fork was deleted', 'pull_request', pullRequestEvent('synchronize', { head: { sha: HEAD_SHA, repo: null } }), 'ignore'],
   ['a push by a bot', 'pull_request', pullRequestEvent('synchronize', {}, BOT_SENDER), 'state:bot_push'],
   ['a PR opened by a bot', 'pull_request', pullRequestEvent('opened', {}, BOT_SENDER), 'state:bot_push'],
