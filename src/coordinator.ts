@@ -57,11 +57,21 @@ export const UNTRUSTED_DISPATCHES_PER_HOUR = 5;
 const TOKEN_EXPIRY_MARGIN_MS = 5 * MINUTE;
 /** How long a looked-up write access is reused for the same login. */
 const WRITER_CACHE_MS = 5 * MINUTE;
-/**
- * GitHub calls one alarm spends on eyes reactions, next to at most two token mints. The lanes keep the other 30 of the
- * Free plan's 50 subrequests per invocation.
- */
+/** The Free plan's subrequests per invocation, which one alarm must stay within. */
+const SUBREQUEST_LIMIT = 50;
+/** GitHub calls one alarm spends on eyes reactions at most. The lanes keep the rest of the limit. */
 const REACTION_BUDGET = 18;
+/** Token mints the reactions of one alarm can take, one for each kind of comment. */
+const REACTION_MINTS = 2;
+/**
+ * The most calls one step of a lane makes, by a count of the code with one check to end: a poll, the end of the waiting
+ * checks, or the start of an item. The costliest is a settings edit that ticks Review again on the head under review
+ * and Deeper review, with a fresh opt-in read.
+ */
+const STEP_COST = 32;
+/** The most calls the start of an item makes that only dispatches a run or answers help, with a fresh opt-in read. */
+const DISPATCH_COST = 10;
+const DISPATCH_ONLY: ReadonlySet<Work['kind']> = new Set(['merged', 'review_state', 'thread', 'comment', 'issue', 'help']);
 /** How long a review waits before each new read of a PR whose mergeability GitHub has not computed yet. */
 const MERGEABILITY_RETRY_MS = [5_000, 15_000];
 /** GitHub's largest page of the pull requests of a commit. A full page may be cut off. */
@@ -192,6 +202,11 @@ interface PendingReaction {
   commentId: number;
   /** Mirrors `Work.repliesTo`. The reaction is added only when that comment starts one of Manki's threads. */
   repliesTo?: number;
+}
+
+/** Returns the GitHub calls a reaction takes. A reply costs the read of the comment it answers and the reaction, a command the reaction alone. */
+function reactionCost(reaction: PendingReaction): number {
+  return reaction.repliesTo === undefined ? 1 : 2;
 }
 
 export type ReceiveResult = { accepted: false; reason: string } | { accepted: true; effect: string };
@@ -380,6 +395,12 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /** Whether this instance created or upgraded its tables. They are created on first use, not in the constructor. */
   private schemaReady = false;
+  /** The calls this instance made since its last alarm started, except the reactions, which have a budget of their own. */
+  private calls = 0;
+  /** The calls the lanes of the alarm may make, with every token mint and the opt-in read. */
+  private laneBudget = SUBREQUEST_LIMIT;
+  /** The first lane whose step did not fit the budget of the last alarm, as its place in `LANES`. It goes first in the next. */
+  private waitingLane: number | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -794,6 +815,11 @@ export class PrCoordinator extends DurableObject<Env> {
     this.ensureSchema();
     try {
       if (await this.cleanUpWhenIdle()) return;
+      this.calls = 0;
+      // The reactions run next to the lanes, so the calls they can make are kept out of the lanes' share.
+      const reactions = this.getMeta<PendingReaction[]>('reactions') ?? [];
+      const reactionCalls = reactions.reduce((sum, reaction) => sum + reactionCost(reaction), 0);
+      this.laneBudget = SUBREQUEST_LIMIT - (reactions.length > 0 ? Math.min(reactionCalls, REACTION_BUDGET) + REACTION_MINTS : 0);
       // Both read the opt-in through `optIn`, which shares one read between them.
       await Promise.all([this.react(), this.advance()]);
     } catch (error) {
@@ -820,9 +846,8 @@ export class PrCoordinator extends DurableObject<Env> {
       return;
     }
     if (!target) return;
-    // A reply costs the read of the comment it answers and the reaction, a command the reaction alone.
     let calls = 0;
-    const cut = pending.findIndex((reaction) => (calls += reaction.repliesTo === undefined ? 1 : 2) > REACTION_BUDGET);
+    const cut = pending.findIndex((reaction) => (calls += reactionCost(reaction)) > REACTION_BUDGET);
     const waiting = cut < 0 ? [] : pending.splice(cut);
     // `receive` may have queued comments during the reads above. They go after the ones that waited longer.
     if (waiting.length > 0) this.setMeta('reactions', [...waiting, ...(this.getMeta<PendingReaction[]>('reactions') ?? [])]);
@@ -913,29 +938,55 @@ export class PrCoordinator extends DurableObject<Env> {
       now - QUEUED_MAX_AGE_MS,
     );
     this.sql.exec(`UPDATE work SET status = 'queued', lease_until = NULL WHERE status = 'dispatching' AND lease_until <= ?`, now);
-    await Promise.all(LANES.map(async (lane) => {
+    // The lanes go one after another, so each step sees what the ones before it spent. The lane that waited goes first.
+    const first = this.waitingLane ?? 0;
+    this.waitingLane = null;
+    for (const lane of [...LANES.slice(first), ...LANES.slice(0, first)]) {
       try {
-        const running = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'running'`, lane).toArray()[0];
-        if (running && (running.check_at ?? 0) <= now) await this.poll(running);
-        if (this.sql.exec(`SELECT 1 FROM work WHERE lane = ? AND ${ACTIVE}`, lane).toArray().length > 0) return;
-        // The next run can create a `Manki` check, and none may appear on a head while a waiting check is open there.
-        if (lane === 'state' && this.checksToEnd().length > 0 && !(await this.endWaitingChecks())) return;
-        const next = this.nextQueued(lane);
-        // A queued item's `check_at` holds it until the dispatch cap allows another run.
-        if (!next || (next.check_at ?? 0) > now) return;
-        if (next.kind === 'thread') {
-          this.sql.exec(
-            `UPDATE work SET passed_at = ? WHERE lane = ? AND status = 'queued' AND kind IN ('review', 'review_state') AND id < ? AND passed_at IS NULL`,
-            now, lane, next.id,
-          );
-        }
-        await this.start(next);
+        if (!(await this.advanceLane(lane, now))) this.waitingLane ??= LANES.indexOf(lane);
       } catch (error) {
         log('coordinator_lane_error', { ...this.logFields(), lane, error: String(error) });
       }
-    }));
+    }
     // A review that ended in this pass has its waiting check ended at once.
-    await this.endWaitingChecks();
+    if (this.checksToEnd().length === 0) return;
+    if (this.fits(STEP_COST)) await this.endWaitingChecks();
+    else this.waitingLane ??= LANES.indexOf('state');
+  }
+
+  /** Whether `cost` more calls fit in what the lanes of this alarm may still make. */
+  private fits(cost: number): boolean {
+    return this.calls + cost <= this.laneBudget;
+  }
+
+  /**
+   * Polls the lane's run when it is due, and starts its next item once the lane is free. Each step runs only when its
+   * costliest path fits the alarm's budget. Returns false when a step has to wait for the next alarm.
+   */
+  private async advanceLane(lane: Lane, now: number): Promise<boolean> {
+    const running = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'running'`, lane).toArray()[0];
+    if (running && (running.check_at ?? 0) <= now) {
+      if (!this.fits(STEP_COST)) return false;
+      await this.poll(running);
+    }
+    if (this.sql.exec(`SELECT 1 FROM work WHERE lane = ? AND ${ACTIVE}`, lane).toArray().length > 0) return true;
+    // The next run can create a `Manki` check, and none may appear on a head while a waiting check is open there.
+    if (lane === 'state' && this.checksToEnd().length > 0) {
+      if (!this.fits(STEP_COST)) return false;
+      if (!(await this.endWaitingChecks())) return true;
+    }
+    const next = this.nextQueued(lane);
+    // A queued item's `check_at` holds it until the dispatch cap allows another run.
+    if (!next || (next.check_at ?? 0) > now) return true;
+    if (!this.fits(DISPATCH_ONLY.has(next.kind) ? DISPATCH_COST : STEP_COST)) return false;
+    if (next.kind === 'thread') {
+      this.sql.exec(
+        `UPDATE work SET passed_at = ? WHERE lane = ? AND status = 'queued' AND kind IN ('review', 'review_state') AND id < ? AND passed_at IS NULL`,
+        now, lane, next.id,
+      );
+    }
+    await this.start(next);
+    return true;
   }
 
   /**
@@ -976,7 +1027,9 @@ export class PrCoordinator extends DurableObject<Env> {
     return target;
   }
 
+  /** Calls the GitHub REST API and counts the call against the alarm's budget. */
   private api(token: string, path: string, init?: { method?: string; body?: unknown }): Promise<Response> {
+    this.calls++;
     return githubApi(token, path, init);
   }
 
@@ -986,6 +1039,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const key = JSON.stringify([target.installationId, target.repositoryId, Object.entries(permissions).sort()]);
     const cached = this.tokens.get(key);
     if (cached && cached.expiresAt - TOKEN_EXPIRY_MARGIN_MS > Date.now()) return { ok: true, ...cached };
+    this.calls++;
     const mint = await mintRepositoryToken(this.env, target.installationId, target.repositoryId, permissions, {
       purpose: 'coordinator',
       repository: `${target.owner}/${target.repo}`,
@@ -1341,6 +1395,7 @@ export class PrCoordinator extends DurableObject<Env> {
     if (!target) throw new Error('the repository could not be read');
     const token = await this.token({ metadata: 'read' });
     if (token === null) return false;
+    this.calls++;
     const writer = await hasWriteAccess(token, target.owner, target.repo, item.sender);
     this.writers.set(item.sender, { writer, until: Date.now() + WRITER_CACHE_MS });
     return writer;
@@ -1585,6 +1640,7 @@ export class PrCoordinator extends DurableObject<Env> {
     token: string, target: Target, matches: (body: string) => boolean, since = 0,
   ): Promise<{ id: number; body: string } | null> {
     const repo = `/repos/${target.owner}/${target.repo}`;
+    this.calls++;
     const data = await githubGraphql<RecentCommentsResponse>(token, RECENT_COMMENTS_QUERY, {
       owner: target.owner, name: target.repo, number: target.number,
     });
@@ -2153,6 +2209,7 @@ export class PrCoordinator extends DurableObject<Env> {
       } else {
         const repo = await response.json() as { name: string; owner: { login: string; id: number }; default_branch: string };
         repository = { owner: repo.owner.login, ownerId: repo.owner.id, repo: repo.name, defaultBranch: repo.default_branch };
+        this.calls++;
         optIn = await readOptIn(mint.token, repository);
       }
       takesOverCheck = await this.reportOptIn(repository === null ? target : { ...target, ...repository }, optIn.optedIn);
@@ -2171,6 +2228,8 @@ export class PrCoordinator extends DurableObject<Env> {
    */
   private async reportOptIn(target: Target, optedIn: boolean): Promise<boolean> {
     try {
+      // Cloudflare does not say which limit a call to another Durable Object counts against, so it counts here too.
+      this.calls++;
       return await this.env.RECONCILER.getByName(RECONCILER_NAME).recordOptIn(target, optedIn);
     } catch (error) {
       log('coordinator_record_opt_in_error', { ...this.logFields(), error: String(error) });
@@ -2198,6 +2257,8 @@ export class PrCoordinator extends DurableObject<Env> {
     if (until !== null && (until > now || !pending)) times.push(until);
     // Comments still waiting for their reaction wake the alarm at once, since no lane's time stands for them.
     if (this.getMeta<PendingReaction[]>('reactions')) times.push(now);
+    // So does a step that did not fit the budget of the alarm.
+    if (this.waitingLane !== null) times.push(now);
     if (times.length > 0) await this.ctx.storage.setAlarm(Math.max(now, Math.min(...times)));
   }
 }
