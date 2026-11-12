@@ -1235,9 +1235,10 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /**
    * Ends every waiting check whose review ended or whose run reports in a check of its own. A failure is logged and
-   * tried again. Returns whether none is left to end. A run that completed without asking `/token` is not the Manki
-   * App's, as with a custom App, so the registry is told that the repository's runs take no check over. The next
-   * `/token` request that says they do stores that again.
+   * tried again. Returns whether none is left to end. A run that ended as a success or a failure without asking
+   * `/token` is not the Manki App's, as with a custom App, so the registry is told that the repository's runs take no
+   * check over. The next `/token` request that says they do stores that again. A run that was cancelled or deleted may
+   * never have started, so it says nothing about the App.
    */
   private async endWaitingChecks(): Promise<boolean> {
     const rows = this.checksToEnd();
@@ -1246,7 +1247,8 @@ export class PrCoordinator extends DurableObject<Env> {
       const target = await this.verifiedTarget();
       const token = target && await this.token({ checks: 'write' });
       for (const row of rows) {
-        if (row.status === 'done' && !row.check_asked) await this.rememberCheckAbility(false);
+        const ran = row.status === 'done' && (row.conclusion === 'success' || row.conclusion === 'failure');
+        if (ran && !row.check_asked) await this.rememberCheckAbility(false);
         if (target && token) await this.endWaitingCheck(row, target, token);
         else this.forgetCheck(row.id);
       }

@@ -2175,7 +2175,20 @@ describe('PrCoordinator dispatch', () => {
       const refused = await dispatched(true, { dispatchStatuses: [422] });
       await refused.push(SHA_2);
       expect(refused.github.waitingChecks).toMatchObject([{ output: { title: 'Review could not start' } }, { head_sha: SHA_2, status: 'queued' }]);
+      // A run cancelled while it waited for a runner says nothing about the App, so the next review still gets its check.
+      const cancelled = await dispatched();
+      await cancelled.end('cancelled');
+      await cancelled.push(SHA_2);
+      expect(cancelled.github.waitingChecks).toMatchObject([
+        { conclusion: 'cancelled', output: { title: 'Review did not run' } }, { head_sha: SHA_2, status: 'queued' },
+      ]);
       expect(logged(log, 'reconciler_check_ability').map((line) => line.takes_over_check)).toEqual([false, true]);
+      // A run that failed without asking clears the answer, as one that succeeded does.
+      const failed = await dispatched();
+      await failed.end('failure');
+      await failed.push(SHA_2);
+      expect(failed.github.waitingChecks).toHaveLength(1);
+      expect(logged(log, 'reconciler_check_ability').map((line) => line.takes_over_check)).toEqual([false, true, false]);
     });
 
     it('creates no waiting check while the registry cannot be read, and believes a run only once the registry stored it', async () => {
