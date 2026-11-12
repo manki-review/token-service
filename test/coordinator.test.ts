@@ -2867,6 +2867,23 @@ describe('PrCoordinator dispatch', () => {
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches).toHaveLength(1);
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'running', run_id: 7003, note: 'recovered the run of an earlier attempt' }]);
+
+    // A lost run that asked for its token before the retry gave the item its id, so the retry adopts it as well.
+    const asked = pullRequest();
+    const askedGitHub = fakeGitHub(asked.number);
+    askedGitHub.dispatchStatuses = [502];
+    await asked.send('pull_request', asked.push(SHA_1), 'd-asked');
+    await runDurableObjectAlarm(asked.stub);
+    const lost = run(7010, `Manki pull_request.synchronize on #${asked.number} (d-asked)`);
+    askedGitHub.runs.set(lost.id, { status: 'queued', event: 'workflow_dispatch', ...lost });
+    askedGitHub.listedRuns = [lost];
+    const workflow_ref = `${OWNER}/${REPO}/.github/workflows/manki-dispatch.yml@refs/heads/main`;
+    const token = await oidcToken({ claims: { repository_id: String(REPOSITORY_ID), workflow_ref, run_id: String(lost.id) } });
+    expect((await postToken({ token, body: { owner: OWNER, repo: REPO } })).status).toBe(200);
+    advanceClock(DISPATCH_BACKOFF_MS[0]);
+    await runDurableObjectAlarm(asked.stub);
+    expect(askedGitHub.dispatches).toHaveLength(1);
+    expect(await workRows(asked.stub)).toMatchObject([{ status: 'running', run_id: 7010, note: 'recovered the run of an earlier attempt' }]);
   });
 
   it('dispatches again when no lost run turns up, and fails after the last backoff', async () => {
