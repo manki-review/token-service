@@ -2117,6 +2117,7 @@ describe('PrCoordinator dispatch', () => {
 
     it('creates a waiting check only once a run of the repository said it takes one over, and none once a run does not', async () => {
       // Moving up: the first review gets none. Its run says it takes one over, so the next review gets one.
+      log.mockClear();
       const up = await dispatched(false);
       expect(up.github.waitingChecks).toEqual([]);
       expect(await workRows(up.pr.stub)).toMatchObject([{ status: 'running', check_ref: null }]);
@@ -2144,6 +2145,32 @@ describe('PrCoordinator dispatch', () => {
       expect(otherGitHub.waitingChecks).toEqual([]);
       expect(otherGitHub.dispatches).toHaveLength(1);
       expect(logged(log, 'reconciler_check_ability').map((line) => line.takes_over_check)).toEqual([false, true, false]);
+
+      // A run that completes without asking for a token is not the Manki App's, as after a move to a custom App. Its
+      // check ends unclaimed, the stored answer is cleared, and the next review gets none.
+      const moved = await dispatched();
+      log.mockClear();
+      await moved.end();
+      expect(moved.github.waitingChecks).toMatchObject([{ status: 'completed', conclusion: 'cancelled', output: { title: 'Review did not run' } }]);
+      await moved.push(SHA_2);
+      expect(moved.github.waitingChecks).toHaveLength(1);
+      // A run that asks with the flag stores the answer again, also while it holds no check. The review after it gets one.
+      expect(await moved.ask({ takes_over_check: true }, 9001)).not.toHaveProperty('check_run');
+      await moved.end('success', 9001);
+      await moved.push(SHA_3);
+      expect(moved.github.waitingChecks).toMatchObject([{ head_sha: SHA_1 }, { id: 501, head_sha: SHA_3, status: 'queued' }]);
+      expect(logged(log, 'reconciler_check_ability').map((line) => line.takes_over_check)).toEqual([false, true]);
+
+      // A run that asked and ended without a review keeps the answer, and so does a review that never got a run.
+      const kept = await dispatched();
+      await kept.ask({ takes_over_check: true });
+      await kept.end();
+      await kept.push(SHA_2);
+      expect(kept.github.waitingChecks).toMatchObject([{ output: { title: 'Review did not run' } }, { head_sha: SHA_2, status: 'queued' }]);
+      const refused = await dispatched(true, { dispatchStatuses: [422] });
+      await refused.push(SHA_2);
+      expect(refused.github.waitingChecks).toMatchObject([{ output: { title: 'Review could not start' } }, { head_sha: SHA_2, status: 'queued' }]);
+      expect(logged(log, 'reconciler_check_ability').map((line) => line.takes_over_check)).toEqual([false, true]);
     });
 
     it('creates no waiting check while the registry cannot be read, and believes a run only once the registry stored it', async () => {

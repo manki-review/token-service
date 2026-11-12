@@ -123,6 +123,8 @@ export interface WorkRow extends Record<string, string | number | null> {
   check_ref: string | null;
   /** 1 once a run that reports in a check of its own started, so the waiting check ends at once. */
   check_own: number;
+  /** 1 once the review's run asked `/token` while the review held a waiting check. */
+  check_asked: number;
 }
 
 /** The waiting `Manki` check of a review, as `/token` names it to the review's run. */
@@ -307,7 +309,8 @@ export const MIGRATIONS = [
   `ALTER TABLE work ADD COLUMN check_id INTEGER;
    ALTER TABLE work ADD COLUMN check_head TEXT;
    ALTER TABLE work ADD COLUMN check_ref TEXT;
-   ALTER TABLE work ADD COLUMN check_own INTEGER NOT NULL DEFAULT 0;`,
+   ALTER TABLE work ADD COLUMN check_own INTEGER NOT NULL DEFAULT 0;
+   ALTER TABLE work ADD COLUMN check_asked INTEGER NOT NULL DEFAULT 0;`,
 ];
 
 const ACTIVE = `status IN ('dispatching', 'running')`;
@@ -460,6 +463,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const held = () => this.sql.exec<WorkRow>(`SELECT * FROM work WHERE ${ACTIVE} AND run_id = ? AND check_ref IS NOT NULL`, runId).toArray()[0];
     const asked = held();
     if (!asked?.check_head) return null;
+    this.sql.exec('UPDATE work SET check_asked = 1 WHERE id = ?', asked.id);
     const target = await this.verifiedTarget();
     const token = target && await this.token({ checks: 'write' });
     const handOver = takesOver && target !== null && token !== null && await this.holdsVerdict(asked, target, token, true);
@@ -1208,7 +1212,7 @@ export class PrCoordinator extends DurableObject<Env> {
       title: 'Waiting for a runner',
       summary: `Manki started the review run for \`${head.slice(0, 7)}\`. It begins when GitHub Actions gives the run a runner.`,
     };
-    this.sql.exec('UPDATE work SET check_id = NULL, check_head = ?, check_ref = ?, check_own = 0 WHERE id = ?', head, item.delivery, item.id);
+    this.sql.exec('UPDATE work SET check_id = NULL, check_head = ?, check_ref = ?, check_own = 0, check_asked = 0 WHERE id = ?', head, item.delivery, item.id);
     const created = await githubApi(token, `${repo}/check-runs`, {
       method: 'POST',
       body: { name: 'Manki', head_sha: head, status: 'queued', external_id: item.delivery, output },
@@ -1229,7 +1233,9 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /**
    * Ends every waiting check whose review ended or whose run reports in a check of its own. A failure is logged and
-   * tried again. Returns whether none is left to end.
+   * tried again. Returns whether none is left to end. A run that completed without asking `/token` is not the Manki
+   * App's, as with a custom App, so the registry is told that the repository's runs take no check over. The next
+   * `/token` request that says they do stores that again.
    */
   private async endWaitingChecks(): Promise<boolean> {
     const rows = this.checksToEnd();
@@ -1238,6 +1244,7 @@ export class PrCoordinator extends DurableObject<Env> {
       const target = await this.verifiedTarget();
       const token = target && await this.token({ checks: 'write' });
       for (const row of rows) {
+        if (row.status === 'done' && !row.check_asked) await this.rememberCheckAbility(false);
         if (target && token) await this.endWaitingCheck(row, target, token);
         else this.forgetCheck(row.id);
       }
@@ -1291,7 +1298,7 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   private forgetCheck(id: number): void {
-    this.sql.exec('UPDATE work SET check_id = NULL, check_head = NULL, check_ref = NULL, check_own = 0 WHERE id = ?', id);
+    this.sql.exec('UPDATE work SET check_id = NULL, check_head = NULL, check_ref = NULL, check_own = 0, check_asked = 0 WHERE id = ?', id);
   }
 
   /**
