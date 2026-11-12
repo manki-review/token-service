@@ -1200,11 +1200,13 @@ export class PrCoordinator extends DurableObject<Env> {
     // A check whose create reply was lost is looked for when its run asks for a token and when the review ends. Until then the review gets no other.
     const lost = item.check_ref !== null && item.check_id === null;
     if (head === null || item.check_head === head || lost) return;
+    const wanted = () => create && this.env.WAITING_CHECK_ENABLED === 'true' && this.getMeta<CachedOptIn>('opt_in')?.takesOverCheck === true;
+    if (!wanted() && item.check_id === null) return;
     const token = await this.token({ checks: 'write' });
     if (token === null) return;
     const repo = `/repos/${target.owner}/${target.repo}`;
     if (item.check_id !== null) await this.endWaitingCheck(item, target, token, true);
-    if (!create || this.env.WAITING_CHECK_ENABLED !== 'true' || this.getMeta<CachedOptIn>('opt_in')?.takesOverCheck !== true) return;
+    if (!wanted()) return;
     const list = await githubApi(token, `${repo}/commits/${head}/check-runs?check_name=Manki&app_id=${this.env.APP_ID}&filter=all&per_page=1`);
     if (!list.ok) throw new Error(`listing the Manki checks failed with ${list.status}`);
     if (((await list.json()) as { total_count: number }).total_count > 0) return;

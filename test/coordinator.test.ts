@@ -1830,6 +1830,9 @@ describe('PrCoordinator dispatch', () => {
       return { pr, github, ask, end, push };
     };
 
+    /** The tokens minted for check runs. */
+    const checkMints = (github: ReturnType<typeof fakeGitHub>) => github.mints.filter((mint) => 'checks' in mint.permissions);
+
     it('shows a queued `Manki` check before the dispatch, and hands it to a run that takes it over', async () => {
       const pr = pullRequest();
       const github = fakeGitHub(pr.number);
@@ -2120,6 +2123,8 @@ describe('PrCoordinator dispatch', () => {
       log.mockClear();
       const up = await dispatched(false);
       expect(up.github.waitingChecks).toEqual([]);
+      // With no check to create or end, no token for checks is minted.
+      expect(checkMints(up.github)).toEqual([]);
       expect(await workRows(up.pr.stub)).toMatchObject([{ status: 'running', check_ref: null }]);
       expect(await up.ask({ takes_over_check: true })).not.toHaveProperty('check_run');
       await up.end();
@@ -2211,12 +2216,16 @@ describe('PrCoordinator dispatch', () => {
       await push(SHA_2);
       expect(github.waitingChecks).toHaveLength(1);
       expect(await workRows(pr.stub)).toMatchObject([{ status: 'done' }, { status: 'running', check_ref: null }]);
+      const fresh = await dispatched();
+      expect(fresh.github.waitingChecks).toEqual([]);
+      expect(checkMints(fresh.github)).toEqual([]);
       setWaitingCheckEnabled(true);
 
       // With `auto_review` off the run of a push reviews nothing. A value that is not `true` and a config that does not parse count as off.
       for (const config of ['auto_review: false', 'auto_review: sometimes', 'auto_review: [true']) {
         const off = await dispatched(true, { config });
         expect(off.github.waitingChecks).toEqual([]);
+        expect(checkMints(off.github)).toEqual([]);
         expect(off.github.dispatches).toHaveLength(1);
       }
       expect((await dispatched(true, { config: 'auto_review: true' })).github.waitingChecks).toEqual([WAITING]);
