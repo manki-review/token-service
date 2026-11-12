@@ -111,6 +111,14 @@ export function reviewsDrafts(config: BaseConfig): boolean {
   return config?.drafts === 'review';
 }
 
+/**
+ * Whether `config` is known to leave automatic reviews of a push on. A config that could not be read (null) is not, and
+ * neither is an `auto_review` that is not `true`.
+ */
+export function autoReviewIsOn(config: BaseConfig): boolean {
+  return config !== null && (config.auto_review === undefined || config.auto_review === true);
+}
+
 export interface SkipFacts {
   labels: string[];
   author?: string;

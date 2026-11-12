@@ -80,6 +80,9 @@ export default {
         log('token_refused', { ...workflow, event_name: claims.event_name, workflow_ref: claims.workflow_ref, reason: run.refused });
         return Response.json({ error: `Only the run Manki dispatched gets a token: ${run.refused}` }, { status: 403 });
       }
+      // A run that does not take over its waiting check reports in a check of its own, so the waiting one ends before any token leaves.
+      const check = await env.PR_COORDINATOR.getByName(`${repositoryId}:${run.pr}`)
+        .handOverCheck(Number(claims.run_id), verified.body.takes_over_check === true);
 
       const tokenResponse = await createInstallationToken(appJwt, installation.id, permissions, { repository_ids: [repositoryId] });
 
@@ -89,7 +92,7 @@ export default {
 
       const tokenData = await tokenResponse.json() as MintedToken & { permissions: Permissions };
       logMintedToken({ purpose: 'review', ...workflow, installation_id: installation.id, permissions: tokenData.permissions });
-      return Response.json({ token: tokenData.token, expires_at: tokenData.expires_at, permissions: tokenData.permissions });
+      return Response.json({ token: tokenData.token, expires_at: tokenData.expires_at, permissions: tokenData.permissions, ...(check && { check_run: check }) });
     } catch (error) {
       return failure(500, 'Token generation failed', { detail: String(error) });
     }

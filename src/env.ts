@@ -12,6 +12,8 @@ export interface Env {
   WEBHOOK_SECRET_PREVIOUS?: string;
   /** `"true"` lets the coordinators start runs. Anything else only logs what they would start. */
   DISPATCH_ENABLED?: string;
+  /** `"true"` lets the coordinators create a waiting `Manki` check. Anything else creates none, and open ones still end. */
+  WAITING_CHECK_ENABLED?: string;
   /**
    * Comma-separated ids of the accounts whose repositories' deliveries reach a coordinator. Any other is logged and
    * dropped.

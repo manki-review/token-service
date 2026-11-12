@@ -35,12 +35,15 @@ const FAILED_WRITES = new Set([
   'coordinator_conflict_note_failed',
   'coordinator_starting_status_failed',
   'coordinator_cancel_report_failed',
+  'coordinator_waiting_check_failed',
   'coordinator_reaction_failed',
   'coordinator_reaction_error',
 ]);
 
 /** The messages the window query reads, besides timed out items and any line with a 5xx status or error. */
-export const SIGNAL_MESSAGES = ['coordinator_start_error', ...FAILED_WRITES, 'coordinator_requeued', 'coordinator_cancel_failed'];
+export const SIGNAL_MESSAGES = [
+  'coordinator_start_error', ...FAILED_WRITES, 'coordinator_waiting_check_refused', 'coordinator_requeued', 'coordinator_cancel_failed',
+];
 
 /** The messages that queue, hold, start or end work, which the stuck work check reads over a longer span. */
 export const QUEUE_MESSAGES = [
@@ -125,7 +128,9 @@ function finding(title: string, matches: Match[], publicRepos: ReadonlySet<strin
 export function findings(signals: LogEvent[], queue: LogEvent[], now: number, publicRepos: ReadonlySet<string>): Finding[] {
   const starts = signals.filter((event) => event.source.msg === 'coordinator_start_error')
     .map((event) => ({ event, detail: text(event.source.error) }));
-  const writes = signals.filter((event) => FAILED_WRITES.has(text(event.source.msg)))
+  // A waiting check GitHub forbids to end stays queued on its commit. One that is gone (404) leaves nothing behind.
+  const forbidden = (source: Record<string, unknown>) => source.msg === 'coordinator_waiting_check_refused' && source.status === 403;
+  const writes = signals.filter((event) => FAILED_WRITES.has(text(event.source.msg)) || forbidden(event.source))
     .map((event) => ({ event, detail: text(event.source.error ?? (event.source.status === undefined ? '' : `status ${text(event.source.status)}`)) }));
   const cancels = signals.filter((event) => event.source.msg === 'coordinator_requeued'
     || event.source.msg === 'coordinator_cancel_failed'
