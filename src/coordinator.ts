@@ -159,6 +159,18 @@ interface PullRequestRead {
   base: { ref: string };
 }
 
+/** An entry of GitHub's list of the pull requests of a commit. */
+interface HeadPull {
+  number: number;
+  state: string;
+  head: { sha: string; repo?: { id?: number } | null };
+}
+
+function isHeadPull(pull: unknown): pull is HeadPull {
+  const { number, state, head } = (pull ?? {}) as Partial<HeadPull>;
+  return Number.isInteger(number) && typeof state === 'string' && typeof head?.sha === 'string';
+}
+
 /** The opt-in result as cached, with the repository as GitHub names it when it was read. */
 type CachedOptIn = OptIn & {
   expires: number;
@@ -1721,7 +1733,8 @@ export class PrCoordinator extends DurableObject<Env> {
    * Returns the open pull request that is reviewed instead of this one, or null when this one is reviewed. A commit has
    * one `Manki` status, so of the repository's open pull requests with the head `pr.head.sha` only the one with the
    * lowest number is reviewed. GitHub also lists a pull request that merely contains the commit, which does not count.
-   * In doubt the review runs: when the list fails, may be cut off or does not name this pull request.
+   * In doubt the review runs: when the list fails, is not a list of pull requests, may be cut off or does not name this
+   * pull request.
    */
   private async reviewedInstead(pr: PullRequestRead, target: Target, token: string): Promise<number | null> {
     const head = pr.head.sha;
@@ -1729,21 +1742,21 @@ export class PrCoordinator extends DurableObject<Env> {
       log('coordinator_head_pulls_unsure', { ...this.logFields(), head_sha: head, reason });
       return null;
     };
-    let listed: Array<{ number: number; state: string; head: { sha: string; repo?: { id?: number } | null } }>;
     try {
       const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/commits/${head}/pulls?per_page=${HEAD_PULLS_PAGE}`);
       if (!response.ok) return unsure(`listing the pull requests of the commit failed with ${response.status}`);
-      listed = await response.json();
+      const listed: unknown = await response.json();
+      if (!Array.isArray(listed) || !listed.every(isHeadPull)) return unsure('the reply is not a list of pull requests');
+      if (listed.length >= HEAD_PULLS_PAGE) return unsure('the list may be cut off');
+      const sharing = listed
+        .filter((pull) => pull.state === 'open' && pull.head.sha === head && pull.head.repo?.id === target.repositoryId)
+        .map((pull) => pull.number);
+      if (!sharing.includes(target.number)) return unsure('the list does not name this pull request');
+      const lowest = Math.min(...sharing);
+      return lowest < target.number ? lowest : null;
     } catch (error) {
       return unsure(`listing the pull requests of the commit failed: ${error instanceof Error ? error.message : String(error)}`);
     }
-    if (listed.length >= HEAD_PULLS_PAGE) return unsure('the list may be cut off');
-    const sharing = listed
-      .filter((pull) => pull.state === 'open' && pull.head.sha === head && pull.head.repo?.id === target.repositoryId)
-      .map((pull) => pull.number);
-    if (!sharing.includes(target.number)) return unsure('the list does not name this pull request');
-    const lowest = Math.min(...sharing);
-    return lowest < target.number ? lowest : null;
   }
 
   /**

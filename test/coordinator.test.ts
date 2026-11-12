@@ -692,6 +692,8 @@ function fakeGitHub(number: number) {
     otherPulls: [] as Array<{ number: number; state?: string; head?: string; repositoryId?: number }>,
     listsOwnPull: true,
     pullListStatus: 200,
+    /** What the list returns in place of the pull requests: a string as the raw reply, anything else as JSON. */
+    pullListBody: undefined as unknown,
     /** The commits whose pull requests were listed. */
     pullLists: [] as string[],
     /** The base branch's `.manki.yml`, or null when it has none. */
@@ -828,6 +830,8 @@ function fakeGitHub(number: number) {
       state.pullLists.push(headPulls[1]);
       if (state.pullListStatus === 0) throw new Error('connection lost');
       if (state.pullListStatus !== 200) return Response.json({ message: 'no' }, { status: state.pullListStatus });
+      if (typeof state.pullListBody === 'string') return new Response(state.pullListBody);
+      if (state.pullListBody !== undefined) return Response.json(state.pullListBody);
       const own = { number, state: state.prState, head: { sha: state.head, repo: { id: state.headRepositoryId } } };
       return Response.json([...(state.listsOwnPull ? [own] : []), ...state.otherPulls.map((pull) => ({
         number: pull.number, state: pull.state ?? 'open', head: { sha: pull.head ?? headPulls[1], repo: { id: pull.repositoryId ?? REPOSITORY_ID } },
@@ -1637,7 +1641,7 @@ describe('PrCoordinator dispatch', () => {
     // Each of these is reviewed: nothing else shares its head, or GitHub's answer leaves that in doubt.
     const below = () => ({ number: pullRequest().number });
     const many = Array.from({ length: 99 }, (_unused, index) => ({ number: index + 1 }));
-    const unsure = (reason: string) => [expect.objectContaining({ head_sha: SHA_1, reason })];
+    const unsure = (reason: unknown) => [expect.objectContaining({ head_sha: SHA_1, reason })];
     for (const [set, doubt] of [
       // The lower PR closed, so its number no longer counts.
       [() => ({ otherPulls: [{ ...below(), state: 'closed' }] }), []],
@@ -1647,6 +1651,10 @@ describe('PrCoordinator dispatch', () => {
       [() => ({ otherPulls: [{ ...below(), repositoryId: REPOSITORY_ID + 1 }] }), []],
       [() => ({ otherPulls: [below()], pullListStatus: 500 }), unsure('listing the pull requests of the commit failed with 500')],
       [() => ({ otherPulls: [below()], pullListStatus: 0 }), unsure('listing the pull requests of the commit failed: connection lost')],
+      [() => ({ pullListBody: 'Bad gateway' }), unsure(expect.stringMatching(/^listing the pull requests of the commit failed: /))],
+      // A reply that is no list, or a list with an entry that cannot be read, is not a whole answer.
+      ...[{ message: 'Moved' }, null, [null], [{ number: 1, state: 'open' }], [{ number: 1, state: 'open', head: null }], [{ state: 'open', head: { sha: SHA_1 } }]]
+        .map((pullListBody) => [() => ({ pullListBody }), unsure('the reply is not a list of pull requests')] as [() => object, unknown[]]),
       // GitHub lists only the merged PR for a commit of the default branch.
       [() => ({ otherPulls: [{ ...below(), state: 'closed' }], listsOwnPull: false }), unsure('the list does not name this pull request')],
       [() => ({ otherPulls: many }), unsure('the list may be cut off')],
