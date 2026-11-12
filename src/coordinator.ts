@@ -1217,10 +1217,7 @@ export class PrCoordinator extends DurableObject<Env> {
     if (token === null) return;
     const repo = `/repos/${target.owner}/${target.repo}`;
     if (item.check_id !== null) await this.endWaitingCheck(item, target, token, true);
-    if (!wanted()) return;
-    const list = await githubApi(token, `${repo}/commits/${head}/check-runs?check_name=Manki&app_id=${this.env.APP_ID}&filter=all&per_page=1`);
-    if (!list.ok) throw new Error(`listing the Manki checks failed with ${list.status}`);
-    if (((await list.json()) as { total_count: number }).total_count > 0) return;
+    if (!wanted() || await this.hasMankiCheck(head, target, token)) return;
     const output = {
       title: 'Waiting for a runner',
       summary: `Manki started the review run for \`${head.slice(0, 7)}\`. It begins when GitHub Actions gives the run a runner.`,
@@ -1237,6 +1234,14 @@ export class PrCoordinator extends DurableObject<Env> {
     }
     const { id } = await created.json() as { id: number };
     this.sql.exec('UPDATE work SET check_id = ? WHERE id = ?', id, item.id);
+  }
+
+  /** Whether `head` holds a `Manki` check of the App, in any state. Throws when GitHub fails to list them. */
+  private async hasMankiCheck(head: string, target: Target, token: string): Promise<boolean> {
+    const path = `/repos/${target.owner}/${target.repo}/commits/${head}/check-runs?check_name=Manki&app_id=${this.env.APP_ID}&filter=all&per_page=1`;
+    const list = await githubApi(token, path);
+    if (!list.ok) throw new Error(`listing the Manki checks failed with ${list.status}`);
+    return ((await list.json()) as { total_count: number }).total_count > 0;
   }
 
   /** Returns the reviews whose waiting check is still to end. */
@@ -1642,16 +1647,21 @@ export class PrCoordinator extends DurableObject<Env> {
     this.finish(item.id, 'done', 'answered help');
   }
 
+  /** Reads the PR, and returns it with the token that read it. Throws when it cannot be read. */
+  private async readPull(target: Target): Promise<{ pr: PullRequestRead; token: string }> {
+    const token = await this.token({ pull_requests: 'read' });
+    if (token === null) throw new Error('could not mint a token to read the pull request');
+    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/pulls/${target.number}`);
+    if (!response.ok) throw new Error(`reading the pull request failed with ${response.status}`);
+    return { pr: await response.json() as PullRequestRead, token };
+  }
+
   /**
    * Re-reads the PR before a review starts. Returns null when the review does not start now, and otherwise whether its
    * run may get a waiting check.
    */
   private async refreshReview(item: WorkRow, target: Target): Promise<{ waitingCheck: boolean } | null> {
-    const token = await this.token({ pull_requests: 'read' });
-    if (token === null) throw new Error('could not mint a token to read the pull request');
-    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/pulls/${target.number}`);
-    if (!response.ok) throw new Error(`reading the pull request failed with ${response.status}`);
-    const pr = await response.json() as PullRequestRead;
+    const { pr, token } = await this.readPull(target);
     if (!this.isDispatching(item.id)) return null;
     if (pr.state !== 'open') {
       this.finish(item.id, 'dropped', 'pull request closed');
