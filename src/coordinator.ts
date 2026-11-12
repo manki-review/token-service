@@ -64,6 +64,8 @@ const WRITER_CACHE_MS = 5 * MINUTE;
 const REACTION_BUDGET = 18;
 /** How long a review waits before each new read of a PR whose mergeability GitHub has not computed yet. */
 const MERGEABILITY_RETRY_MS = [5_000, 15_000];
+/** GitHub's largest page of the pull requests of a commit. A full page may be cut off. */
+const HEAD_PULLS_PAGE = 100;
 /** Marks the Worker's note that a review waits for a rebase. Manki removes it once a review posts. */
 export const CONFLICT_NOTE_MARKER = '<!-- manki-conflict-note -->';
 const NOT_STARTED = new Set(['queued', 'requested', 'waiting', 'pending']);
@@ -1653,6 +1655,13 @@ export class PrCoordinator extends DurableObject<Env> {
       this.finish(item.id, 'dropped', 'pull request is a draft');
       return null;
     }
+    const reviewed = first ? await this.reviewedInstead(pr, target, token) : null;
+    if (!this.isDispatching(item.id)) return null;
+    if (reviewed !== null) {
+      await this.reportYielded(item, pr.head.sha, reviewed, target);
+      if (this.isDispatching(item.id)) this.finish(item.id, 'skipped', `#${reviewed} has the same head commit`);
+      return null;
+    }
     let waitingCheck = true;
     if (push) {
       // With `auto_review` off the run of a push reviews nothing, so only a config read as leaving it on allows the check.
@@ -1706,6 +1715,56 @@ export class PrCoordinator extends DurableObject<Env> {
     }
     this.sql.exec('UPDATE work SET run_head = ? WHERE id = ?', pr.head.sha, item.id);
     return { waitingCheck };
+  }
+
+  /**
+   * Returns the open pull request that is reviewed instead of this one, or null when this one is reviewed. A commit has
+   * one `Manki` status, so of the repository's open pull requests with the head `pr.head.sha` only the one with the
+   * lowest number is reviewed. GitHub also lists a pull request that merely contains the commit, which does not count.
+   * In doubt the review runs: when the list fails, may be cut off or does not name this pull request.
+   */
+  private async reviewedInstead(pr: PullRequestRead, target: Target, token: string): Promise<number | null> {
+    const head = pr.head.sha;
+    const unsure = (reason: string): null => {
+      log('coordinator_head_pulls_unsure', { ...this.logFields(), head_sha: head, reason });
+      return null;
+    };
+    let listed: Array<{ number: number; state: string; head: { sha: string; repo?: { id?: number } | null } }>;
+    try {
+      const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/commits/${head}/pulls?per_page=${HEAD_PULLS_PAGE}`);
+      if (!response.ok) return unsure(`listing the pull requests of the commit failed with ${response.status}`);
+      listed = await response.json();
+    } catch (error) {
+      return unsure(`listing the pull requests of the commit failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (listed.length >= HEAD_PULLS_PAGE) return unsure('the list may be cut off');
+    const sharing = listed
+      .filter((pull) => pull.state === 'open' && pull.head.sha === head && pull.head.repo?.id === target.repositoryId)
+      .map((pull) => pull.number);
+    if (!sharing.includes(target.number)) return unsure('the list does not name this pull request');
+    const lowest = Math.min(...sharing);
+    return lowest < target.number ? lowest : null;
+  }
+
+  /**
+   * Tells the PR once per head that `reviewed` is reviewed instead of it: in the status line of Manki's settings
+   * comment, or in a Manki note when there is none. It gets no check, which would be the newest on the commit that
+   * `reviewed` shares. A failure is logged and still skips the review.
+   */
+  private async reportYielded(item: WorkRow, head: string, reviewed: number, target: Target): Promise<void> {
+    const told = `${head}:${reviewed}`;
+    if (this.getMeta<string>('yielded') === told) return;
+    const sha = `\`${head.slice(0, 7)}\``;
+    const note = `Manki reviews one pull request per commit. #${reviewed} has the same head commit ${sha} and the lower number, so Manki reviews #${reviewed} and not this pull request. `
+      + `The \`Manki\` check shown here is the one of #${reviewed}. To have this pull request reviewed, close #${reviewed} and comment \`/manki review\` here, or push a commit that only this pull request has.`;
+    try {
+      if (!(await this.showStatus(head, target, `not reviewed, #${reviewed} has the same head commit`, modesOf(item)))) {
+        await this.postNote(`${note}\n\n${CONFLICT_NOTE_MARKER}`, target);
+      }
+      this.setMeta('yielded', told);
+    } catch (error) {
+      log('coordinator_yielded_report_failed', { ...this.logFields(), head_sha: head, reviewed, error: error instanceof Error ? error.message : String(error) });
+    }
   }
 
   /**

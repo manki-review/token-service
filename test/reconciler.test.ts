@@ -116,6 +116,12 @@ function fakeGitHub() {
       const found = (state.pulls.get(single[1]) ?? []).find((candidate) => candidate.number === Number(single[2]));
       return Response.json({ state: 'open', draft: false, head: { sha: found?.head.sha, ref: 'feature' }, base: { ref: 'main' } });
     }
+    const ofCommit = url.pathname.match(/^\/repos\/[^/]+\/([^/]+)\/commits\/([0-9a-f]+)\/pulls$/);
+    if (ofCommit && request.method === 'GET') {
+      const id = ofCommit[1] === 'manki' ? 4242 : Number(ofCommit[1].replace('repo-', ''));
+      return Response.json((state.pulls.get(ofCommit[1]) ?? []).filter((candidate) => candidate.head.sha === ofCommit[2])
+        .map((candidate) => ({ number: candidate.number, state: 'open', head: { sha: candidate.head.sha, repo: { id } } })));
+    }
     if (/^\/repos\/[^/]+\/[^/]+\/contents\/\.manki\.yml$/.test(url.pathname)) return Response.json({ message: 'Not Found' }, { status: 404 });
     if (url.pathname.endsWith('/actions/workflows/manki-dispatch.yml/dispatches') && request.method === 'POST') {
       state.dispatches++;
