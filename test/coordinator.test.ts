@@ -1568,7 +1568,7 @@ describe('PrCoordinator dispatch', () => {
     expect(github.dispatches).toEqual([]);
     expect(github.checkRuns.map((check) => check.head_sha)).toEqual([SHA_1]);
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped', conclusion: 'conflict', errors: 0 }]);
-    expect(logged(log, 'coordinator_conflict_note_failed')).toMatchObject([{ error: 'Error: posting the conflict note failed with 403' }]);
+    expect(logged(log, 'coordinator_conflict_note_failed')).toMatchObject([{ error: 'Error: posting the note failed with 403' }]);
     // A comment on a pull request needs `pull_requests: write`.
     expect(github.mints).toContainEqual({ permissions: { issues: 'write', pull_requests: 'write' }, repository_ids: [REPOSITORY_ID] });
 

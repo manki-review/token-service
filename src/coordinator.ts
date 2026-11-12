@@ -5,7 +5,7 @@ import { githubApi, githubGraphql, hasWriteAccess, isRateLimited, isRefusal, typ
 import { log } from './log';
 import {
   autoReviewIsOn, type BaseConfig, BOT_LOGIN, boxLabels, type BoxChange, cancelledProgress, HELP_REPLY, isMankiGraphqlLogin, isRunningProgress, MANKI_COMMENT_MARKER,
-  MANKI_LOGINS, matchSkipRule, parseConfig, REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes, settingsHead, skipRulesOf, withSettingsStatus,
+  MANKI_LOGINS, matchSkipRule, parseConfig, REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes, type SettingsBox, settingsHead, skipRulesOf, withSettingsStatus,
 } from './manki';
 import { type OptIn, readOptIn, type Repository } from './opt-in';
 import type { Permissions } from './permissions';
@@ -1643,19 +1643,20 @@ export class PrCoordinator extends DurableObject<Env> {
       this.finish(item.id, 'dropped', 'pull request closed');
       return null;
     }
+    // A retry after a dispatch attempt may find that attempt's run, so only the first attempt can drop or skip.
+    const first = item.attempts === 0;
+    const push = item.event.startsWith('pull_request.');
+    const config = push && first ? await this.baseConfig(pr, target) : null;
+    if (!this.isDispatching(item.id)) return null;
+    // A draft is reviewed on request, such as by its settings box, unless the base config reviews drafts.
+    if (push && first && pr.draft && !reviewsDrafts(config)) {
+      this.finish(item.id, 'dropped', 'pull request is a draft');
+      return null;
+    }
     let waitingCheck = true;
-    if (item.event.startsWith('pull_request.')) {
-      // A retry after a dispatch attempt may find that attempt's run, so only the first attempt can drop or skip.
-      const first = item.attempts === 0;
-      const config = first ? await this.baseConfig(pr, target) : null;
-      if (!this.isDispatching(item.id)) return null;
+    if (push) {
       // With `auto_review` off the run of a push reviews nothing, so only a config read as leaving it on allows the check.
       waitingCheck = first && autoReviewIsOn(config);
-      // A draft is reviewed on request, such as by its settings box, unless the base config reviews drafts.
-      if (first && pr.draft && !reviewsDrafts(config)) {
-        this.finish(item.id, 'dropped', 'pull request is a draft');
-        return null;
-      }
       const rule = first ? this.skipRule(config, pr, item.head_sha, item.sender, target) : null;
       if (rule !== null) {
         await this.reportSkipped(pr.head.sha, rule, target);
@@ -1714,7 +1715,7 @@ export class PrCoordinator extends DurableObject<Env> {
   private async reportConflict(pr: PullRequestRead, target: Target): Promise<void> {
     const text = `This PR conflicts with \`${pr.base.ref}\`. Rebase it, and Manki reviews it then.`;
     try {
-      await this.postConflictNote(`${text}\n\n${CONFLICT_NOTE_MARKER}`, target);
+      await this.postNote(`${text}\n\n${CONFLICT_NOTE_MARKER}`, target);
     } catch (error) {
       // The note only explains the skip, so a failure to post it never holds the lane.
       log('coordinator_conflict_note_failed', { ...this.logFields(), error: String(error) });
@@ -1722,8 +1723,8 @@ export class PrCoordinator extends DurableObject<Env> {
     await this.completeCheck(pr.head.sha, 'action_required', { title: 'Rebase needed', summary: text }, target, pr.html_url);
   }
 
-  /** Posts the conflict note, or edits the one an earlier skip posted. */
-  private async postConflictNote(body: string, target: Target): Promise<void> {
+  /** Posts the Manki note that says why no review starts, or edits the one an earlier skip posted. */
+  private async postNote(body: string, target: Target): Promise<void> {
     // A comment on a pull request needs `pull_requests: write`, one on a plain issue `issues: write`.
     const token = await this.token({ issues: 'write', pull_requests: 'write' });
     if (token === null) return;
@@ -1733,10 +1734,10 @@ export class PrCoordinator extends DurableObject<Env> {
     // Manki deletes the note once a review posts, so a note that is gone is posted again.
     if (edited === null || edited.status === 404) {
       const posted = await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/${target.number}/comments`, { method: 'POST', body: { body } });
-      if (!posted.ok) throw new Error(`posting the conflict note failed with ${posted.status}`);
+      if (!posted.ok) throw new Error(`posting the note failed with ${posted.status}`);
       this.setMeta('conflict_note', ((await posted.json()) as { id: number }).id);
     } else if (!edited.ok) {
-      throw new Error(`updating the conflict note failed with ${edited.status}`);
+      throw new Error(`updating the note failed with ${edited.status}`);
     }
   }
 
@@ -1792,20 +1793,24 @@ export class PrCoordinator extends DurableObject<Env> {
       await this.completeCheck(head, 'action_required', output, target, pr.html_url)
         .then(() => this.setMeta('paused_head', head), failed('check'));
     }
-    await this.showPaused(head, target).catch(failed('comment'));
+    await this.showStatus(head, target, `automatic review paused, \`${head.slice(0, 7)}\` waits`).catch(failed('comment'));
   }
 
-  /** Sets the status line of Manki's newest settings comment, among the PR's newest comments, to say that `head` waits. */
-  private async showPaused(head: string, target: Target): Promise<void> {
+  /**
+   * Sets the status line of Manki's newest settings comment, among the PR's newest comments, to `status` for `head`, and
+   * clears the boxes in `untick`. Returns whether a settings comment shows it.
+   */
+  private async showStatus(head: string, target: Target, status: string, untick: SettingsBox[] = []): Promise<boolean> {
     const token = await this.token({ issues: 'write', pull_requests: 'write' });
-    if (token === null) return;
+    if (token === null) return false;
     const settings = await this.newestMankiComment(token, target, (body) => settingsHead(body) !== null);
     // A progress comment still in progress belongs to its run, which may edit it at any time.
-    if (!settings || isRunningProgress(settings.body)) return;
-    const body = withSettingsStatus(settings.body, `automatic review paused, \`${head.slice(0, 7)}\` waits`, [], head);
-    if (body === settings.body) return;
+    if (!settings || isRunningProgress(settings.body)) return false;
+    const body = withSettingsStatus(settings.body, status, untick, head);
+    if (body === settings.body) return true;
     const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/comments/${settings.id}`, { method: 'PATCH', body: { body } });
-    if (!response.ok) throw new Error(`showing the paused push failed with ${response.status}`);
+    if (!response.ok) throw new Error(`setting the status line failed with ${response.status}`);
+    return true;
   }
 
   /** Completes a `Manki` check on `head` with `output`. Without `checks: write` on the installation, it creates none. */
