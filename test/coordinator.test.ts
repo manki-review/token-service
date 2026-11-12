@@ -2203,6 +2203,21 @@ describe('PrCoordinator dispatch', () => {
       expect(await workRows(pr.stub)).toMatchObject([{ check_id: null }, { status: 'running', check_id: null }]);
       expect(github.dispatches).toHaveLength(2);
 
+      // A thread reply goes ahead of a review state check, and waits for the check to end like any item of the lane.
+      const held = await dispatched();
+      await held.pr.send('pull_request_review', held.pr.review());
+      await held.pr.send('pull_request_review_comment', held.pr.reply('Fixed'));
+      held.github.waitingCheckStatuses = [502, 502];
+      await held.end();
+      const kinds = async () => (await workRows(held.pr.stub)).map((row) => `${row.kind}:${row.status}:${row.check_id}`);
+      expect(await kinds()).toEqual(['review:done:500', 'review_state:queued:null', 'thread:queued:null']);
+      expect(held.github.dispatches).toHaveLength(1);
+      advanceClock(POLL_MS);
+      await runDurableObjectAlarm(held.pr.stub);
+      expect(held.github.waitingChecks).toMatchObject([{ status: 'completed', conclusion: 'cancelled' }]);
+      expect(await kinds()).toEqual(['review:done:null', 'review_state:queued:null', 'thread:running:null']);
+      expect(held.github.dispatches).toHaveLength(2);
+
       const gone = await dispatched();
       gone.github.waitingCheckStatuses = [404];
       await gone.end();
