@@ -35,7 +35,8 @@ export type Lane = 'state' | 'chat' | 'help' | 'settings';
  * The Manki handler a work item ends up in. Only `review` items coalesce.
  * - `review`: `handlePullRequest` or `handleCommentTrigger`
  * - `merged`: `handleMergedPullRequest`
- * - `review_state`: `handleReviewStateCheck`, also for a resolved or reopened thread
+ * - `review_state`: `handleReviewStateCheck`, also for a resolved or reopened thread. The coordinator turns a PR marked
+ *   ready into one when its head has a review
  * - `thread`: `handleReviewCommentInteraction`
  * - `comment`: `handleInteraction`
  * - `issue`: `handleIssueInteraction`
