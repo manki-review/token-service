@@ -5,7 +5,7 @@ import { githubApi, githubGraphql, hasWriteAccess, isRateLimited, isRefusal, typ
 import { log } from './log';
 import {
   autoReviewIsOn, type BaseConfig, BOT_LOGIN, boxLabels, type BoxChange, cancelledProgress, HELP_REPLY, isMankiGraphqlLogin, isRunningProgress, MANKI_COMMENT_MARKER,
-  MANKI_LOGINS, matchSkipRule, parseConfig, REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes, settingsHead, skipRulesOf, withSettingsStatus,
+  MANKI_LOGINS, matchSkipRule, parseConfig, REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes, type SettingsBox, settingsHead, skipRulesOf, withSettingsStatus,
 } from './manki';
 import { type OptIn, readOptIn, type Repository } from './opt-in';
 import type { Permissions } from './permissions';
@@ -64,6 +64,8 @@ const WRITER_CACHE_MS = 5 * MINUTE;
 const REACTION_BUDGET = 18;
 /** How long a review waits before each new read of a PR whose mergeability GitHub has not computed yet. */
 const MERGEABILITY_RETRY_MS = [5_000, 15_000];
+/** GitHub's largest page of the pull requests of a commit. A full page may be cut off. */
+const HEAD_PULLS_PAGE = 100;
 /** Marks the Worker's note that a review waits for a rebase. Manki removes it once a review posts. */
 export const CONFLICT_NOTE_MARKER = '<!-- manki-conflict-note -->';
 const NOT_STARTED = new Set(['queued', 'requested', 'waiting', 'pending']);
@@ -155,6 +157,18 @@ interface PullRequestRead {
   user?: { login?: string } | null;
   head: { sha: string; ref: string; repo?: { id?: number } | null };
   base: { ref: string };
+}
+
+/** An entry of GitHub's list of the pull requests of a commit. */
+interface HeadPull {
+  number: number;
+  state: string;
+  head: { sha: string; repo?: { id?: number } | null };
+}
+
+function isHeadPull(pull: unknown): pull is HeadPull {
+  const { number, state, head } = (pull ?? {}) as Partial<HeadPull>;
+  return Number.isInteger(number) && typeof state === 'string' && typeof head?.sha === 'string';
 }
 
 /** The opt-in result as cached, with the repository as GitHub names it when it was read. */
@@ -1428,13 +1442,13 @@ export class PrCoordinator extends DurableObject<Env> {
     return `${replaced}, ${this.requestReview(item, mode)}`;
   }
 
-  /** Returns comment `id` of `repo`, or null when it is gone. */
-  private async readComment(token: string, repo: string, id: number): Promise<{ id: number; body: string } | null> {
+  /** Returns comment `id` of `repo` and whether one of Manki's logins wrote it, or null when it is gone. */
+  private async readComment(token: string, repo: string, id: number): Promise<{ id: number; body: string; byManki: boolean } | null> {
     const read = await githubApi(token, `${repo}/issues/comments/${id}`);
     if (read.status === 404) return null;
     if (!read.ok) throw new Error(`reading the settings comment failed with ${read.status}`);
-    const { body } = await read.json() as { body?: string };
-    return body ? { id, body } : null;
+    const { body, user } = await read.json() as IssueCommentRead;
+    return body ? { id, body, byManki: MANKI_LOGINS.includes(user?.login ?? '') } : null;
   }
 
   /** Returns the review running since before the edit at `at`, so a late edit cannot reach a newer run. */
@@ -1643,19 +1657,27 @@ export class PrCoordinator extends DurableObject<Env> {
       this.finish(item.id, 'dropped', 'pull request closed');
       return null;
     }
+    // A retry after a dispatch attempt may find that attempt's run, so only the first attempt can drop or skip.
+    const first = item.attempts === 0;
+    const push = item.event.startsWith('pull_request.');
+    const config = push && first ? await this.baseConfig(pr, target) : null;
+    if (!this.isDispatching(item.id)) return null;
+    // A draft is reviewed on request, such as by its settings box, unless the base config reviews drafts.
+    if (push && first && pr.draft && !reviewsDrafts(config)) {
+      this.finish(item.id, 'dropped', 'pull request is a draft');
+      return null;
+    }
+    const reviewed = first ? await this.reviewedInstead(pr, target, token) : null;
+    if (!this.isDispatching(item.id)) return null;
+    if (reviewed !== null) {
+      await this.reportYielded(item, pr.head.sha, reviewed, target);
+      if (this.isDispatching(item.id)) this.finish(item.id, 'skipped', `#${reviewed} has the same head commit`);
+      return null;
+    }
     let waitingCheck = true;
-    if (item.event.startsWith('pull_request.')) {
-      // A retry after a dispatch attempt may find that attempt's run, so only the first attempt can drop or skip.
-      const first = item.attempts === 0;
-      const config = first ? await this.baseConfig(pr, target) : null;
-      if (!this.isDispatching(item.id)) return null;
+    if (push) {
       // With `auto_review` off the run of a push reviews nothing, so only a config read as leaving it on allows the check.
       waitingCheck = first && autoReviewIsOn(config);
-      // A draft is reviewed on request, such as by its settings box, unless the base config reviews drafts.
-      if (first && pr.draft && !reviewsDrafts(config)) {
-        this.finish(item.id, 'dropped', 'pull request is a draft');
-        return null;
-      }
       const rule = first ? this.skipRule(config, pr, item.head_sha, item.sender, target) : null;
       if (rule !== null) {
         await this.reportSkipped(pr.head.sha, rule, target);
@@ -1708,13 +1730,66 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /**
+   * Returns the open pull request that is reviewed instead of this one, or null when this one is reviewed. A commit has
+   * one `Manki` status, so of the repository's open pull requests with the head `pr.head.sha` only the one with the
+   * lowest number is reviewed. GitHub also lists a pull request that merely contains the commit, which does not count.
+   * In doubt the review runs: when the list fails, is not a list of pull requests, may be cut off or does not name this
+   * pull request.
+   */
+  private async reviewedInstead(pr: PullRequestRead, target: Target, token: string): Promise<number | null> {
+    const head = pr.head.sha;
+    const unsure = (reason: string): null => {
+      log('coordinator_head_pulls_unsure', { ...this.logFields(), head_sha: head, reason });
+      return null;
+    };
+    try {
+      const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/commits/${head}/pulls?per_page=${HEAD_PULLS_PAGE}`);
+      if (!response.ok) return unsure(`listing the pull requests of the commit failed with ${response.status}`);
+      const listed: unknown = await response.json();
+      if (!Array.isArray(listed) || !listed.every(isHeadPull)) return unsure('the reply is not a list of pull requests');
+      if (listed.length >= HEAD_PULLS_PAGE) return unsure('the list may be cut off');
+      const sharing = listed
+        .filter((pull) => pull.state === 'open' && pull.head.sha === head && pull.head.repo?.id === target.repositoryId)
+        .map((pull) => pull.number);
+      if (!sharing.includes(target.number)) return unsure('the list does not name this pull request');
+      const lowest = Math.min(...sharing);
+      return lowest < target.number ? lowest : null;
+    } catch (error) {
+      return unsure(`listing the pull requests of the commit failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * Tells the PR that `reviewed` is reviewed instead of it. Manki's settings comments say so in their status line, and
+   * the boxes that asked are unticked. Without a settings comment the PR gets one Manki note per head. A review command
+   * gets the note each time, as a new comment below it. The PR gets no check, which would be the newest on the commit
+   * that `reviewed` shares. A failure is logged and still skips the review.
+   */
+  private async reportYielded(item: WorkRow, head: string, reviewed: number, target: Target): Promise<void> {
+    try {
+      const told = `${head}:${reviewed}`;
+      const shown = await this.showStatus(head, target, `not reviewed, #${reviewed} has the same head commit`, modesOf(item), item.object_id);
+      // A comment that asked and is not a settings comment is a review command.
+      const command = item.object_id !== null && !shown.includes(item.object_id);
+      if (command || (shown.length === 0 && this.getMeta<string>('yielded') !== told)) {
+        const note = `Manki reviews one pull request per commit. #${reviewed} has the same head commit \`${head.slice(0, 7)}\` and the lower number, so Manki reviews #${reviewed} and not this pull request. `
+          + `The \`Manki\` check shown here is the one of #${reviewed}. To have this pull request reviewed, close #${reviewed} and comment \`/manki review\` here, or push a commit that only this pull request has.`;
+        await this.postNote(`${note}\n\n${CONFLICT_NOTE_MARKER}`, target, command);
+      }
+      this.setMeta('yielded', told);
+    } catch (error) {
+      log('coordinator_yielded_report_failed', { ...this.logFields(), head_sha: head, reviewed, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  /**
    * Tells the PR's author that its review waits for a rebase: one Manki note, which replaces the note an earlier skip
    * posted, and a `Manki` check on the head that asks for the rebase.
    */
   private async reportConflict(pr: PullRequestRead, target: Target): Promise<void> {
     const text = `This PR conflicts with \`${pr.base.ref}\`. Rebase it, and Manki reviews it then.`;
     try {
-      await this.postConflictNote(`${text}\n\n${CONFLICT_NOTE_MARKER}`, target);
+      await this.postNote(`${text}\n\n${CONFLICT_NOTE_MARKER}`, target);
     } catch (error) {
       // The note only explains the skip, so a failure to post it never holds the lane.
       log('coordinator_conflict_note_failed', { ...this.logFields(), error: String(error) });
@@ -1722,21 +1797,24 @@ export class PrCoordinator extends DurableObject<Env> {
     await this.completeCheck(pr.head.sha, 'action_required', { title: 'Rebase needed', summary: text }, target, pr.html_url);
   }
 
-  /** Posts the conflict note, or edits the one an earlier skip posted. */
-  private async postConflictNote(body: string, target: Target): Promise<void> {
+  /**
+   * Posts the Manki note that says why no review starts, or edits the one an earlier skip posted. With `anew` the note
+   * replaces that one as a new comment, so it stands below the comment it answers.
+   */
+  private async postNote(body: string, target: Target, anew = false): Promise<void> {
     // A comment on a pull request needs `pull_requests: write`, one on a plain issue `issues: write`.
     const token = await this.token({ issues: 'write', pull_requests: 'write' });
     if (token === null) return;
     const noteId = this.getMeta<number>('conflict_note');
     const edited = noteId === null ? null
-      : await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/comments/${noteId}`, { method: 'PATCH', body: { body } });
+      : await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/comments/${noteId}`, anew ? { method: 'DELETE' } : { method: 'PATCH', body: { body } });
     // Manki deletes the note once a review posts, so a note that is gone is posted again.
-    if (edited === null || edited.status === 404) {
+    if (edited === null || edited.status === 404 || anew) {
       const posted = await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/${target.number}/comments`, { method: 'POST', body: { body } });
-      if (!posted.ok) throw new Error(`posting the conflict note failed with ${posted.status}`);
+      if (!posted.ok) throw new Error(`posting the note failed with ${posted.status}`);
       this.setMeta('conflict_note', ((await posted.json()) as { id: number }).id);
     } else if (!edited.ok) {
-      throw new Error(`updating the conflict note failed with ${edited.status}`);
+      throw new Error(`updating the note failed with ${edited.status}`);
     }
   }
 
@@ -1792,20 +1870,32 @@ export class PrCoordinator extends DurableObject<Env> {
       await this.completeCheck(head, 'action_required', output, target, pr.html_url)
         .then(() => this.setMeta('paused_head', head), failed('check'));
     }
-    await this.showPaused(head, target).catch(failed('comment'));
+    await this.showStatus(head, target, `automatic review paused, \`${head.slice(0, 7)}\` waits`).catch(failed('comment'));
   }
 
-  /** Sets the status line of Manki's newest settings comment, among the PR's newest comments, to say that `head` waits. */
-  private async showPaused(head: string, target: Target): Promise<void> {
+  /**
+   * Sets the status line of Manki's settings comments to `status` for `head` and clears the boxes in `untick`: on the
+   * newest one among the PR's newest comments, and on comment `ticked` when that is another one. Returns the ids of the
+   * settings comments that show it.
+   */
+  private async showStatus(head: string, target: Target, status: string, untick: SettingsBox[] = [], ticked: number | null = null): Promise<number[]> {
     const token = await this.token({ issues: 'write', pull_requests: 'write' });
-    if (token === null) return;
-    const settings = await this.newestMankiComment(token, target, (body) => settingsHead(body) !== null);
-    // A progress comment still in progress belongs to its run, which may edit it at any time.
-    if (!settings || isRunningProgress(settings.body)) return;
-    const body = withSettingsStatus(settings.body, `automatic review paused, \`${head.slice(0, 7)}\` waits`, [], head);
-    if (body === settings.body) return;
-    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/comments/${settings.id}`, { method: 'PATCH', body: { body } });
-    if (!response.ok) throw new Error(`showing the paused push failed with ${response.status}`);
+    if (token === null) return [];
+    const repo = `/repos/${target.owner}/${target.repo}`;
+    const newest = await this.newestMankiComment(token, target, (body) => settingsHead(body) !== null);
+    const other = ticked === null || ticked === newest?.id ? null : await this.readComment(token, repo, ticked);
+    const shown: number[] = [];
+    for (const settings of [newest, other?.byManki && settingsHead(other.body) !== null ? other : null]) {
+      // A progress comment still in progress belongs to its run, which may edit it at any time.
+      if (!settings || isRunningProgress(settings.body)) continue;
+      const body = withSettingsStatus(settings.body, status, untick, head);
+      if (body !== settings.body) {
+        const response = await githubApi(token, `${repo}/issues/comments/${settings.id}`, { method: 'PATCH', body: { body } });
+        if (!response.ok) throw new Error(`setting the status line failed with ${response.status}`);
+      }
+      shown.push(settings.id);
+    }
+    return shown;
   }
 
   /** Completes a `Manki` check on `head` with `output`. Without `checks: write` on the installation, it creates none. */
