@@ -19,7 +19,7 @@ import {
   workflowRunEvent,
 } from './payloads';
 
-/** A compact form of the route: `ignore`, `<lane>:<kind>`, `close`, `close+merged`, `seen`, `reopen` or `run_completed`. */
+/** A compact form of the route: `ignore`, `<lane>:<kind>`, `close`, `close+merged`, `reopen` or `run_completed`. */
 const SETTINGS_COMMENT = '- [ ] Pause automatic reviews <!-- manki-box:pause -->\n- [ ] Review again <!-- manki-box:again -->\n<!-- manki-settings -->';
 const FINDING_COMMENT = '**Off by one**\n\n- [ ] Create an issue for this <!-- manki-box:issue:src/a.ts:3:3:Off-by-one -->\n\n<!-- manki-finding: {} -->';
 const TICKED_FINDING = FINDING_COMMENT.replace('[ ] Create', '[x] Create');
@@ -46,8 +46,6 @@ function verdict(route: Route): string {
       return `${route.work.lane}:${route.work.kind}`;
     case 'close':
       return route.merged ? 'close+merged' : 'close';
-    case 'seen':
-      return 'seen';
     case 'reopen':
       return 'reopen';
     case 'run_completed':
@@ -65,9 +63,9 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['a PR converted to a draft', 'pull_request', pullRequestEvent('converted_to_draft', { draft: true }), 'ignore'],
   ['a push to a fork PR', 'pull_request', forkPullRequestEvent('synchronize'), 'ignore'],
   ['a push to a PR whose fork was deleted', 'pull_request', pullRequestEvent('synchronize', { head: { sha: HEAD_SHA, repo: null } }), 'ignore'],
-  ['a push by a bot', 'pull_request', pullRequestEvent('synchronize', {}, BOT_SENDER), 'seen'],
-  ['a PR opened by a bot', 'pull_request', pullRequestEvent('opened', {}, BOT_SENDER), 'seen'],
-  ['a push by the Manki App', 'pull_request', pullRequestEvent('synchronize', {}, { login: 'manki-review[bot]', type: 'User' }), 'seen'],
+  ['a push by a bot', 'pull_request', pullRequestEvent('synchronize', {}, BOT_SENDER), 'state:bot_push'],
+  ['a PR opened by a bot', 'pull_request', pullRequestEvent('opened', {}, BOT_SENDER), 'state:bot_push'],
+  ['a push by the Manki App', 'pull_request', pullRequestEvent('synchronize', {}, { login: 'manki-review[bot]', type: 'User' }), 'state:bot_push'],
   ['a bot push to a fork PR', 'pull_request', { ...forkPullRequestEvent('synchronize'), sender: BOT_SENDER }, 'ignore'],
   ['a PR labeled by a bot', 'pull_request', pullRequestEvent('labeled', {}, BOT_SENDER), 'ignore'],
   ['a labeled PR', 'pull_request', pullRequestEvent('labeled'), 'ignore'],

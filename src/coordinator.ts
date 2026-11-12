@@ -567,6 +567,8 @@ export class PrCoordinator extends DurableObject<Env> {
         const state = this.reviewState(route.work.headSha);
         if (state !== null) return { accepted: true, effect: 'head already reviewed or under review' };
       }
+      // The cron leaves the head of a bot's push alone, whatever becomes of the item.
+      if (route.work.kind === 'bot_push') this.setMeta('bot_head', route.work.headSha);
       if ((route.work.acknowledge || route.work.repliesTo !== undefined) && route.work.writer && route.work.objectId !== null) {
         const reaction: PendingReaction = {
           comments: route.work.event.startsWith('pull_request_review_comment.') ? 'pulls' : 'issues',
@@ -688,25 +690,6 @@ export class PrCoordinator extends DurableObject<Env> {
     });
     await this.ctx.storage.setAlarm(now);
     return { accepted: true, effect };
-  }
-
-  /**
-   * Records a head pushed by a bot, which Manki does not review, without queuing work. The cron then knows the head
-   * was skipped on purpose and does not catch it up.
-   */
-  async markSeen(delivery: Delivery, target: Target, head: string): Promise<ReceiveResult> {
-    this.ensureSchema();
-    const now = Date.now();
-    const result = this.ctx.storage.transactionSync((): ReceiveResult => {
-      if (this.isReplay(delivery)) return { accepted: false, reason: 'duplicate delivery' };
-      this.remember(delivery, now);
-      this.setMeta('target', target);
-      this.setMeta('bot_head', head);
-      return { accepted: true, effect: 'head marked as seen' };
-    });
-    log('coordinator_receive', { ...this.logFields(), delivery: delivery.id, ...result });
-    if (result.accepted) await this.scheduleNext();
-    return result;
   }
 
   private insert(work: Work, delivery: string, now: number): string {
@@ -1054,6 +1037,10 @@ export class PrCoordinator extends DurableObject<Env> {
         await this.applySettings(item);
         return;
       }
+      if (item.kind === 'bot_push') {
+        await this.skipBotPush(item);
+        return;
+      }
       if (this.capped(item)) return;
       if (item.kind === 'help') await this.answerHelp(item);
       else await this.dispatch(item, optIn.workflow);
@@ -1217,10 +1204,7 @@ export class PrCoordinator extends DurableObject<Env> {
     if (token === null) return;
     const repo = `/repos/${target.owner}/${target.repo}`;
     if (item.check_id !== null) await this.endWaitingCheck(item, target, token, true);
-    if (!wanted()) return;
-    const list = await githubApi(token, `${repo}/commits/${head}/check-runs?check_name=Manki&app_id=${this.env.APP_ID}&filter=all&per_page=1`);
-    if (!list.ok) throw new Error(`listing the Manki checks failed with ${list.status}`);
-    if (((await list.json()) as { total_count: number }).total_count > 0) return;
+    if (!wanted() || await this.hasMankiCheck(head, target, token)) return;
     const output = {
       title: 'Waiting for a runner',
       summary: `Manki started the review run for \`${head.slice(0, 7)}\`. It begins when GitHub Actions gives the run a runner.`,
@@ -1237,6 +1221,14 @@ export class PrCoordinator extends DurableObject<Env> {
     }
     const { id } = await created.json() as { id: number };
     this.sql.exec('UPDATE work SET check_id = ? WHERE id = ?', id, item.id);
+  }
+
+  /** Whether `head` holds a `Manki` check of the App, in any state. Throws when GitHub fails to list them. */
+  private async hasMankiCheck(head: string, target: Target, token: string): Promise<boolean> {
+    const path = `/repos/${target.owner}/${target.repo}/commits/${head}/check-runs?check_name=Manki&app_id=${this.env.APP_ID}&filter=all&per_page=1`;
+    const list = await githubApi(token, path);
+    if (!list.ok) throw new Error(`listing the Manki checks failed with ${list.status}`);
+    return ((await list.json()) as { total_count: number }).total_count > 0;
   }
 
   /** Returns the reviews whose waiting check is still to end. */
@@ -1642,16 +1634,21 @@ export class PrCoordinator extends DurableObject<Env> {
     this.finish(item.id, 'done', 'answered help');
   }
 
+  /** Reads the PR, and returns it with the token that read it. Throws when it cannot be read. */
+  private async readPull(target: Target): Promise<{ pr: PullRequestRead; token: string }> {
+    const token = await this.token({ pull_requests: 'read' });
+    if (token === null) throw new Error('could not mint a token to read the pull request');
+    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/pulls/${target.number}`);
+    if (!response.ok) throw new Error(`reading the pull request failed with ${response.status}`);
+    return { pr: await response.json() as PullRequestRead, token };
+  }
+
   /**
    * Re-reads the PR before a review starts. Returns null when the review does not start now, and otherwise whether its
    * run may get a waiting check.
    */
   private async refreshReview(item: WorkRow, target: Target): Promise<{ waitingCheck: boolean } | null> {
-    const token = await this.token({ pull_requests: 'read' });
-    if (token === null) throw new Error('could not mint a token to read the pull request');
-    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/pulls/${target.number}`);
-    if (!response.ok) throw new Error(`reading the pull request failed with ${response.status}`);
-    const pr = await response.json() as PullRequestRead;
+    const { pr, token } = await this.readPull(target);
     if (!this.isDispatching(item.id)) return null;
     if (pr.state !== 'open') {
       this.finish(item.id, 'dropped', 'pull request closed');
@@ -1832,6 +1829,33 @@ export class PrCoordinator extends DurableObject<Env> {
     const file = await response.json() as { type?: string; size?: number; encoding?: string; content?: string };
     if (file.type !== 'file' || file.encoding !== 'base64' || file.content === undefined || (file.size ?? 0) > MAX_CONFIG_BYTES) return null;
     return parseConfig(new TextDecoder().decode(Uint8Array.from(atob(file.content.replace(/\s/g, '')), (c) => c.charCodeAt(0))));
+  }
+
+  /**
+   * Ends a bot's push, which gets no review. A PR that matches a skip rule gets its `Manki` check completed as skipped,
+   * as for a person's push. The check is added only when it cannot hide another: the pushed commit is still the head,
+   * no other pull request is reviewed for it, and it holds no `Manki` check, since GitHub reads the check created last.
+   */
+  private async skipBotPush(item: WorkRow): Promise<void> {
+    const target = await this.verifiedTarget();
+    if (!target) throw new Error('the repository could not be read');
+    const end = (note: string, conclusion: string | null = null) => {
+      if (this.isDispatching(item.id)) this.finish(item.id, 'skipped', note, conclusion);
+    };
+    const { pr, token } = await this.readPull(target);
+    if (pr.state !== 'open' || pr.head.sha !== item.head_sha) return end('pushed by a bot, and no longer the head');
+    const config = await this.baseConfig(pr, target);
+    // A draft gets no check from a push, as a person's push to it gets none.
+    const rule = pr.draft && !reviewsDrafts(config) ? null : this.skipRule(config, pr, item.head_sha, item.sender, target);
+    if (rule === null) return end('pushed by a bot');
+    const skipped = `matches the skip rule for ${rule}`;
+    const reviewed = await this.reviewedInstead(pr, target, token);
+    if (reviewed !== null) return end(`${skipped}, no check added, #${reviewed} has the same head commit`, 'skipped');
+    const checks = await this.token({ checks: 'write' });
+    if (checks === null || await this.hasMankiCheck(pr.head.sha, target, checks)) return end(`${skipped}, no check added`, 'skipped');
+    if (!this.isDispatching(item.id)) return;
+    await this.reportSkipped(pr.head.sha, rule, target);
+    end(skipped, 'skipped');
   }
 
   /** Returns the skip rule of `config` the PR matches, or null when none does. */

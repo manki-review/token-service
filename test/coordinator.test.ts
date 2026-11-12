@@ -47,6 +47,7 @@ import {
   workRows,
 } from './helpers';
 import {
+  BOT_SENDER,
   COMMENT_ID,
   DISPATCH_WORKFLOW_YAML,
   EVENT_WORKFLOW_YAML,
@@ -90,6 +91,7 @@ function pullRequest() {
     number,
     stub,
     push: (sha: string, action = 'synchronize') => pullRequestEvent(action, { number, head: { sha, repo: { full_name: 'manki-review/manki' } } }),
+    botPush: (sha: string, action = 'synchronize') => pullRequestEvent(action, { number, head: { sha, repo: { full_name: 'manki-review/manki' } } }, BOT_SENDER),
     comment: (body: string, action = 'created') => issueCommentEvent(body, { number, action }),
     outsiderComment: (body: string, action = 'created') => issueCommentEvent(body, { number, action, association: 'NONE' }),
     review: () => reviewEvent('submitted', {}, { number }),
@@ -378,13 +380,13 @@ describe('PrCoordinator catch-up state', () => {
     expect(await pr.stub.catchUp(target(pr.number), SHA_1)).toEqual({ accepted: false, reason: 'head already handled' });
   });
 
-  it('marks a bot head as handled without work, refuses the same delivery twice and sets its cleanup alarm', async () => {
+  it('marks a bot head as handled, queues its push and refuses the same delivery twice', async () => {
     const pr = pullRequest();
-    expect(await pr.stub.markSeen(key('d-bot'), target(pr.number), SHA_1)).toEqual({ accepted: true, effect: 'head marked as seen' });
-    expect(await pr.stub.markSeen(key('d-bot'), target(pr.number), SHA_1)).toEqual({ accepted: false, reason: 'duplicate delivery' });
-    expect(await workRows(pr.stub)).toEqual([]);
+    expect(await pr.send('pull_request', pr.botPush(SHA_1), 'd-bot')).toEqual({ accepted: true, effect: 'queued work 1' });
+    expect(await pr.send('pull_request', pr.botPush(SHA_1), 'd-bot')).toEqual({ accepted: false, reason: 'duplicate delivery' });
+    expect(await workRows(pr.stub)).toMatchObject([{ lane: 'state', kind: 'bot_push', head_sha: SHA_1, sender: 'dependabot[bot]', status: 'queued' }]);
     expect(await pr.stub.catchUpState(SHA_1)).toBe('handled');
-    expect(await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm())).toBe(Date.now() + IDLE_RETENTION_MS);
+    expect(await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm())).toBe(Date.now());
   });
 });
 
@@ -1799,6 +1801,76 @@ describe('PrCoordinator dispatch', () => {
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches).toHaveLength(1);
     expect(github.checkRuns).toEqual([]);
+  });
+
+  it.each([
+    ['its own PR that lists it as an author', { config: 'skip_authors: ["Dependabot[bot]"]', author: 'dependabot[bot]' }, 'author dependabot[bot]', 'synchronize'],
+    ['a PR with a skip label', { config: 'skip_labels: [dependencies]', labels: ['dependencies'] }, 'label "dependencies"', 'opened'],
+    ['a PR on a skip branch', { config: 'skip_branches: ["dependabot/**"]', headRef: 'dependabot/npm/yaml' }, 'branch dependabot/npm/yaml', 'ready_for_review'],
+  ])('completes the skipped check for a bot\'s push to %s, with no run', async (_case, change, rule, action) => {
+    const pr = pullRequest();
+    const github = Object.assign(fakeGitHub(pr.number), change, { baseRef: 'develop' });
+    await pr.send('pull_request', pr.botPush(SHA_1, action));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches).toEqual([]);
+    expect(github.configReads).toEqual(['develop']);
+    expect(github.checkRuns).toEqual([{
+      name: 'Manki', head_sha: SHA_1, status: 'completed', conclusion: 'skipped',
+      output: { title: 'Review skipped', summary: `This PR matches the skip rule for ${rule} in \`.manki.yml\` on the base branch.` },
+    }]);
+    expect(await workRows(pr.stub)).toMatchObject([{ kind: 'bot_push', status: 'skipped', conclusion: 'skipped', note: `matches the skip rule for ${rule}` }]);
+    expect(await pr.stub.catchUpState(SHA_1)).toBe('handled');
+    // A person can still ask for a review, and its check is created after the skipped one.
+    await pr.send('issue_comment', pr.comment('@manki review'));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches).toHaveLength(1);
+  });
+
+  it.each([
+    ['that matches no rule', { config: 'skip_authors: [renovate-bot]\nskip_labels: [dependencies]', author: 'dependabot[bot]' }, 'pushed by a bot'],
+    ['to a person\'s PR that lists only the person', { config: 'skip_authors: [octocat]' }, 'pushed by a bot'],
+    ['without a config', {}, 'pushed by a bot'],
+    ['whose commit is no longer the head', { config: 'skip_labels: [dependencies]', labels: ['dependencies'], head: SHA_2 }, 'pushed by a bot, and no longer the head'],
+    ['to a PR closed since', { config: 'skip_labels: [dependencies]', labels: ['dependencies'], prState: 'closed' }, 'pushed by a bot, and no longer the head'],
+    ['to a draft', { config: 'skip_labels: [dependencies]', labels: ['dependencies'], draft: true }, 'pushed by a bot'],
+    ['whose head already shows a Manki check', { config: 'skip_labels: [dependencies]', labels: ['dependencies'], reviewedHeads: [SHA_1] },
+      'matches the skip rule for label "dependencies", no check added'],
+    ['whose head a pull request with a lower number is reviewed for', { config: 'skip_labels: [dependencies]', labels: ['dependencies'], otherPulls: [{ number: 7 }] },
+      'matches the skip rule for label "dependencies", no check added, #7 has the same head commit'],
+  ])('starts no review and adds no check for a bot\'s push %s', async (_case, change, note) => {
+    const pr = pullRequest();
+    const github = Object.assign(fakeGitHub(pr.number), change);
+    await pr.send('pull_request', pr.botPush(SHA_1));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches).toEqual([]);
+    expect(github.checkRuns).toEqual([]);
+    expect(github.comments).toEqual([]);
+    expect(await workRows(pr.stub)).toMatchObject([{ kind: 'bot_push', status: 'skipped', note }]);
+    expect(await pr.stub.catchUpState(SHA_1)).toBe('handled');
+  });
+
+  it('adds no skipped check for a bot\'s push over the check of a review, or while the checks of the head cannot be listed', async () => {
+    const pr = pullRequest();
+    const github = Object.assign(fakeGitHub(pr.number), { config: 'skip_labels: [dependencies]', labels: ['dependencies'] });
+    await pr.send('issue_comment', pr.comment('@manki review'));
+    await runDurableObjectAlarm(pr.stub);
+    // The push waits behind the running review, which leaves its verdict on the head.
+    await pr.send('pull_request', pr.botPush(SHA_1));
+    await runDurableObjectAlarm(pr.stub);
+    expect(await workRows(pr.stub)).toMatchObject([{ kind: 'review', status: 'running' }, { kind: 'bot_push', status: 'queued' }]);
+    github.reviewedHeads = [SHA_1];
+    github.checkListStatus = 502;
+    await pr.stub.runCompleted(key('d-review-end'), 9000, 'success');
+    await runDurableObjectAlarm(pr.stub);
+    expect(await workRows(pr.stub)).toMatchObject([{ kind: 'review', status: 'done' }, { kind: 'bot_push', status: 'queued', errors: 1 }]);
+    github.checkListStatus = 200;
+    advanceClock(backoff(0));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.checkRuns).toEqual([]);
+    expect(await workRows(pr.stub)).toMatchObject([
+      { kind: 'review', status: 'done' },
+      { kind: 'bot_push', status: 'skipped', note: 'matches the skip rule for label "dependencies", no check added' },
+    ]);
   });
 
   it('keeps judging a retried skip by the queued push, and applies skip rules and a pause only before the first dispatch attempt', async () => {

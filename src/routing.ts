@@ -41,8 +41,9 @@ export type Lane = 'state' | 'chat' | 'help' | 'settings';
  * - `issue`: `handleIssueInteraction`
  * - `help`: answered by the Worker, with no run
  * - `settings`: applied by the Worker, with no run
+ * - `bot_push`: a bot's push, which Manki does not review. The Worker reads the skip rules for it, with no run
  */
-export type WorkKind = 'review' | 'merged' | 'review_state' | 'thread' | 'comment' | 'issue' | 'help' | 'settings';
+export type WorkKind = 'review' | 'merged' | 'review_state' | 'thread' | 'comment' | 'issue' | 'help' | 'settings' | 'bot_push';
 
 /** The pull request or issue a delivery is about. Every field comes from the signed payload. */
 export interface Target {
@@ -110,7 +111,6 @@ export type Route =
   | { type: 'work'; target: Target; work: Work }
   /** `at` is when GitHub says the PR closed, or reopened, in milliseconds. 0 when the payload names no time. */
   | { type: 'close'; target: Target; merged: Work | null; at: number }
-  | { type: 'seen'; target: Target; headSha: string }
   | { type: 'reopen'; target: Target; at: number }
   | { type: 'run_completed'; target: Target; runId: number; conclusion: string | null };
 
@@ -271,11 +271,13 @@ export function routeDelivery(event: string, payload: WebhookPayload, now = Date
     return routeReviewBoxTick(target, payload);
   }
 
-  // Manki skips a bot's push. The coordinator still records the head, so the cron does not review it later.
+  // Manki skips a bot's push. The coordinator still records the head, so the cron does not review it later, and
+  // completes the `Manki` check when the PR matches a skip rule.
   if (isBot(payload.sender)) {
-    const headSha = payload.pull_request?.head?.sha;
     const pushed = event === 'pull_request' && ['opened', 'synchronize', 'ready_for_review'].includes(payload.action ?? '');
-    return pushed && headSha && !isForkHead(payload) ? { type: 'seen', target, headSha } : ignore('sender is a bot');
+    return pushed && payload.pull_request?.head?.sha && !isForkHead(payload)
+      ? { type: 'work', target, work: work('state', 'bot_push', payload, event) }
+      : ignore('sender is a bot');
   }
   // An answer that late helps nobody. The time is the comment's last edit, which is what a settings box tick changes.
   const commentAt = Date.parse(payload.comment?.updated_at ?? payload.comment?.created_at ?? '');
