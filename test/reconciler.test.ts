@@ -686,7 +686,7 @@ describe('Reconciler catch-up', () => {
     github.pulls.set(target.repo, [pull(1, SHA_1, { repo: target.repo })]);
     await stub.reconcile();
     expect(github.graphqlCalls).toBe(0);
-    expect(await workRows(coordinator(target.repositoryId, 1))).toEqual([]);
+    expect(await workRows(coordinator(target.repositoryId, 1))).toMatchObject([{ kind: 'bot_push', head_sha: SHA_1 }]);
   });
 
   it('waits while a caught-up review is pending and catches the head up again a day after it did not finish', async () => {
@@ -778,13 +778,16 @@ describe('Reconciler catch-up', () => {
     const target = repo();
     await stub.recordOptIn(target, true);
     const github = fakeGitHub();
-    await coordinator(target.repositoryId, 1).markSeen(key(crypto.randomUUID()), { ...target, number: 1 }, SHA_1);
-    const pushed = routeDelivery('pull_request', {
-      ...pullRequestEvent('synchronize', { number: 2, head: { sha: SHA_2, repo: { full_name: `${OWNER}/${target.repo}` } } }),
-      repository: { id: target.repositoryId, name: target.repo, full_name: `${OWNER}/${target.repo}`, default_branch: 'main', owner: { login: OWNER, id: OWNER_ID } },
-    });
-    if (pushed.type !== 'work') throw new Error('expected work');
-    await coordinator(target.repositoryId, 2).receive(key(crypto.randomUUID()), pushed);
+    const push = (number: number, sha: string, sender?: { login: string; type: string }) => {
+      const pushed = routeDelivery('pull_request', {
+        ...pullRequestEvent('synchronize', { number, head: { sha, repo: { full_name: `${OWNER}/${target.repo}` } } }, sender),
+        repository: { id: target.repositoryId, name: target.repo, full_name: `${OWNER}/${target.repo}`, default_branch: 'main', owner: { login: OWNER, id: OWNER_ID } },
+      });
+      if (pushed.type !== 'work') throw new Error('expected work');
+      return coordinator(target.repositoryId, number).receive(key(crypto.randomUUID()), pushed);
+    };
+    await push(1, SHA_1, { login: 'dependabot[bot]', type: 'Bot' });
+    await push(2, SHA_2);
     github.pulls.set(target.repo, [pull(1, SHA_1, { repo: target.repo }), pull(2, SHA_2, { repo: target.repo })]);
     const calls = watchCoordinators();
     await stub.reconcile();

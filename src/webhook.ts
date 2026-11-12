@@ -103,8 +103,6 @@ function summarize(route: Route): Record<string, unknown> {
     }
     case 'close':
       return { route: 'close', pr: route.target.number, repository_id: route.target.repositoryId, merged: route.merged !== null };
-    case 'seen':
-      return { route: 'seen', pr: route.target.number, repository_id: route.target.repositoryId, head_sha: route.headSha };
     case 'reopen':
       return { route: 'reopen', pr: route.target.number, repository_id: route.target.repositoryId };
     case 'run_completed':
@@ -199,7 +197,6 @@ export async function handleWebhook(request: Request, env: Env): Promise<Respons
     let stored = false;
     try {
       if (route.type === 'run_completed') await coordinator.runCompleted(key, route.runId, route.conclusion);
-      else if (route.type === 'seen') await coordinator.markSeen(key, route.target, route.headSha);
       else if (route.type === 'reopen') await coordinator.reopen(key, route.target, route.at);
       else stored = (await coordinator.receive(key, route)).accepted;
     } catch (error) {
