@@ -38,7 +38,7 @@ export function hasOwnMarker(body: string, marker: string): boolean {
 export const HELP_REPLY = [
   '| Command | What it does |',
   '|---|---|',
-  '| `/manki review` | Reviews the head commit unless Manki already has a complete review of it. Tick Review again in the settings block to review it again |',
+  '| `/manki review` | Reviews the head commit unless Manki\'s newest review of it is complete. Tick Review again in the settings block to review it again |',
   '| `/manki explain [topic]` | Explains something about this PR |',
   '| `/manki check` | Checks for open blocking threads and approves when there are none |',
   '| `/manki dismiss [finding]` | Dismisses a finding |',
