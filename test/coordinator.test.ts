@@ -2074,6 +2074,15 @@ describe('PrCoordinator dispatch', () => {
       expect(skipped.github.waitingChecks).toMatchObject([{ id: 500, status: 'completed', conclusion: 'skipped', output: { title: 'Review skipped' } }]);
       expect(await workRows(skipped.pr.stub)).toMatchObject([{ status: 'skipped', check_id: null }]);
 
+      // GitHub reads the check created last. Past another `Manki` check on the head, the report is a new check and the waiting one ends.
+      const joined = await again();
+      Object.assign(joined.github, { config: 'skip_labels: [no-review]', labels: ['no-review'], reviewedHeads: [SHA_1] });
+      await runDurableObjectAlarm(joined.pr.stub);
+      await runDurableObjectAlarm(joined.pr.stub);
+      expect(joined.github.checkRuns).toMatchObject([{ head_sha: SHA_1, conclusion: 'skipped', output: { title: 'Review skipped' } }]);
+      expect(joined.github.waitingChecks).toMatchObject([{ id: 500, status: 'completed', conclusion: 'cancelled', output: { title: 'Review not started' } }]);
+      expect(await workRows(joined.pr.stub)).toMatchObject([{ status: 'skipped', check_id: null }]);
+
       // The head moved by the second dispatch: the old head's check ends, and the new head gets its own.
       const moved = await again();
       moved.github.head = SHA_2;

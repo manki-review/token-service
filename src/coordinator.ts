@@ -1808,10 +1808,11 @@ export class PrCoordinator extends DurableObject<Env> {
     if (token === null) return;
     const repo = `/repos/${target.owner}/${target.repo}`;
     const body = { status: 'completed', conclusion, ...(detailsUrl && { details_url: detailsUrl }), output };
-    // The waiting check of the review being started becomes the report, so `head` never gets a second, newer check.
-    const [waiting] = this.sql.exec<{ id: number; check_id: number }>(
-      `SELECT id, check_id FROM work WHERE status = 'dispatching' AND check_id IS NOT NULL AND check_head = ?`, head,
-    ).toArray();
+    // The waiting check of the review being started becomes the report while a required check would read it. Past
+    // another `Manki` check on `head` the report is a new check, the one created last, and the waiting one ends with the review.
+    const held = () => this.sql.exec<WorkRow>(`SELECT * FROM work WHERE status = 'dispatching' AND check_id IS NOT NULL AND check_head = ?`, head).toArray()[0];
+    const first = held();
+    const waiting = first && await this.holdsVerdict(first, target, token) ? held() : undefined;
     const response = waiting
       ? await githubApi(token, `${repo}/check-runs/${waiting.check_id}`, { method: 'PATCH', body })
       : await githubApi(token, `${repo}/check-runs`, { method: 'POST', body: { name: 'Manki', head_sha: head, ...body } });
