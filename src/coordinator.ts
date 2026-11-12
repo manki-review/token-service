@@ -921,11 +921,13 @@ export class PrCoordinator extends DurableObject<Env> {
    * and before a review state check. The review then sees each thread as the reply leaves it, instead of requesting
    * changes the reply withdraws a minute later. The check reads the PR when it runs, so it loses nothing, and a person
    * waits for the reply. Once replies have gone ahead of a review or a check for `REPLY_FIRST_MS`, it goes first again,
-   * so a stream of replies cannot hold it back. Time spent waiting behind a run does not count.
+   * so a stream of replies cannot hold it back. Time spent waiting behind a run does not count. A review that holds a
+   * waiting check lets no reply go first. The reply's approval would create a newer `Manki` check on that head, and a
+   * required check reads the check created last, so the review's verdict in the waiting check would not count.
    */
   private nextQueued(lane: Lane): WorkRow | undefined {
     const next = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'queued' ORDER BY id LIMIT 1`, lane).toArray()[0];
-    const yields = next?.kind === 'review' || next?.kind === 'review_state';
+    const yields = (next?.kind === 'review' && next.check_ref === null) || next?.kind === 'review_state';
     if (!next || !yields || (next.passed_at !== null && Date.now() - next.passed_at >= REPLY_FIRST_MS)) return next;
     return this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'queued' AND kind = 'thread' ORDER BY id LIMIT 1`, lane).toArray()[0] ?? next;
   }

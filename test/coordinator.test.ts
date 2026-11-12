@@ -1968,9 +1968,11 @@ describe('PrCoordinator dispatch', () => {
       const stuckGitHub = fakeGitHub(stuck.number);
       await stuck.send('pull_request', stuck.push(SHA_1), 'd-push');
       await runDurableObjectAlarm(stuck.stub);
+      // A reply's approval would create a newer check on the head, so the reply waits while the review holds its check.
+      await stuck.send('pull_request_review_comment', stuck.reply('Fixed'));
       advanceClock(QUEUED_RUN_TIMEOUT_MS + 1);
       await runDurableObjectAlarm(stuck.stub);
-      expect(await workRows(stuck.stub)).toMatchObject([{ status: 'running', run_id: 9001, requeues: 1, check_id: 500 }]);
+      expect(await workRows(stuck.stub)).toMatchObject([{ status: 'running', run_id: 9001, requeues: 1, check_id: 500 }, { kind: 'thread', status: 'queued' }]);
       expect(stuckGitHub.waitingChecks).toEqual([WAITING]);
       advanceClock(QUEUED_RUN_TIMEOUT_MS + 1);
       await runDurableObjectAlarm(stuck.stub);
