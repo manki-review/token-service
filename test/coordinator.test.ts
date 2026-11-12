@@ -700,6 +700,8 @@ function fakeGitHub(number: number) {
     checkRunReplyLost: false,
     /** The status the next reads or edits of a waiting check answer with, in order. Afterwards 200. */
     waitingCheckStatuses: [] as number[],
+    /** Whether the repository is private, so GitHub shows the PR only to a token minted with `pull_requests`. */
+    privateRepository: false,
     /** The status a list of a commit's `Manki` checks answers with. */
     checkListStatus: 200,
     /** Runs while a check-run creation is in flight, before GitHub answers it. */
@@ -771,7 +773,8 @@ function fakeGitHub(number: number) {
       if (state.refuseActionsWrite && body.permissions.actions === 'write') {
         return Response.json({ message: 'The permissions requested are not granted to this installation.' }, { status: 422 });
       }
-      return Response.json({ token: 'ghs_repo', expires_at: '2030-01-01T01:00:00Z', permissions: body.permissions }, { status: 201 });
+      const token = state.privateRepository ? `ghs_${Object.keys(body.permissions).sort().join('_')}` : 'ghs_repo';
+      return Response.json({ token, expires_at: '2030-01-01T01:00:00Z', permissions: body.permissions }, { status: 201 });
     }
     if (route === `GET ${repo}/installation`) {
       return Response.json({ id: INSTALLATION_ID, permissions: { actions: 'write', contents: 'write', issues: 'write', metadata: 'read', pull_requests: 'write' } });
@@ -796,6 +799,9 @@ function fakeGitHub(number: number) {
       return Response.json(workflowsReply(state.workflows).body);
     }
     if (route === `GET ${repo}/pulls/${number}`) {
+      if (state.privateRepository && !request.headers.get('Authorization')?.includes('pull_requests')) {
+        return Response.json({ message: 'Resource not accessible by integration' }, { status: 403 });
+      }
       return Response.json({
         state: state.prState,
         draft: state.draft,
@@ -1919,7 +1925,7 @@ describe('PrCoordinator dispatch', () => {
     const DID_NOT_RUN = "The review run ended without reviewing `1111111`. Tick **Review again** on Manki's settings comment to review it.";
 
     // Each case is a way a run ends before Manki takes its check over. Its `/token` requests say `takes_over_check`.
-    it.each<[string, (run: Dispatched) => unknown, string, Record<string, string>]>([
+    it.each<[string, (run: Dispatched) => unknown, string, Record<string, string>, Partial<ReturnType<typeof fakeGitHub>>?]>([
       ['a run that asked for no token and ended, as one that found the head moved before it', () => {}, 'success', {
         conclusion: 'cancelled', title: 'Review did not run', summary: DID_NOT_RUN,
       }],
@@ -1940,6 +1946,10 @@ describe('PrCoordinator dispatch', () => {
         conclusion: 'cancelled', title: 'Superseded by a newer commit',
         summary: '`1111111` is no longer the head of this pull request, so it was not reviewed. Manki reviews the new head.',
       }],
+      ['a run on a private repository whose head a newer commit replaced', ({ github }) => { github.head = SHA_2; }, 'success', {
+        conclusion: 'cancelled', title: 'Superseded by a newer commit',
+        summary: '`1111111` is no longer the head of this pull request, so it was not reviewed. Manki reviews the new head.',
+      }, { privateRepository: true }],
       ['a run that took the check over and was cancelled', async ({ github, ask }) => {
         await ask({ takes_over_check: true });
         github.waitingChecks[0].status = 'in_progress';
@@ -1948,8 +1958,8 @@ describe('PrCoordinator dispatch', () => {
         await ask({ takes_over_check: true });
         github.waitingChecks[0].status = 'in_progress';
       }, 'failure', { conclusion: 'failure', title: 'Review stopped', summary: 'The run ended before the review finished.' }],
-    ])('ends the waiting check of %s', async (_case, before, conclusion, { conclusion: ended, ...output }) => {
-      const run = await dispatched();
+    ])('ends the waiting check of %s', async (_case, before, conclusion, { conclusion: ended, ...output }, set) => {
+      const run = await dispatched(true, set);
       const { pr, github, end } = run;
       await before(run);
       // Naming the check in a token reply hands nothing over: the check stays the Worker's to end until the run completes it.

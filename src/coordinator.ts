@@ -1257,8 +1257,8 @@ export class PrCoordinator extends DurableObject<Env> {
    */
   private async endWaitingCheck(item: WorkRow, target: Target, token: string, superseded?: boolean): Promise<void> {
     const repo = `/repos/${target.owner}/${target.repo}`;
-    const call = async (path: string, init?: { method: string; body: unknown }): Promise<Response | null> => {
-      const response = await githubApi(token, path, init);
+    const call = async (path: string, init?: { method: string; body: unknown }, as = token): Promise<Response | null> => {
+      const response = await githubApi(as, path, init);
       if (response.ok) return response;
       if (!isRefusal(response, await response.text())) throw new Error(`ending the waiting check failed with ${response.status}`);
       log('coordinator_waiting_check_refused', { ...this.logFields(), work_id: item.id, check_id: item.check_id, status: response.status });
@@ -1280,7 +1280,9 @@ export class PrCoordinator extends DurableObject<Env> {
     const read = await call(`${repo}/check-runs/${id}`);
     const { status } = read ? await read.json() as { status: string } : { status: 'completed' };
     if (status !== 'completed') {
-      const pr = superseded === undefined && !item.check_own ? await call(`${repo}/pulls/${target.number}`) : null;
+      // A token for checks alone cannot read the PR of a private repository.
+      const reader = superseded === undefined && !item.check_own ? await this.token({ pull_requests: 'read' }) : null;
+      const pr = reader === null ? null : await call(`${repo}/pulls/${target.number}`, undefined, reader);
       const left = superseded ?? (pr !== null && ((await pr.json()) as PullRequestRead).head.sha !== item.check_head);
       const { conclusion, ...output } = waitingCheckEnd(this.row(item.id) ?? item, status, left);
       await call(`${repo}/check-runs/${id}`, { method: 'PATCH', body: { status: 'completed', conclusion, output } });
@@ -1522,7 +1524,10 @@ export class PrCoordinator extends DurableObject<Env> {
     if (checks === null) return;
     let head = running.run_head;
     if (head === null) {
-      const pr = await githubApi(checks, `${repo}/pulls/${target.number}`);
+      // A token for checks alone cannot read the PR of a private repository.
+      const reader = await this.token({ pull_requests: 'read' });
+      if (reader === null) return;
+      const pr = await githubApi(reader, `${repo}/pulls/${target.number}`);
       if (!pr.ok) throw new Error(`reading the pull request failed with ${pr.status}`);
       head = ((await pr.json()) as PullRequestRead).head.sha;
     }
