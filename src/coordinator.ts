@@ -446,27 +446,52 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Returns the waiting `Manki` check of the review that run `runId` is, for a run that takes it over. A run that does
-   * not (`takesOver` false) reports in a check of its own, so its waiting check ends before this returns. So does a
-   * check whose create reply was lost, which no run is told about. Throws when GitHub fails to end it, so the run gets
-   * no token to create its check with: a check that ends after a newer one could be read ahead of it.
+   * Returns the waiting `Manki` check of the review that run `runId` is, for a run that takes it over. A required check
+   * reads the `Manki` check created last on a commit, so the run gets the waiting check only while its verdict there
+   * would be the one read (`holdsVerdict`). In every other case the run reports in a check of its own, which is created
+   * later, and the waiting check ends before this returns: for a run that does not take it over (`takesOver` false),
+   * for a check whose create reply was lost, and once another `Manki` check is on the commit. Throws when GitHub fails
+   * to end it, so the run gets no token.
    */
   async handOverCheck(runId: number, takesOver: boolean): Promise<WaitingCheck | null> {
     if (!this.hasState()) return null;
     this.ensureSchema();
     await this.rememberCheckAbility(takesOver);
-    const row = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE ${ACTIVE} AND run_id = ? AND check_ref IS NOT NULL`, runId).toArray()[0];
+    const held = () => this.sql.exec<WorkRow>(`SELECT * FROM work WHERE ${ACTIVE} AND run_id = ? AND check_ref IS NOT NULL`, runId).toArray()[0];
+    const asked = held();
+    if (!asked?.check_head) return null;
+    const target = await this.verifiedTarget();
+    const token = target && await this.token({ checks: 'write' });
+    const handOver = takesOver && target !== null && token !== null && await this.holdsVerdict(asked, target, token, true);
+    // The check may have ended or changed during the calls above.
+    const row = held();
     if (!row?.check_head) return null;
-    const own = !takesOver || row.check_id === null;
+    const own = !handOver || row.check_id !== asked.check_id;
     this.sql.exec('UPDATE work SET check_own = ? WHERE id = ?', Number(own), row.id);
     if (!own) return { id: row.check_id!, head_sha: row.check_head };
     // The alarm tries again when the call below fails.
     await this.scheduleNext();
-    const target = await this.verifiedTarget();
-    const token = target && await this.token({ checks: 'write' });
     if (target && token) await this.endWaitingCheck({ ...row, check_own: 1 }, target, token);
     else this.forgetCheck(row.id);
     return null;
+  }
+
+  /**
+   * Whether a verdict written into the waiting check of `item` is the one a required check reads. GitHub reads the
+   * `Manki` check created last on a commit, so the waiting check must be the only one of the App there. With `taken`,
+   * a check its run already set in progress counts as well, since the run holds it. A failed list counts as no.
+   */
+  private async holdsVerdict(item: WorkRow, target: Target, token: string, taken = false): Promise<boolean> {
+    if (item.check_id === null) return false;
+    const path = `/repos/${target.owner}/${target.repo}/commits/${item.check_head}/check-runs?check_name=Manki&app_id=${this.env.APP_ID}&filter=all&per_page=100`;
+    const response = await githubApi(token, path);
+    if (!response.ok) {
+      log('coordinator_waiting_check_failed', { ...this.logFields(), work_id: item.id, error: `listing the Manki checks failed with ${response.status}` });
+      return false;
+    }
+    const { total_count, check_runs } = await response.json() as { total_count: number; check_runs: Array<{ id: number; status: string }> };
+    const waiting = check_runs.find((run) => run.id === item.check_id);
+    return waiting !== undefined && (total_count === 1 || (taken && waiting.status !== 'queued'));
   }
 
   /**

@@ -700,6 +700,8 @@ function fakeGitHub(number: number) {
     checkRunReplyLost: false,
     /** The status the next reads or edits of a waiting check answer with, in order. Afterwards 200. */
     waitingCheckStatuses: [] as number[],
+    /** The status a list of a commit's `Manki` checks answers with. */
+    checkListStatus: 200,
     /** Runs while a check-run creation is in flight, before GitHub answers it. */
     onCheckRun: null as (() => void) | null,
     /** Replies the next dispatches get, in order. Afterwards 200 with a new run id. */
@@ -860,6 +862,7 @@ function fakeGitHub(number: number) {
     }
     const checksOf = url.pathname.match(new RegExp(`^${repo}/commits/([0-9a-f]+)/check-runs$`));
     if (checksOf && request.method === 'GET' && url.searchParams.get('check_name') === 'Manki') {
+      if (state.checkListStatus !== 200) return Response.json({ message: 'no' }, { status: state.checkListStatus });
       const app = url.searchParams.get('app_id');
       const open = state.openChecks.filter((check) => check.head_sha === checksOf[1] && (app === null || String(check.app_id ?? APP_ID) === app));
       if (url.searchParams.get('status') === 'in_progress') return Response.json({ check_runs: open });
@@ -867,7 +870,7 @@ function fakeGitHub(number: number) {
       const waiting = state.waitingChecks.filter((check) => check.head_sha === checksOf[1]);
       const all = state.checkRuns.filter((check) => check.head_sha === checksOf[1]).length + waiting.length + open.length
         + state.reviewedHeads.filter((head) => head === checksOf[1]).length;
-      return Response.json({ total_count: all, check_runs: waiting.map(({ id, external_id }) => ({ id, external_id })) });
+      return Response.json({ total_count: all, check_runs: waiting.map(({ id, external_id, status }) => ({ id, external_id, status })) });
     }
     const check = url.pathname.match(new RegExp(`^${repo}/check-runs/(\\d+)$`));
     const waiting = check && state.waitingChecks.find((entry) => entry.id === Number(check[1]));
@@ -1876,6 +1879,25 @@ describe('PrCoordinator dispatch', () => {
       expect(await ask({ takes_over_check: true })).not.toHaveProperty('check_run');
       await end();
       expect(github.waitingChecks).toEqual([ended]);
+
+      // GitHub reads the check created last. Another `Manki` check on the head since, such as that of a second PR with
+      // the same head commit, would be read ahead of the waiting check, so the run reports in a check of its own.
+      const joined = await dispatched();
+      joined.github.reviewedHeads = [SHA_1];
+      expect(await joined.ask({ takes_over_check: true })).not.toHaveProperty('check_run');
+      expect(joined.github.waitingChecks).toEqual([ended]);
+      // So does a run whose head's checks cannot be listed.
+      const unlisted = await dispatched();
+      unlisted.github.checkListStatus = 502;
+      expect(await unlisted.ask({ takes_over_check: true })).not.toHaveProperty('check_run');
+      expect(unlisted.github.waitingChecks).toEqual([ended]);
+      // A check the run already set in progress stays with it.
+      const taken = await dispatched();
+      expect(await taken.ask({ takes_over_check: true })).toMatchObject({ check_run: { id: 500, head_sha: SHA_1 } });
+      taken.github.waitingChecks[0].status = 'in_progress';
+      taken.github.reviewedHeads = [SHA_1];
+      expect(await taken.ask({ takes_over_check: true })).toMatchObject({ check_run: { id: 500, head_sha: SHA_1 } });
+      expect(taken.github.waitingChecks).toEqual([{ ...WAITING, status: 'in_progress' }]);
 
       // While GitHub fails to end the check, the run gets no token, so it cannot create its own check first.
       const failing = await dispatched();
