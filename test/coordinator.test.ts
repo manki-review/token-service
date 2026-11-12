@@ -1049,6 +1049,8 @@ describe('PrCoordinator dispatch', () => {
     // The command's reaction is one call, and each reply's read and reaction are two.
     expect(github.reactions).toEqual(['issues/1001', ...replies.slice(0, 8).map((id) => `pulls/${id}`)]);
     expect(github.dispatches.map((dispatch) => dispatch.inputs.event).sort()).toEqual(['issue_comment', 'pull_request_review_comment']);
+    // The two lanes that start in this alarm share one token.
+    expect(github.mints.filter((mint) => mint.permissions.actions === 'write')).toHaveLength(1);
     expect(fetches.length).toBeLessThanOrEqual(SUBREQUEST_LIMIT);
     expect(await alarmAt()).toBe(Date.now());
 
@@ -2773,6 +2775,65 @@ describe('PrCoordinator dispatch', () => {
       }]);
       expect((await workRows(waiting.pr.stub))[0]).toMatchObject({ check_id: null });
       expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'done', note: 'no review to cancel' });
+    });
+
+    it('starts the steps that do not fit the subrequest limit of one alarm in the alarms that follow, and drops none', async () => {
+      const { pr, github, edit } = setup();
+      Object.assign(github, { config: 'skip_authors: ["Dependabot[bot]"]', author: 'dependabot[bot]' });
+      const fetches = vi.mocked(fetch).mock.calls;
+      const alarmAt = () => runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm());
+      await pr.send('pull_request', pr.push(SHA_1));
+      await runDurableObjectAlarm(pr.stub);
+      await pr.send('issue_comment', pr.comment('@manki explain'));
+      await runDurableObjectAlarm(pr.stub);
+      await edit([], ['pause']);
+      // The review runs past its timeout, and its progress comment is the oldest of Manki's newest five. The chat run never started.
+      github.runs.set(9000, { status: 'in_progress', run_started_at: new Date().toISOString() });
+      for (const id of [1400, 1401, 1402, 1403]) github.issueComments.set(id, id === 1400 ? progress() : 'An answer.\n<!-- manki -->');
+      github.openChecks = [{ id: 70, head_sha: SHA_1 }];
+      advanceClock(RUNNING_RUN_TIMEOUT_MS + 1);
+
+      // A push the pause skips, a bot's push a skip rule matches, 17 commands, a help command and a Cancel tick all arrive before the next alarm.
+      github.head = SHA_3;
+      await pr.send('pull_request', pr.push(SHA_2));
+      await pr.send('pull_request', pr.botPush(SHA_3));
+      const ask = pr.comment('@manki explain');
+      for (let id = 2001; id <= 2017; id++) await pr.send('issue_comment', { ...ask, comment: { ...ask.comment!, id } });
+      await pr.send('issue_comment', pr.comment('@manki help'));
+      const tick = issueCommentEvent(boxes(['pause', 'cancel']), {
+        number: pr.number, action: 'edited', author: MANKI_AUTHOR, sender: { login: 'alice', type: 'User' }, previousBody: boxes(['pause']),
+      });
+      github.issueComments.set(SETTINGS, boxes(['pause', 'cancel']));
+      await pr.send('issue_comment', { ...tick, comment: { ...tick.comment!, id: SETTINGS, updated_at: new Date().toISOString() } });
+
+      const spent: number[] = [];
+      while (spent.length < 10 && (await alarmAt())! <= Date.now()) {
+        const before = fetches.length;
+        await runDurableObjectAlarm(pr.stub);
+        spent.push(fetches.length - before);
+      }
+      for (const calls of spent) expect(calls).toBeLessThanOrEqual(SUBREQUEST_LIMIT);
+      // Each alarm that left a step waiting set the next one at once, until nothing was left to start.
+      expect(spent.length).toBeGreaterThan(1);
+      expect(spent.length).toBeLessThan(10);
+      expect(github.cancels).toEqual([9000, 9001]);
+      expect(github.checkEdits).toMatchObject([{ id: 70, body: { conclusion: 'cancelled', output: { title: 'Review stopped' } } }]);
+      // The bot's push adds no skipped check over the one that tells of the pause.
+      expect(github.checkRuns).toMatchObject([{ head_sha: SHA_3, conclusion: 'action_required', output: { title: 'Automatic review paused' } }]);
+      expect(github.reactions).toEqual([`issues/${COMMENT_ID}`, ...Array.from({ length: 17 }, (_, index) => `issues/${2001 + index}`)]);
+      expect(github.comments).toContain(`${HELP_REPLY}\n<!-- manki-answered:${COMMENT_ID} -->`);
+      const rows = await workRows(pr.stub);
+      expect(rows.filter((row) => row.status === 'dropped' || row.status === 'failed')).toEqual([]);
+      expect(rows.filter((row) => row.lane !== 'chat')).toMatchObject([
+        { kind: 'review', head_sha: SHA_1, status: 'timed_out' },
+        { kind: 'settings', status: 'done', note: 'paused' },
+        { kind: 'review', head_sha: SHA_3, status: 'skipped', note: 'pull request is paused' },
+        { kind: 'bot_push', status: 'skipped', note: 'matches the skip rule for author dependabot[bot], no check added' },
+        { kind: 'help', status: 'done' },
+        { kind: 'settings', status: 'done', note: 'no review to cancel' },
+      ]);
+      // The chat run that never started was cancelled and started again, and the 17 commands wait behind it.
+      expect(rows.filter((row) => row.lane === 'chat').map((row) => row.status)).toEqual(['running', ...Array<string>(17).fill('queued')]);
     });
 
     it('replaces a running review on Deeper review, and on Review again only once the head moved', async () => {

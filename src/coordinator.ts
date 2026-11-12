@@ -57,11 +57,22 @@ export const UNTRUSTED_DISPATCHES_PER_HOUR = 5;
 const TOKEN_EXPIRY_MARGIN_MS = 5 * MINUTE;
 /** How long a looked-up write access is reused for the same login. */
 const WRITER_CACHE_MS = 5 * MINUTE;
-/**
- * GitHub calls one alarm spends on eyes reactions, next to at most two token mints. The lanes keep the other 30 of the
- * Free plan's 50 subrequests per invocation.
- */
+/** The Free plan's subrequests per invocation, which one alarm must stay within. */
+const SUBREQUEST_LIMIT = 50;
+/** GitHub calls one alarm spends on eyes reactions at most. The lanes keep the rest of the limit. */
 const REACTION_BUDGET = 18;
+/** Token mints the reactions of one alarm can take, one for each kind of comment. */
+const REACTION_MINTS = 2;
+/**
+ * The most calls one step of a lane makes, by a count of the code with one check to end: a poll, the end of the waiting
+ * checks, or the start of an item. The costliest is a settings edit that ticks Review again on the head under review
+ * and Deeper review, with a fresh opt-in read.
+ */
+const STEP_COST = 32;
+/** The most calls the start of an item of `LIGHT_KINDS` makes, with a fresh opt-in read. The costliest is a bot's push that gets its skipped check. */
+const LIGHT_COST = 11;
+/** The kinds whose start only dispatches a run, answers help or ends a bot's push. Any other kind is checked against `STEP_COST`. */
+const LIGHT_KINDS: ReadonlySet<Work['kind']> = new Set(['merged', 'review_state', 'thread', 'comment', 'issue', 'help', 'bot_push']);
 /** How long a review waits before each new read of a PR whose mergeability GitHub has not computed yet. */
 const MERGEABILITY_RETRY_MS = [5_000, 15_000];
 /** GitHub's largest page of the pull requests of a commit. A full page may be cut off. */
@@ -192,6 +203,11 @@ interface PendingReaction {
   commentId: number;
   /** Mirrors `Work.repliesTo`. The reaction is added only when that comment starts one of Manki's threads. */
   repliesTo?: number;
+}
+
+/** Returns the GitHub calls a reaction takes. A reply costs the read of the comment it answers and the reaction, a command the reaction alone. */
+function reactionCost(reaction: PendingReaction): number {
+  return reaction.repliesTo === undefined ? 1 : 2;
 }
 
 export type ReceiveResult = { accepted: false; reason: string } | { accepted: true; effect: string };
@@ -380,6 +396,12 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /** Whether this instance created or upgraded its tables. They are created on first use, not in the constructor. */
   private schemaReady = false;
+  /** The calls this instance made since its last alarm started, except the reactions, which have a budget of their own. */
+  private calls = 0;
+  /** The calls the lanes of the alarm may make, with every token mint and the opt-in read. */
+  private laneBudget = SUBREQUEST_LIMIT;
+  /** The first lane whose step did not fit the budget of the last alarm, as its place in `LANES`. It goes first in the next. */
+  private waitingLane: number | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -498,7 +520,7 @@ export class PrCoordinator extends DurableObject<Env> {
   private async holdsVerdict(item: WorkRow, target: Target, token: string, taken = false): Promise<boolean> {
     if (item.check_id === null) return false;
     const path = `/repos/${target.owner}/${target.repo}/commits/${item.check_head}/check-runs?check_name=Manki&app_id=${this.env.APP_ID}&filter=all&per_page=100`;
-    const response = await githubApi(token, path);
+    const response = await this.api(token, path);
     if (!response.ok) {
       log('coordinator_waiting_check_failed', { ...this.logFields(), work_id: item.id, error: `listing the Manki checks failed with ${response.status}` });
       return false;
@@ -794,6 +816,11 @@ export class PrCoordinator extends DurableObject<Env> {
     this.ensureSchema();
     try {
       if (await this.cleanUpWhenIdle()) return;
+      this.calls = 0;
+      // The reactions run next to the lanes, so the calls they can make are kept out of the lanes' share.
+      const reactions = this.getMeta<PendingReaction[]>('reactions') ?? [];
+      const reactionCalls = reactions.reduce((sum, reaction) => sum + reactionCost(reaction), 0);
+      this.laneBudget = SUBREQUEST_LIMIT - (reactions.length > 0 ? Math.min(reactionCalls, REACTION_BUDGET) + REACTION_MINTS : 0);
       // Both read the opt-in through `optIn`, which shares one read between them.
       await Promise.all([this.react(), this.advance()]);
     } catch (error) {
@@ -820,9 +847,8 @@ export class PrCoordinator extends DurableObject<Env> {
       return;
     }
     if (!target) return;
-    // A reply costs the read of the comment it answers and the reaction, a command the reaction alone.
     let calls = 0;
-    const cut = pending.findIndex((reaction) => (calls += reaction.repliesTo === undefined ? 1 : 2) > REACTION_BUDGET);
+    const cut = pending.findIndex((reaction) => (calls += reactionCost(reaction)) > REACTION_BUDGET);
     const waiting = cut < 0 ? [] : pending.splice(cut);
     // `receive` may have queued comments during the reads above. They go after the ones that waited longer.
     if (waiting.length > 0) this.setMeta('reactions', [...waiting, ...(this.getMeta<PendingReaction[]>('reactions') ?? [])]);
@@ -913,29 +939,55 @@ export class PrCoordinator extends DurableObject<Env> {
       now - QUEUED_MAX_AGE_MS,
     );
     this.sql.exec(`UPDATE work SET status = 'queued', lease_until = NULL WHERE status = 'dispatching' AND lease_until <= ?`, now);
-    await Promise.all(LANES.map(async (lane) => {
+    // The lanes go one after another, so each step sees what the ones before it spent. The lane that waited goes first.
+    const first = this.waitingLane ?? 0;
+    this.waitingLane = null;
+    for (const lane of [...LANES.slice(first), ...LANES.slice(0, first)]) {
       try {
-        const running = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'running'`, lane).toArray()[0];
-        if (running && (running.check_at ?? 0) <= now) await this.poll(running);
-        if (this.sql.exec(`SELECT 1 FROM work WHERE lane = ? AND ${ACTIVE}`, lane).toArray().length > 0) return;
-        // The next run can create a `Manki` check, and none may appear on a head while a waiting check is open there.
-        if (lane === 'state' && this.checksToEnd().length > 0 && !(await this.endWaitingChecks())) return;
-        const next = this.nextQueued(lane);
-        // A queued item's `check_at` holds it until the dispatch cap allows another run.
-        if (!next || (next.check_at ?? 0) > now) return;
-        if (next.kind === 'thread') {
-          this.sql.exec(
-            `UPDATE work SET passed_at = ? WHERE lane = ? AND status = 'queued' AND kind IN ('review', 'review_state') AND id < ? AND passed_at IS NULL`,
-            now, lane, next.id,
-          );
-        }
-        await this.start(next);
+        if (!(await this.advanceLane(lane, now))) this.waitingLane ??= LANES.indexOf(lane);
       } catch (error) {
         log('coordinator_lane_error', { ...this.logFields(), lane, error: String(error) });
       }
-    }));
+    }
     // A review that ended in this pass has its waiting check ended at once.
-    await this.endWaitingChecks();
+    if (this.checksToEnd().length === 0) return;
+    if (this.fits(STEP_COST)) await this.endWaitingChecks();
+    else this.waitingLane ??= LANES.indexOf('state');
+  }
+
+  /** Whether `cost` more calls fit in what the lanes of this alarm may still make. */
+  private fits(cost: number): boolean {
+    return this.calls + cost <= this.laneBudget;
+  }
+
+  /**
+   * Polls the lane's run when it is due, and starts its next item once the lane is free. Each step runs only when its
+   * costliest path fits the alarm's budget. Returns false when a step has to wait for the next alarm.
+   */
+  private async advanceLane(lane: Lane, now: number): Promise<boolean> {
+    const running = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'running'`, lane).toArray()[0];
+    if (running && (running.check_at ?? 0) <= now) {
+      if (!this.fits(STEP_COST)) return false;
+      await this.poll(running);
+    }
+    if (this.sql.exec(`SELECT 1 FROM work WHERE lane = ? AND ${ACTIVE}`, lane).toArray().length > 0) return true;
+    // The next run can create a `Manki` check, and none may appear on a head while a waiting check is open there.
+    if (lane === 'state' && this.checksToEnd().length > 0) {
+      if (!this.fits(STEP_COST)) return false;
+      if (!(await this.endWaitingChecks())) return true;
+    }
+    const next = this.nextQueued(lane);
+    // A queued item's `check_at` holds it until the dispatch cap allows another run.
+    if (!next || (next.check_at ?? 0) > now) return true;
+    if (!this.fits(LIGHT_KINDS.has(next.kind) ? LIGHT_COST : STEP_COST)) return false;
+    if (next.kind === 'thread') {
+      this.sql.exec(
+        `UPDATE work SET passed_at = ? WHERE lane = ? AND status = 'queued' AND kind IN ('review', 'review_state') AND id < ? AND passed_at IS NULL`,
+        now, lane, next.id,
+      );
+    }
+    await this.start(next);
+    return true;
   }
 
   /**
@@ -976,12 +1028,19 @@ export class PrCoordinator extends DurableObject<Env> {
     return target;
   }
 
+  /** Calls the GitHub REST API and counts the call against the alarm's budget. */
+  private api(token: string, path: string, init?: { method?: string; body?: unknown }): Promise<Response> {
+    this.calls++;
+    return githubApi(token, path, init);
+  }
+
   /** Mints a token for this repository alone, or reuses one this instance minted that is not about to expire. */
   private async mint(permissions: Permissions): Promise<MintResult> {
     const target = this.target();
     const key = JSON.stringify([target.installationId, target.repositoryId, Object.entries(permissions).sort()]);
     const cached = this.tokens.get(key);
     if (cached && cached.expiresAt - TOKEN_EXPIRY_MARGIN_MS > Date.now()) return { ok: true, ...cached };
+    this.calls++;
     const mint = await mintRepositoryToken(this.env, target.installationId, target.repositoryId, permissions, {
       purpose: 'coordinator',
       repository: `${target.owner}/${target.repo}`,
@@ -1147,7 +1206,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const attempts = current.attempts + 1;
     let response: Response | null = null;
     try {
-      response = await githubApi(token, `/repos/${target.owner}/${target.repo}/actions/workflows/${encodeURIComponent(workflow)}/dispatches`, {
+      response = await this.api(token, `/repos/${target.owner}/${target.repo}/actions/workflows/${encodeURIComponent(workflow)}/dispatches`, {
         method: 'POST',
         body: { ref: target.defaultBranch, inputs: dispatchInputs(current, target.number), return_run_details: true },
       });
@@ -1210,7 +1269,7 @@ export class PrCoordinator extends DurableObject<Env> {
       summary: `Manki started the review run for \`${head.slice(0, 7)}\`. It begins when GitHub Actions gives the run a runner.`,
     };
     this.sql.exec('UPDATE work SET check_id = NULL, check_head = ?, check_ref = ?, check_own = 0 WHERE id = ?', head, item.delivery, item.id);
-    const created = await githubApi(token, `${repo}/check-runs`, {
+    const created = await this.api(token, `${repo}/check-runs`, {
       method: 'POST',
       body: { name: 'Manki', head_sha: head, status: 'queued', external_id: item.delivery, output },
     });
@@ -1226,7 +1285,7 @@ export class PrCoordinator extends DurableObject<Env> {
   /** Whether `head` holds a `Manki` check of the App, in any state. Throws when GitHub fails to list them. */
   private async hasMankiCheck(head: string, target: Target, token: string): Promise<boolean> {
     const path = `/repos/${target.owner}/${target.repo}/commits/${head}/check-runs?check_name=Manki&app_id=${this.env.APP_ID}&filter=all&per_page=1`;
-    const list = await githubApi(token, path);
+    const list = await this.api(token, path);
     if (!list.ok) throw new Error(`listing the Manki checks failed with ${list.status}`);
     return ((await list.json()) as { total_count: number }).total_count > 0;
   }
@@ -1267,7 +1326,7 @@ export class PrCoordinator extends DurableObject<Env> {
   private async endWaitingCheck(item: WorkRow, target: Target, token: string, superseded?: boolean): Promise<void> {
     const repo = `/repos/${target.owner}/${target.repo}`;
     const call = async (path: string, init?: { method: string; body: unknown }, as = token): Promise<Response | null> => {
-      const response = await githubApi(as, path, init);
+      const response = await this.api(as, path, init);
       if (response.ok) return response;
       if (!isRefusal(response, await response.text())) throw new Error(`ending the waiting check failed with ${response.status}`);
       log('coordinator_waiting_check_refused', { ...this.logFields(), work_id: item.id, check_id: item.check_id, status: response.status });
@@ -1311,14 +1370,14 @@ export class PrCoordinator extends DurableObject<Env> {
     const token = await this.token({ issues: 'write', pull_requests: 'write' });
     if (token === null || item.object_id === null) return;
     const path = `/repos/${target.owner}/${target.repo}/issues/comments/${item.object_id}`;
-    const read = await githubApi(token, path);
+    const read = await this.api(token, path);
     if (!read.ok) throw new Error(`reading the settings comment failed with ${read.status}`);
     const { body, user } = await read.json() as IssueCommentRead;
     if (!MANKI_LOGINS.includes(user?.login ?? '')) return;
     const labels = boxLabels(body ?? '', modesOf(item));
     const starting = withSettingsStatus(body ?? '', `${labels.join(' and ') || 'Review'} requested by @${item.sender}, starting…`, [], item.run_head ?? undefined);
     if (starting === body) return;
-    const response = await githubApi(token, path, { method: 'PATCH', body: { body: starting } });
+    const response = await this.api(token, path, { method: 'PATCH', body: { body: starting } });
     if (!response.ok) throw new Error(`showing the review as starting failed with ${response.status}`);
   }
 
@@ -1337,6 +1396,7 @@ export class PrCoordinator extends DurableObject<Env> {
     if (!target) throw new Error('the repository could not be read');
     const token = await this.token({ metadata: 'read' });
     if (token === null) return false;
+    this.calls++;
     const writer = await hasWriteAccess(token, target.owner, target.repo, item.sender);
     this.writers.set(item.sender, { writer, until: Date.now() + WRITER_CACHE_MS });
     return writer;
@@ -1412,7 +1472,7 @@ export class PrCoordinator extends DurableObject<Env> {
       const token = await this.token({ issues: 'write', pull_requests: 'write' });
       if (token === null) return this.requestReview(item, mode);
       const repo = `/repos/${target.owner}/${target.repo}`;
-      const pr = await githubApi(token, `${repo}/pulls/${target.number}`);
+      const pr = await this.api(token, `${repo}/pulls/${target.number}`);
       if (!pr.ok) throw new Error(`reading the pull request failed with ${pr.status}`);
       const head = ((await pr.json()) as PullRequestRead).head.sha;
       const progress = await this.runningProgress(token, item.object_id, running, target);
@@ -1424,7 +1484,7 @@ export class PrCoordinator extends DurableObject<Env> {
         for (const comment of [progress, ticked]) {
           if (!comment) continue;
           const body = withSettingsStatus(comment.body, `already reviewing \`${head.slice(0, 7)}\``, ['again'], head);
-          const edited = await githubApi(token, `${repo}/issues/comments/${comment.id}`, { method: 'PATCH', body: { body } });
+          const edited = await this.api(token, `${repo}/issues/comments/${comment.id}`, { method: 'PATCH', body: { body } });
           if (!edited.ok) throw new Error(`showing the running review failed with ${edited.status}`);
         }
         return `already reviewing ${head.slice(0, 7)}`;
@@ -1436,7 +1496,7 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /** Returns comment `id` of `repo` and whether one of Manki's logins wrote it, or null when it is gone. */
   private async readComment(token: string, repo: string, id: number): Promise<{ id: number; body: string; byManki: boolean } | null> {
-    const read = await githubApi(token, `${repo}/issues/comments/${id}`);
+    const read = await this.api(token, `${repo}/issues/comments/${id}`);
     if (read.status === 404) return null;
     if (!read.ok) throw new Error(`reading the settings comment failed with ${read.status}`);
     const { body, user } = await read.json() as IssueCommentRead;
@@ -1522,7 +1582,7 @@ export class PrCoordinator extends DurableObject<Env> {
       return;
     }
     const path = `/repos/${target.owner}/${target.repo}/issues/comments/${comment.id}`;
-    const response = await githubApi(token, path, { method: 'PATCH', body: { body: cancelledProgress(comment.body, headline) } });
+    const response = await this.api(token, path, { method: 'PATCH', body: { body: cancelledProgress(comment.body, headline) } });
     if (!response.ok) throw new Error(`marking the progress comment cancelled failed with ${response.status}`);
   }
 
@@ -1536,16 +1596,16 @@ export class PrCoordinator extends DurableObject<Env> {
       // A token for checks alone cannot read the PR of a private repository.
       const reader = await this.token({ pull_requests: 'read' });
       if (reader === null) return;
-      const pr = await githubApi(reader, `${repo}/pulls/${target.number}`);
+      const pr = await this.api(reader, `${repo}/pulls/${target.number}`);
       if (!pr.ok) throw new Error(`reading the pull request failed with ${pr.status}`);
       head = ((await pr.json()) as PullRequestRead).head.sha;
     }
     // Another app's check of the same name is not Manki's, and the App could not edit it.
-    const list = await githubApi(checks, `${repo}/commits/${head}/check-runs?check_name=Manki&status=in_progress&app_id=${this.env.APP_ID}`);
+    const list = await this.api(checks, `${repo}/commits/${head}/check-runs?check_name=Manki&status=in_progress&app_id=${this.env.APP_ID}`);
     if (!list.ok) throw new Error(`listing the Manki checks failed with ${list.status}`);
     const { check_runs: runs } = await list.json() as { check_runs: Array<{ id: number }> };
     for (const run of runs) {
-      const response = await githubApi(checks, `${repo}/check-runs/${run.id}`, {
+      const response = await this.api(checks, `${repo}/check-runs/${run.id}`, {
         method: 'PATCH',
         body: { status: 'completed', conclusion: 'cancelled', output: { title, summary: headline } },
       });
@@ -1562,7 +1622,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const isOwn = (comment: IssueCommentRead) =>
       !!comment.body && isRunningProgress(comment.body) && Date.parse(comment.created_at ?? '') >= since;
     if (ticked !== null) {
-      const read = await githubApi(token, `${repo}/issues/comments/${ticked}`);
+      const read = await this.api(token, `${repo}/issues/comments/${ticked}`);
       if (read.ok) {
         const comment = await read.json() as IssueCommentRead;
         if (isOwn(comment)) return { id: ticked, body: comment.body! };
@@ -1581,6 +1641,7 @@ export class PrCoordinator extends DurableObject<Env> {
     token: string, target: Target, matches: (body: string) => boolean, since = 0,
   ): Promise<{ id: number; body: string } | null> {
     const repo = `/repos/${target.owner}/${target.repo}`;
+    this.calls++;
     const data = await githubGraphql<RecentCommentsResponse>(token, RECENT_COMMENTS_QUERY, {
       owner: target.owner, name: target.repo, number: target.number,
     });
@@ -1600,13 +1661,13 @@ export class PrCoordinator extends DurableObject<Env> {
     const token = await this.token({ issues: 'write', pull_requests: 'write' });
     if (token === null || item.object_id === null) return;
     const path = `/repos/${target.owner}/${target.repo}/issues/comments/${item.object_id}`;
-    const read = await githubApi(token, path);
+    const read = await this.api(token, path);
     if (!read.ok) throw new Error(`reading the settings comment failed with ${read.status}`);
     const { body } = await read.json() as { body?: string };
     const { paused } = this.reported().settings;
     const reverted = setBoxes(body ?? '', editOf(item).changes.map(({ box }) => ({ box, ticked: box === 'pause' && paused })));
     if (reverted === body) return;
-    const response = await githubApi(token, path, { method: 'PATCH', body: { body: reverted } });
+    const response = await this.api(token, path, { method: 'PATCH', body: { body: reverted } });
     if (!response.ok) throw new Error(`reverting the settings comment failed with ${response.status}`);
   }
 
@@ -1623,12 +1684,12 @@ export class PrCoordinator extends DurableObject<Env> {
     const repo = `/repos/${target.owner}/${target.repo}`;
     const comments = item.event.startsWith('pull_request_review_comment.') ? 'pulls' : 'issues';
     if (item.object_id !== null) {
-      const reaction = await githubApi(token, `${repo}/${comments}/comments/${item.object_id}/reactions`, { method: 'POST', body: { content: '+1' } });
+      const reaction = await this.api(token, `${repo}/${comments}/comments/${item.object_id}/reactions`, { method: 'POST', body: { content: '+1' } });
       if (!reaction.ok) log('coordinator_reaction_failed', { ...this.logFields(), comment_id: item.object_id, status: reaction.status });
     }
     // Manki marks the reply to a PR comment as its answer, as its `markAnswers` does.
     const body = comments === 'issues' ? `${HELP_REPLY}\n<!-- manki-answered:${item.object_id} -->` : HELP_REPLY;
-    const response = await githubApi(token, `${repo}/issues/${target.number}/comments`, { method: 'POST', body: { body } });
+    const response = await this.api(token, `${repo}/issues/${target.number}/comments`, { method: 'POST', body: { body } });
     if (!response.ok) throw new Error(`posting the help reply failed with ${response.status}`);
     this.sql.exec('UPDATE work SET dispatched_at = ? WHERE id = ?', Date.now(), item.id);
     this.finish(item.id, 'done', 'answered help');
@@ -1638,7 +1699,7 @@ export class PrCoordinator extends DurableObject<Env> {
   private async readPull(target: Target): Promise<{ pr: PullRequestRead; token: string }> {
     const token = await this.token({ pull_requests: 'read' });
     if (token === null) throw new Error('could not mint a token to read the pull request');
-    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/pulls/${target.number}`);
+    const response = await this.api(token, `/repos/${target.owner}/${target.repo}/pulls/${target.number}`);
     if (!response.ok) throw new Error(`reading the pull request failed with ${response.status}`);
     return { pr: await response.json() as PullRequestRead, token };
   }
@@ -1740,7 +1801,7 @@ export class PrCoordinator extends DurableObject<Env> {
       return null;
     };
     try {
-      const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/commits/${head}/pulls?per_page=${HEAD_PULLS_PAGE}`);
+      const response = await this.api(token, `/repos/${target.owner}/${target.repo}/commits/${head}/pulls?per_page=${HEAD_PULLS_PAGE}`);
       if (!response.ok) return unsure(`listing the pull requests of the commit failed with ${response.status}`);
       const listed: unknown = await response.json();
       if (!Array.isArray(listed) || !listed.every(isHeadPull)) return unsure('the reply is not a list of pull requests');
@@ -1804,10 +1865,10 @@ export class PrCoordinator extends DurableObject<Env> {
     if (token === null) return;
     const noteId = this.getMeta<number>('conflict_note');
     const edited = noteId === null ? null
-      : await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/comments/${noteId}`, anew ? { method: 'DELETE' } : { method: 'PATCH', body: { body } });
+      : await this.api(token, `/repos/${target.owner}/${target.repo}/issues/comments/${noteId}`, anew ? { method: 'DELETE' } : { method: 'PATCH', body: { body } });
     // Manki deletes the note once a review posts, so a note that is gone is posted again.
     if (edited === null || edited.status === 404 || anew) {
-      const posted = await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/${target.number}/comments`, { method: 'POST', body: { body } });
+      const posted = await this.api(token, `/repos/${target.owner}/${target.repo}/issues/${target.number}/comments`, { method: 'POST', body: { body } });
       if (!posted.ok) throw new Error(`posting the note failed with ${posted.status}`);
       this.setMeta('conflict_note', ((await posted.json()) as { id: number }).id);
     } else if (!edited.ok) {
@@ -1823,7 +1884,7 @@ export class PrCoordinator extends DurableObject<Env> {
   private async baseConfig(pr: PullRequestRead, target: Target): Promise<BaseConfig> {
     const token = await this.token({ contents: 'read', metadata: 'read' });
     if (token === null) return null;
-    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/contents/.manki.yml?ref=${encodeURIComponent(pr.base.ref)}`);
+    const response = await this.api(token, `/repos/${target.owner}/${target.repo}/contents/.manki.yml?ref=${encodeURIComponent(pr.base.ref)}`);
     if (response.status === 404) return {};
     if (!response.ok) throw new Error(`reading .manki.yml failed with ${response.status}`);
     const file = await response.json() as { type?: string; size?: number; encoding?: string; content?: string };
@@ -1914,7 +1975,7 @@ export class PrCoordinator extends DurableObject<Env> {
       if (!settings || isRunningProgress(settings.body)) continue;
       const body = withSettingsStatus(settings.body, status, untick, head);
       if (body !== settings.body) {
-        const response = await githubApi(token, `${repo}/issues/comments/${settings.id}`, { method: 'PATCH', body: { body } });
+        const response = await this.api(token, `${repo}/issues/comments/${settings.id}`, { method: 'PATCH', body: { body } });
         if (!response.ok) throw new Error(`setting the status line failed with ${response.status}`);
       }
       shown.push(settings.id);
@@ -1935,14 +1996,14 @@ export class PrCoordinator extends DurableObject<Env> {
     const held = () => this.sql.exec<WorkRow>(`SELECT * FROM work WHERE status = 'dispatching' AND check_id IS NOT NULL AND check_head = ?`, head).toArray()[0];
     const first = held();
     let waiting = first && await this.holdsVerdict(first, target, token) ? held() : undefined;
-    let response = waiting && await githubApi(token, `${repo}/check-runs/${waiting.check_id}`, { method: 'PATCH', body });
+    let response = waiting && await this.api(token, `${repo}/check-runs/${waiting.check_id}`, { method: 'PATCH', body });
     // A waiting check GitHub refuses to change is forgotten, as `endWaitingCheck` does, and the report is a new check.
     if (waiting && response && !response.ok && isRefusal(response, await response.text())) {
       log('coordinator_waiting_check_refused', { ...this.logFields(), work_id: waiting.id, check_id: waiting.check_id, status: response.status });
       this.forgetCheck(waiting.id);
       waiting = response = undefined;
     }
-    response ??= await githubApi(token, `${repo}/check-runs`, { method: 'POST', body: { name: 'Manki', head_sha: head, ...body } });
+    response ??= await this.api(token, `${repo}/check-runs`, { method: 'POST', body: { name: 'Manki', head_sha: head, ...body } });
     if (!response.ok) throw new Error(`creating the ${output.title} check failed with ${response.status}`);
     if (waiting) this.forgetCheck(waiting.id);
   }
@@ -1965,7 +2026,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const token = await this.token({ actions: 'read' });
     if (token === null) return null;
     const since = new Date((item.first_attempt_at ?? Date.now()) - MINUTE).toISOString();
-    const response = await githubApi(
+    const response = await this.api(
       token,
       `/repos/${target.owner}/${target.repo}/actions/workflows/${encodeURIComponent(item.workflow)}/runs?event=workflow_dispatch&created=${encodeURIComponent(`>=${since}`)}&per_page=50`,
     );
@@ -2011,7 +2072,7 @@ export class PrCoordinator extends DurableObject<Env> {
     }
 
     const token = await this.token({ actions: 'read' });
-    const response = token === null ? null : await githubApi(token, `/repos/${target.owner}/${target.repo}/actions/runs/${item.run_id}`);
+    const response = token === null ? null : await this.api(token, `/repos/${target.owner}/${target.repo}/actions/runs/${item.run_id}`);
     if (this.row(item.id)?.status !== 'running') return;
     if (response?.status === 404) {
       this.finish(item.id, 'done', 'run deleted');
@@ -2069,7 +2130,7 @@ export class PrCoordinator extends DurableObject<Env> {
       if (this.row(item.id)?.status === 'running') this.finish(item.id, 'timed_out', `${reason}, cannot cancel without actions: write`);
       return true;
     }
-    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/actions/runs/${item.run_id}/cancel`, { method: 'POST' });
+    const response = await this.api(token, `/repos/${target.owner}/${target.repo}/actions/runs/${item.run_id}/cancel`, { method: 'POST' });
     if (this.row(item.id)?.status !== 'running') return true;
     if (!response.ok) {
       log('coordinator_cancel_failed', { ...this.logFields(), work_id: item.id, run_id: item.run_id, reason, status: response.status });
@@ -2141,7 +2202,7 @@ export class PrCoordinator extends DurableObject<Env> {
     if (!mint.ok) {
       optIn = { optedIn: false, reason: `token mint refused with ${mint.status}` };
     } else {
-      const response = await githubApi(mint.token, `/repositories/${target.repositoryId}`);
+      const response = await this.api(mint.token, `/repositories/${target.repositoryId}`);
       if (response.status === 404) {
         optIn = { optedIn: false, reason: 'repository not found' };
       } else if (!response.ok) {
@@ -2149,6 +2210,7 @@ export class PrCoordinator extends DurableObject<Env> {
       } else {
         const repo = await response.json() as { name: string; owner: { login: string; id: number }; default_branch: string };
         repository = { owner: repo.owner.login, ownerId: repo.owner.id, repo: repo.name, defaultBranch: repo.default_branch };
+        this.calls++;
         optIn = await readOptIn(mint.token, repository);
       }
       takesOverCheck = await this.reportOptIn(repository === null ? target : { ...target, ...repository }, optIn.optedIn);
@@ -2167,6 +2229,8 @@ export class PrCoordinator extends DurableObject<Env> {
    */
   private async reportOptIn(target: Target, optedIn: boolean): Promise<boolean> {
     try {
+      // Cloudflare does not say which limit a call to another Durable Object counts against, so it counts here too.
+      this.calls++;
       return await this.env.RECONCILER.getByName(RECONCILER_NAME).recordOptIn(target, optedIn);
     } catch (error) {
       log('coordinator_record_opt_in_error', { ...this.logFields(), error: String(error) });
@@ -2194,6 +2258,8 @@ export class PrCoordinator extends DurableObject<Env> {
     if (until !== null && (until > now || !pending)) times.push(until);
     // Comments still waiting for their reaction wake the alarm at once, since no lane's time stands for them.
     if (this.getMeta<PendingReaction[]>('reactions')) times.push(now);
+    // So does a step that did not fit the budget of the alarm.
+    if (this.waitingLane !== null) times.push(now);
     if (times.length > 0) await this.ctx.storage.setAlarm(Math.max(now, Math.min(...times)));
   }
 }
