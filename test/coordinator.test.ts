@@ -2779,6 +2779,7 @@ describe('PrCoordinator dispatch', () => {
 
     it('starts the steps that do not fit the subrequest limit of one alarm in the alarms that follow, and drops none', async () => {
       const { pr, github, edit } = setup();
+      Object.assign(github, { config: 'skip_authors: ["Dependabot[bot]"]', author: 'dependabot[bot]' });
       const fetches = vi.mocked(fetch).mock.calls;
       const alarmAt = () => runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm());
       await pr.send('pull_request', pr.push(SHA_1));
@@ -2792,9 +2793,10 @@ describe('PrCoordinator dispatch', () => {
       github.openChecks = [{ id: 70, head_sha: SHA_1 }];
       advanceClock(RUNNING_RUN_TIMEOUT_MS + 1);
 
-      // A push the pause skips, 17 commands, a help command and a Cancel tick all arrive before the next alarm.
-      github.head = SHA_2;
+      // A push the pause skips, a bot's push a skip rule matches, 17 commands, a help command and a Cancel tick all arrive before the next alarm.
+      github.head = SHA_3;
       await pr.send('pull_request', pr.push(SHA_2));
+      await pr.send('pull_request', pr.botPush(SHA_3));
       const ask = pr.comment('@manki explain');
       for (let id = 2001; id <= 2017; id++) await pr.send('issue_comment', { ...ask, comment: { ...ask.comment!, id } });
       await pr.send('issue_comment', pr.comment('@manki help'));
@@ -2816,7 +2818,8 @@ describe('PrCoordinator dispatch', () => {
       expect(spent.length).toBeLessThan(10);
       expect(github.cancels).toEqual([9000, 9001]);
       expect(github.checkEdits).toMatchObject([{ id: 70, body: { conclusion: 'cancelled', output: { title: 'Review stopped' } } }]);
-      expect(github.checkRuns).toMatchObject([{ head_sha: SHA_2, conclusion: 'action_required', output: { title: 'Automatic review paused' } }]);
+      // The bot's push adds no skipped check over the one that tells of the pause.
+      expect(github.checkRuns).toMatchObject([{ head_sha: SHA_3, conclusion: 'action_required', output: { title: 'Automatic review paused' } }]);
       expect(github.reactions).toEqual([`issues/${COMMENT_ID}`, ...Array.from({ length: 17 }, (_, index) => `issues/${2001 + index}`)]);
       expect(github.comments).toContain(`${HELP_REPLY}\n<!-- manki-answered:${COMMENT_ID} -->`);
       const rows = await workRows(pr.stub);
@@ -2824,7 +2827,8 @@ describe('PrCoordinator dispatch', () => {
       expect(rows.filter((row) => row.lane !== 'chat')).toMatchObject([
         { kind: 'review', head_sha: SHA_1, status: 'timed_out' },
         { kind: 'settings', status: 'done', note: 'paused' },
-        { kind: 'review', head_sha: SHA_2, status: 'skipped', note: 'pull request is paused' },
+        { kind: 'review', head_sha: SHA_3, status: 'skipped', note: 'pull request is paused' },
+        { kind: 'bot_push', status: 'skipped', note: 'matches the skip rule for author dependabot[bot], no check added' },
         { kind: 'help', status: 'done' },
         { kind: 'settings', status: 'done', note: 'no review to cancel' },
       ]);

@@ -69,9 +69,10 @@ const REACTION_MINTS = 2;
  * and Deeper review, with a fresh opt-in read.
  */
 const STEP_COST = 32;
-/** The most calls the start of an item makes that only dispatches a run or answers help, with a fresh opt-in read. */
-const DISPATCH_COST = 10;
-const DISPATCH_ONLY: ReadonlySet<Work['kind']> = new Set(['merged', 'review_state', 'thread', 'comment', 'issue', 'help']);
+/** The most calls the start of an item of `LIGHT_KINDS` makes, with a fresh opt-in read. The costliest is a bot's push that gets its skipped check. */
+const LIGHT_COST = 11;
+/** The kinds whose start only dispatches a run, answers help or ends a bot's push. Any other kind is checked against `STEP_COST`. */
+const LIGHT_KINDS: ReadonlySet<Work['kind']> = new Set(['merged', 'review_state', 'thread', 'comment', 'issue', 'help', 'bot_push']);
 /** How long a review waits before each new read of a PR whose mergeability GitHub has not computed yet. */
 const MERGEABILITY_RETRY_MS = [5_000, 15_000];
 /** GitHub's largest page of the pull requests of a commit. A full page may be cut off. */
@@ -978,7 +979,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const next = this.nextQueued(lane);
     // A queued item's `check_at` holds it until the dispatch cap allows another run.
     if (!next || (next.check_at ?? 0) > now) return true;
-    if (!this.fits(DISPATCH_ONLY.has(next.kind) ? DISPATCH_COST : STEP_COST)) return false;
+    if (!this.fits(LIGHT_KINDS.has(next.kind) ? LIGHT_COST : STEP_COST)) return false;
     if (next.kind === 'thread') {
       this.sql.exec(
         `UPDATE work SET passed_at = ? WHERE lane = ? AND status = 'queued' AND kind IN ('review', 'review_state') AND id < ? AND passed_at IS NULL`,
