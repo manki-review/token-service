@@ -47,6 +47,7 @@ import {
   workRows,
 } from './helpers';
 import {
+  COMMENT_ID,
   DISPATCH_WORKFLOW_YAML,
   EVENT_WORKFLOW_YAML,
   issueCommentEvent,
@@ -694,6 +695,8 @@ function fakeGitHub(number: number) {
     pullListStatus: 200,
     /** What the list returns in place of the pull requests: a string as the raw reply, anything else as JSON. */
     pullListBody: undefined as unknown,
+    /** The comments the Worker deleted. */
+    deletes: [] as number[],
     /** The commits whose pull requests were listed. */
     pullLists: [] as string[],
     /** The base branch's `.manki.yml`, or null when it has none. */
@@ -889,6 +892,10 @@ function fakeGitHub(number: number) {
       state.issueComments.set(Number(issueComment[1]), ((await request.json()) as { body: string }).body);
       return Response.json({});
     }
+    if (issueComment && request.method === 'DELETE') {
+      state.deletes.push(Number(issueComment[1]));
+      return new Response(null, { status: 204 });
+    }
     const checksOf = url.pathname.match(new RegExp(`^${repo}/commits/([0-9a-f]+)/check-runs$`));
     if (checksOf && request.method === 'GET' && url.searchParams.get('check_name') === 'Manki') {
       if (state.checkListStatus !== 200) return Response.json({ message: 'no' }, { status: state.checkListStatus });
@@ -928,6 +935,7 @@ function fakeGitHub(number: number) {
     }
     if (route === `POST ${repo}/issues/${number}/comments`) {
       state.comments.push(((await request.json()) as { body: string }).body);
+      if (state.commentStatus === 0) throw new Error('connection lost');
       return Response.json({ id: 5005 }, { status: state.commentStatus });
     }
     const permission = url.pathname.match(new RegExp(`^${repo}/collaborators/([^/]+)/permission$`));
@@ -1628,15 +1636,24 @@ describe('PrCoordinator dispatch', () => {
       `^Manki reviews one pull request per commit\\. #${first.number} has the same head commit \`1111111\` and the lower number.*${CONFLICT_NOTE_MARKER}$`, 's',
     ))]);
 
-    // The note is posted once per head. A review someone asks for is held as well, and so is one a catch-up queues.
-    await second.send('issue_comment', second.comment('@manki review'));
-    await runDurableObjectAlarm(second.stub);
+    // A catch-up of the same head is held too, and the note is not posted again.
     const catchUp = { installationId: INSTALLATION_ID, repositoryId: REPOSITORY_ID, owner: OWNER, ownerId: OWNER_ID, repo: REPO, defaultBranch: 'main', number: second.number };
     expect((await second.stub.catchUp(catchUp, SHA_1)).accepted).toBe(true);
     await runDurableObjectAlarm(second.stub);
-    expect(github.dispatches).toEqual([]);
-    expect((await workRows(second.stub)).map((row) => row.note)).toEqual([held, held, held]);
     expect(github.comments).toHaveLength(1);
+    expect(github.deletes).toEqual([]);
+
+    // A review command is held as well. Each one is answered: the note replaces the older one as a new comment below it.
+    for (const [action, notes] of [['created', 2], ['edited', 3]] as const) {
+      await second.send('issue_comment', second.comment('@manki review', action));
+      await runDurableObjectAlarm(second.stub);
+      expect(github.comments).toHaveLength(notes);
+      expect(github.deletes).toHaveLength(notes - 1);
+      expect(github.comments.at(-1)).toBe(github.comments[0]);
+    }
+    expect(github.reactions).toEqual([`issues/${COMMENT_ID}`, `issues/${COMMENT_ID}`]);
+    expect(github.dispatches).toEqual([]);
+    expect((await workRows(second.stub)).map((row) => row.note)).toEqual([held, held, held, held]);
 
     // Each of these is reviewed: nothing else shares its head, or GitHub's answer leaves that in doubt.
     const below = () => ({ number: pullRequest().number });
@@ -1686,11 +1703,19 @@ describe('PrCoordinator dispatch', () => {
     await runDurableObjectAlarm(failing.stub);
     expect(failingGitHub.dispatches).toEqual([]);
     expect(logged(log, 'coordinator_yielded_report_failed')).toMatchObject([{ reviewed: first.number, error: 'posting the note failed with 403' }]);
-    failingGitHub.commentStatus = 201;
+    // A post that throws is logged the same way and holds the review as well.
+    log.mockClear();
+    failingGitHub.commentStatus = 0;
     await failing.send('issue_comment', failing.comment('@manki review'));
     await runDurableObjectAlarm(failing.stub);
-    // The refused post and the one that went through.
-    expect(failingGitHub.comments).toHaveLength(2);
+    expect(logged(log, 'coordinator_yielded_report_failed')).toMatchObject([{ reviewed: first.number, error: 'connection lost' }]);
+    failingGitHub.commentStatus = 201;
+    expect((await failing.stub.catchUp({ ...catchUp, number: failing.number }, SHA_1)).accepted).toBe(true);
+    await runDurableObjectAlarm(failing.stub);
+    // The two failed posts and the one that went through.
+    expect(failingGitHub.comments).toHaveLength(3);
+    expect(failingGitHub.dispatches).toEqual([]);
+    expect((await workRows(failing.stub)).map((row) => row.status)).toEqual(['skipped', 'skipped', 'skipped']);
   });
 
   it('reviews a PR GitHub has not computed mergeability for after reading it twice more, with replies first and newer pushes merged in, and a clean one at once', async () => {
@@ -2772,18 +2797,46 @@ describe('PrCoordinator dispatch', () => {
       expect((await workRows(pr.stub)).filter((row) => row.kind === 'review').map((row) => row.status)).toEqual(['done', 'done', 'done', 'running']);
     });
 
-    it('says in the status line that another PR is reviewed for the head, and unticks the box that asked', async () => {
+    it('says in the status line that another PR is reviewed for the head, and unticks the box that asked each time', async () => {
       const { pr, github, edit } = setup();
       const lower = pr.number - 1;
       github.otherPulls = [{ number: lower }];
-      const settled = (ticked: string[] = [], status = 'up to date') => ['**Review complete**', '<!-- manki-bot -->', '', '---',
-        `Last reviewed \`1111111\` · head \`1111111\` · ${status}`, ...boxLines(ticked, ['pause', 'deeper']), '<!-- manki-settings -->'].join('\n');
+      const block = (ticked: string[], status: string) => ['---', `Last reviewed \`1111111\` · head \`1111111\` · ${status}`,
+        ...['pause', 'again', 'deeper', 'draft'].map((box) => `- [${ticked.includes(box) ? 'x' : ' '}] ${box} <!-- manki-box:${box} -->`), '<!-- manki-settings -->'];
+      const settled = (ticked: string[] = [], status = 'up to date') => ['**Review complete**', '<!-- manki-bot -->', '', ...block(ticked, status)].join('\n');
+      const held = (ticked: string[] = []) => settled(ticked, `not reviewed, #${lower} has the same head commit`);
+      // The box is ticked on an older settings comment, and a newer one shows the status too.
+      github.issueComments.set(1600, settled());
       await edit([], ['deeper'], 'alice', new Date().toISOString(), settled);
       expect(github.dispatches).toEqual([]);
       expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'review', status: 'skipped', note: `#${lower} has the same head commit` });
-      expect(github.issueComments.get(SETTINGS)).toBe(settled([], `not reviewed, #${lower} has the same head commit`));
+      expect(github.issueComments.get(SETTINGS)).toBe(held());
+      expect(github.issueComments.get(1600)).toBe(held());
       // The status line stands for the note, so no comment is posted.
       expect(github.comments).toEqual([]);
+
+      // Every later tick for the same head is unticked again.
+      for (const box of ['again', 'deeper', 'draft', 'again']) {
+        await edit([], [box], 'alice', new Date().toISOString(), held);
+        expect(github.issueComments.get(SETTINGS)).toBe(held());
+        expect(github.issueComments.get(1600)).toBe(held());
+      }
+      // A push of that head changes nothing more.
+      await pr.send('pull_request', pr.push(SHA_1));
+      await runDurableObjectAlarm(pr.stub);
+      expect(github.issueComments.get(SETTINGS)).toBe(held());
+      expect(github.comments).toEqual([]);
+
+      // A review command gets the note below it, also with the status line set. Its comment is a person's and is never edited.
+      const command = ['@manki review', '', ...block(['again'], 'up to date')].join('\n');
+      github.issueComments.set(COMMENT_ID, command);
+      github.commentAuthors.set(COMMENT_ID, 'alice');
+      await pr.send('issue_comment', pr.comment(command));
+      await runDurableObjectAlarm(pr.stub);
+      expect(github.comments).toEqual([expect.stringContaining(`Manki reviews #${lower} and not this pull request`)]);
+      expect(github.issueComments.get(COMMENT_ID)).toBe(command);
+      expect(github.dispatches).toEqual([]);
+      expect((await workRows(pr.stub)).filter((row) => row.kind === 'review').map((row) => row.status)).toEqual(Array(7).fill('skipped'));
     });
 
     it('falls back to Manki\'s newest running progress comment on a cancel, and skips the comment cleanly when there is none', async () => {

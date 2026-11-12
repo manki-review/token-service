@@ -1442,13 +1442,13 @@ export class PrCoordinator extends DurableObject<Env> {
     return `${replaced}, ${this.requestReview(item, mode)}`;
   }
 
-  /** Returns comment `id` of `repo`, or null when it is gone. */
-  private async readComment(token: string, repo: string, id: number): Promise<{ id: number; body: string } | null> {
+  /** Returns comment `id` of `repo` and whether one of Manki's logins wrote it, or null when it is gone. */
+  private async readComment(token: string, repo: string, id: number): Promise<{ id: number; body: string; byManki: boolean } | null> {
     const read = await githubApi(token, `${repo}/issues/comments/${id}`);
     if (read.status === 404) return null;
     if (!read.ok) throw new Error(`reading the settings comment failed with ${read.status}`);
-    const { body } = await read.json() as { body?: string };
-    return body ? { id, body } : null;
+    const { body, user } = await read.json() as IssueCommentRead;
+    return body ? { id, body, byManki: MANKI_LOGINS.includes(user?.login ?? '') } : null;
   }
 
   /** Returns the review running since before the edit at `at`, so a late edit cannot reach a newer run. */
@@ -1760,19 +1760,21 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Tells the PR once per head that `reviewed` is reviewed instead of it: in the status line of Manki's settings
-   * comment, or in a Manki note when there is none. It gets no check, which would be the newest on the commit that
-   * `reviewed` shares. A failure is logged and still skips the review.
+   * Tells the PR that `reviewed` is reviewed instead of it. Manki's settings comments say so in their status line, and
+   * the boxes that asked are unticked. Without a settings comment the PR gets one Manki note per head. A review command
+   * gets the note each time, as a new comment below it. The PR gets no check, which would be the newest on the commit
+   * that `reviewed` shares. A failure is logged and still skips the review.
    */
   private async reportYielded(item: WorkRow, head: string, reviewed: number, target: Target): Promise<void> {
-    const told = `${head}:${reviewed}`;
-    if (this.getMeta<string>('yielded') === told) return;
-    const sha = `\`${head.slice(0, 7)}\``;
-    const note = `Manki reviews one pull request per commit. #${reviewed} has the same head commit ${sha} and the lower number, so Manki reviews #${reviewed} and not this pull request. `
-      + `The \`Manki\` check shown here is the one of #${reviewed}. To have this pull request reviewed, close #${reviewed} and comment \`/manki review\` here, or push a commit that only this pull request has.`;
     try {
-      if (!(await this.showStatus(head, target, `not reviewed, #${reviewed} has the same head commit`, modesOf(item)))) {
-        await this.postNote(`${note}\n\n${CONFLICT_NOTE_MARKER}`, target);
+      const told = `${head}:${reviewed}`;
+      const shown = await this.showStatus(head, target, `not reviewed, #${reviewed} has the same head commit`, modesOf(item), item.object_id);
+      // A comment that asked and is not a settings comment is a review command.
+      const command = item.object_id !== null && !shown.includes(item.object_id);
+      if (command || (shown.length === 0 && this.getMeta<string>('yielded') !== told)) {
+        const note = `Manki reviews one pull request per commit. #${reviewed} has the same head commit \`${head.slice(0, 7)}\` and the lower number, so Manki reviews #${reviewed} and not this pull request. `
+          + `The \`Manki\` check shown here is the one of #${reviewed}. To have this pull request reviewed, close #${reviewed} and comment \`/manki review\` here, or push a commit that only this pull request has.`;
+        await this.postNote(`${note}\n\n${CONFLICT_NOTE_MARKER}`, target, command);
       }
       this.setMeta('yielded', told);
     } catch (error) {
@@ -1795,16 +1797,19 @@ export class PrCoordinator extends DurableObject<Env> {
     await this.completeCheck(pr.head.sha, 'action_required', { title: 'Rebase needed', summary: text }, target, pr.html_url);
   }
 
-  /** Posts the Manki note that says why no review starts, or edits the one an earlier skip posted. */
-  private async postNote(body: string, target: Target): Promise<void> {
+  /**
+   * Posts the Manki note that says why no review starts, or edits the one an earlier skip posted. With `anew` the note
+   * replaces that one as a new comment, so it stands below the comment it answers.
+   */
+  private async postNote(body: string, target: Target, anew = false): Promise<void> {
     // A comment on a pull request needs `pull_requests: write`, one on a plain issue `issues: write`.
     const token = await this.token({ issues: 'write', pull_requests: 'write' });
     if (token === null) return;
     const noteId = this.getMeta<number>('conflict_note');
     const edited = noteId === null ? null
-      : await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/comments/${noteId}`, { method: 'PATCH', body: { body } });
+      : await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/comments/${noteId}`, anew ? { method: 'DELETE' } : { method: 'PATCH', body: { body } });
     // Manki deletes the note once a review posts, so a note that is gone is posted again.
-    if (edited === null || edited.status === 404) {
+    if (edited === null || edited.status === 404 || anew) {
       const posted = await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/${target.number}/comments`, { method: 'POST', body: { body } });
       if (!posted.ok) throw new Error(`posting the note failed with ${posted.status}`);
       this.setMeta('conflict_note', ((await posted.json()) as { id: number }).id);
@@ -1869,20 +1874,28 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Sets the status line of Manki's newest settings comment, among the PR's newest comments, to `status` for `head`, and
-   * clears the boxes in `untick`. Returns whether a settings comment shows it.
+   * Sets the status line of Manki's settings comments to `status` for `head` and clears the boxes in `untick`: on the
+   * newest one among the PR's newest comments, and on comment `ticked` when that is another one. Returns the ids of the
+   * settings comments that show it.
    */
-  private async showStatus(head: string, target: Target, status: string, untick: SettingsBox[] = []): Promise<boolean> {
+  private async showStatus(head: string, target: Target, status: string, untick: SettingsBox[] = [], ticked: number | null = null): Promise<number[]> {
     const token = await this.token({ issues: 'write', pull_requests: 'write' });
-    if (token === null) return false;
-    const settings = await this.newestMankiComment(token, target, (body) => settingsHead(body) !== null);
-    // A progress comment still in progress belongs to its run, which may edit it at any time.
-    if (!settings || isRunningProgress(settings.body)) return false;
-    const body = withSettingsStatus(settings.body, status, untick, head);
-    if (body === settings.body) return true;
-    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/comments/${settings.id}`, { method: 'PATCH', body: { body } });
-    if (!response.ok) throw new Error(`setting the status line failed with ${response.status}`);
-    return true;
+    if (token === null) return [];
+    const repo = `/repos/${target.owner}/${target.repo}`;
+    const newest = await this.newestMankiComment(token, target, (body) => settingsHead(body) !== null);
+    const other = ticked === null || ticked === newest?.id ? null : await this.readComment(token, repo, ticked);
+    const shown: number[] = [];
+    for (const settings of [newest, other?.byManki && settingsHead(other.body) !== null ? other : null]) {
+      // A progress comment still in progress belongs to its run, which may edit it at any time.
+      if (!settings || isRunningProgress(settings.body)) continue;
+      const body = withSettingsStatus(settings.body, status, untick, head);
+      if (body !== settings.body) {
+        const response = await githubApi(token, `${repo}/issues/comments/${settings.id}`, { method: 'PATCH', body: { body } });
+        if (!response.ok) throw new Error(`setting the status line failed with ${response.status}`);
+      }
+      shown.push(settings.id);
+    }
+    return shown;
   }
 
   /** Completes a `Manki` check on `head` with `output`. Without `checks: write` on the installation, it creates none. */
