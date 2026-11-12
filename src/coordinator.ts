@@ -1817,10 +1817,15 @@ export class PrCoordinator extends DurableObject<Env> {
     // another `Manki` check on `head` the report is a new check, the one created last, and the waiting one ends with the review.
     const held = () => this.sql.exec<WorkRow>(`SELECT * FROM work WHERE status = 'dispatching' AND check_id IS NOT NULL AND check_head = ?`, head).toArray()[0];
     const first = held();
-    const waiting = first && await this.holdsVerdict(first, target, token) ? held() : undefined;
-    const response = waiting
-      ? await githubApi(token, `${repo}/check-runs/${waiting.check_id}`, { method: 'PATCH', body })
-      : await githubApi(token, `${repo}/check-runs`, { method: 'POST', body: { name: 'Manki', head_sha: head, ...body } });
+    let waiting = first && await this.holdsVerdict(first, target, token) ? held() : undefined;
+    let response = waiting && await githubApi(token, `${repo}/check-runs/${waiting.check_id}`, { method: 'PATCH', body });
+    // A waiting check GitHub refuses to change is forgotten, as `endWaitingCheck` does, and the report is a new check.
+    if (waiting && response && !response.ok && isRefusal(response, await response.text())) {
+      log('coordinator_waiting_check_refused', { ...this.logFields(), work_id: waiting.id, check_id: waiting.check_id, status: response.status });
+      this.forgetCheck(waiting.id);
+      waiting = response = undefined;
+    }
+    response ??= await githubApi(token, `${repo}/check-runs`, { method: 'POST', body: { name: 'Manki', head_sha: head, ...body } });
     if (!response.ok) throw new Error(`creating the ${output.title} check failed with ${response.status}`);
     if (waiting) this.forgetCheck(waiting.id);
   }

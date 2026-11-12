@@ -2093,6 +2093,16 @@ describe('PrCoordinator dispatch', () => {
       expect(joined.github.waitingChecks).toMatchObject([{ id: 500, status: 'completed', conclusion: 'cancelled', output: { title: 'Review not started' } }]);
       expect(await workRows(joined.pr.stub)).toMatchObject([{ status: 'skipped', check_id: null }]);
 
+      // A waiting check GitHub refuses to change is forgotten, and the report is a new check.
+      const refused = await again();
+      Object.assign(refused.github, { config: 'skip_labels: [no-review]', labels: ['no-review'], waitingCheckStatuses: [403] });
+      await runDurableObjectAlarm(refused.pr.stub);
+      await runDurableObjectAlarm(refused.pr.stub);
+      expect(refused.github.checkRuns).toMatchObject([{ head_sha: SHA_1, conclusion: 'skipped', output: { title: 'Review skipped' } }]);
+      expect(refused.github.waitingChecks).toMatchObject([{ id: 500, status: 'queued' }]);
+      expect(await workRows(refused.pr.stub)).toMatchObject([{ status: 'skipped', check_id: null }]);
+      expect(logged(log, 'coordinator_waiting_check_refused')).toMatchObject([{ pr: refused.pr.number, check_id: 500, status: 403 }]);
+
       // The head moved by the second dispatch: the old head's check ends, and the new head gets its own.
       const moved = await again();
       moved.github.head = SHA_2;
