@@ -1108,7 +1108,8 @@ export class PrCoordinator extends DurableObject<Env> {
     const current = this.row(item.id);
     if (current?.status !== 'dispatching') return;
     if (current.attempts > 0) {
-      const runId = await this.findRun(current, target);
+      // A run that asked `/token` already gave the item its id (`refuseRun`), and `findRun` leaves out every known run.
+      const runId = current.run_id ?? await this.findRun(current, target);
       if (!this.isDispatching(item.id)) return;
       if (runId !== null) {
         this.markRunning(current, runId, 'recovered the run of an earlier attempt');
