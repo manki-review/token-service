@@ -498,7 +498,7 @@ export class PrCoordinator extends DurableObject<Env> {
   private async holdsVerdict(item: WorkRow, target: Target, token: string, taken = false): Promise<boolean> {
     if (item.check_id === null) return false;
     const path = `/repos/${target.owner}/${target.repo}/commits/${item.check_head}/check-runs?check_name=Manki&app_id=${this.env.APP_ID}&filter=all&per_page=100`;
-    const response = await githubApi(token, path);
+    const response = await this.api(token, path);
     if (!response.ok) {
       log('coordinator_waiting_check_failed', { ...this.logFields(), work_id: item.id, error: `listing the Manki checks failed with ${response.status}` });
       return false;
@@ -976,6 +976,10 @@ export class PrCoordinator extends DurableObject<Env> {
     return target;
   }
 
+  private api(token: string, path: string, init?: { method?: string; body?: unknown }): Promise<Response> {
+    return githubApi(token, path, init);
+  }
+
   /** Mints a token for this repository alone, or reuses one this instance minted that is not about to expire. */
   private async mint(permissions: Permissions): Promise<MintResult> {
     const target = this.target();
@@ -1147,7 +1151,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const attempts = current.attempts + 1;
     let response: Response | null = null;
     try {
-      response = await githubApi(token, `/repos/${target.owner}/${target.repo}/actions/workflows/${encodeURIComponent(workflow)}/dispatches`, {
+      response = await this.api(token, `/repos/${target.owner}/${target.repo}/actions/workflows/${encodeURIComponent(workflow)}/dispatches`, {
         method: 'POST',
         body: { ref: target.defaultBranch, inputs: dispatchInputs(current, target.number), return_run_details: true },
       });
@@ -1210,7 +1214,7 @@ export class PrCoordinator extends DurableObject<Env> {
       summary: `Manki started the review run for \`${head.slice(0, 7)}\`. It begins when GitHub Actions gives the run a runner.`,
     };
     this.sql.exec('UPDATE work SET check_id = NULL, check_head = ?, check_ref = ?, check_own = 0 WHERE id = ?', head, item.delivery, item.id);
-    const created = await githubApi(token, `${repo}/check-runs`, {
+    const created = await this.api(token, `${repo}/check-runs`, {
       method: 'POST',
       body: { name: 'Manki', head_sha: head, status: 'queued', external_id: item.delivery, output },
     });
@@ -1226,7 +1230,7 @@ export class PrCoordinator extends DurableObject<Env> {
   /** Whether `head` holds a `Manki` check of the App, in any state. Throws when GitHub fails to list them. */
   private async hasMankiCheck(head: string, target: Target, token: string): Promise<boolean> {
     const path = `/repos/${target.owner}/${target.repo}/commits/${head}/check-runs?check_name=Manki&app_id=${this.env.APP_ID}&filter=all&per_page=1`;
-    const list = await githubApi(token, path);
+    const list = await this.api(token, path);
     if (!list.ok) throw new Error(`listing the Manki checks failed with ${list.status}`);
     return ((await list.json()) as { total_count: number }).total_count > 0;
   }
@@ -1267,7 +1271,7 @@ export class PrCoordinator extends DurableObject<Env> {
   private async endWaitingCheck(item: WorkRow, target: Target, token: string, superseded?: boolean): Promise<void> {
     const repo = `/repos/${target.owner}/${target.repo}`;
     const call = async (path: string, init?: { method: string; body: unknown }, as = token): Promise<Response | null> => {
-      const response = await githubApi(as, path, init);
+      const response = await this.api(as, path, init);
       if (response.ok) return response;
       if (!isRefusal(response, await response.text())) throw new Error(`ending the waiting check failed with ${response.status}`);
       log('coordinator_waiting_check_refused', { ...this.logFields(), work_id: item.id, check_id: item.check_id, status: response.status });
@@ -1311,14 +1315,14 @@ export class PrCoordinator extends DurableObject<Env> {
     const token = await this.token({ issues: 'write', pull_requests: 'write' });
     if (token === null || item.object_id === null) return;
     const path = `/repos/${target.owner}/${target.repo}/issues/comments/${item.object_id}`;
-    const read = await githubApi(token, path);
+    const read = await this.api(token, path);
     if (!read.ok) throw new Error(`reading the settings comment failed with ${read.status}`);
     const { body, user } = await read.json() as IssueCommentRead;
     if (!MANKI_LOGINS.includes(user?.login ?? '')) return;
     const labels = boxLabels(body ?? '', modesOf(item));
     const starting = withSettingsStatus(body ?? '', `${labels.join(' and ') || 'Review'} requested by @${item.sender}, starting…`, [], item.run_head ?? undefined);
     if (starting === body) return;
-    const response = await githubApi(token, path, { method: 'PATCH', body: { body: starting } });
+    const response = await this.api(token, path, { method: 'PATCH', body: { body: starting } });
     if (!response.ok) throw new Error(`showing the review as starting failed with ${response.status}`);
   }
 
@@ -1412,7 +1416,7 @@ export class PrCoordinator extends DurableObject<Env> {
       const token = await this.token({ issues: 'write', pull_requests: 'write' });
       if (token === null) return this.requestReview(item, mode);
       const repo = `/repos/${target.owner}/${target.repo}`;
-      const pr = await githubApi(token, `${repo}/pulls/${target.number}`);
+      const pr = await this.api(token, `${repo}/pulls/${target.number}`);
       if (!pr.ok) throw new Error(`reading the pull request failed with ${pr.status}`);
       const head = ((await pr.json()) as PullRequestRead).head.sha;
       const progress = await this.runningProgress(token, item.object_id, running, target);
@@ -1424,7 +1428,7 @@ export class PrCoordinator extends DurableObject<Env> {
         for (const comment of [progress, ticked]) {
           if (!comment) continue;
           const body = withSettingsStatus(comment.body, `already reviewing \`${head.slice(0, 7)}\``, ['again'], head);
-          const edited = await githubApi(token, `${repo}/issues/comments/${comment.id}`, { method: 'PATCH', body: { body } });
+          const edited = await this.api(token, `${repo}/issues/comments/${comment.id}`, { method: 'PATCH', body: { body } });
           if (!edited.ok) throw new Error(`showing the running review failed with ${edited.status}`);
         }
         return `already reviewing ${head.slice(0, 7)}`;
@@ -1436,7 +1440,7 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /** Returns comment `id` of `repo` and whether one of Manki's logins wrote it, or null when it is gone. */
   private async readComment(token: string, repo: string, id: number): Promise<{ id: number; body: string; byManki: boolean } | null> {
-    const read = await githubApi(token, `${repo}/issues/comments/${id}`);
+    const read = await this.api(token, `${repo}/issues/comments/${id}`);
     if (read.status === 404) return null;
     if (!read.ok) throw new Error(`reading the settings comment failed with ${read.status}`);
     const { body, user } = await read.json() as IssueCommentRead;
@@ -1522,7 +1526,7 @@ export class PrCoordinator extends DurableObject<Env> {
       return;
     }
     const path = `/repos/${target.owner}/${target.repo}/issues/comments/${comment.id}`;
-    const response = await githubApi(token, path, { method: 'PATCH', body: { body: cancelledProgress(comment.body, headline) } });
+    const response = await this.api(token, path, { method: 'PATCH', body: { body: cancelledProgress(comment.body, headline) } });
     if (!response.ok) throw new Error(`marking the progress comment cancelled failed with ${response.status}`);
   }
 
@@ -1536,16 +1540,16 @@ export class PrCoordinator extends DurableObject<Env> {
       // A token for checks alone cannot read the PR of a private repository.
       const reader = await this.token({ pull_requests: 'read' });
       if (reader === null) return;
-      const pr = await githubApi(reader, `${repo}/pulls/${target.number}`);
+      const pr = await this.api(reader, `${repo}/pulls/${target.number}`);
       if (!pr.ok) throw new Error(`reading the pull request failed with ${pr.status}`);
       head = ((await pr.json()) as PullRequestRead).head.sha;
     }
     // Another app's check of the same name is not Manki's, and the App could not edit it.
-    const list = await githubApi(checks, `${repo}/commits/${head}/check-runs?check_name=Manki&status=in_progress&app_id=${this.env.APP_ID}`);
+    const list = await this.api(checks, `${repo}/commits/${head}/check-runs?check_name=Manki&status=in_progress&app_id=${this.env.APP_ID}`);
     if (!list.ok) throw new Error(`listing the Manki checks failed with ${list.status}`);
     const { check_runs: runs } = await list.json() as { check_runs: Array<{ id: number }> };
     for (const run of runs) {
-      const response = await githubApi(checks, `${repo}/check-runs/${run.id}`, {
+      const response = await this.api(checks, `${repo}/check-runs/${run.id}`, {
         method: 'PATCH',
         body: { status: 'completed', conclusion: 'cancelled', output: { title, summary: headline } },
       });
@@ -1562,7 +1566,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const isOwn = (comment: IssueCommentRead) =>
       !!comment.body && isRunningProgress(comment.body) && Date.parse(comment.created_at ?? '') >= since;
     if (ticked !== null) {
-      const read = await githubApi(token, `${repo}/issues/comments/${ticked}`);
+      const read = await this.api(token, `${repo}/issues/comments/${ticked}`);
       if (read.ok) {
         const comment = await read.json() as IssueCommentRead;
         if (isOwn(comment)) return { id: ticked, body: comment.body! };
@@ -1600,13 +1604,13 @@ export class PrCoordinator extends DurableObject<Env> {
     const token = await this.token({ issues: 'write', pull_requests: 'write' });
     if (token === null || item.object_id === null) return;
     const path = `/repos/${target.owner}/${target.repo}/issues/comments/${item.object_id}`;
-    const read = await githubApi(token, path);
+    const read = await this.api(token, path);
     if (!read.ok) throw new Error(`reading the settings comment failed with ${read.status}`);
     const { body } = await read.json() as { body?: string };
     const { paused } = this.reported().settings;
     const reverted = setBoxes(body ?? '', editOf(item).changes.map(({ box }) => ({ box, ticked: box === 'pause' && paused })));
     if (reverted === body) return;
-    const response = await githubApi(token, path, { method: 'PATCH', body: { body: reverted } });
+    const response = await this.api(token, path, { method: 'PATCH', body: { body: reverted } });
     if (!response.ok) throw new Error(`reverting the settings comment failed with ${response.status}`);
   }
 
@@ -1623,12 +1627,12 @@ export class PrCoordinator extends DurableObject<Env> {
     const repo = `/repos/${target.owner}/${target.repo}`;
     const comments = item.event.startsWith('pull_request_review_comment.') ? 'pulls' : 'issues';
     if (item.object_id !== null) {
-      const reaction = await githubApi(token, `${repo}/${comments}/comments/${item.object_id}/reactions`, { method: 'POST', body: { content: '+1' } });
+      const reaction = await this.api(token, `${repo}/${comments}/comments/${item.object_id}/reactions`, { method: 'POST', body: { content: '+1' } });
       if (!reaction.ok) log('coordinator_reaction_failed', { ...this.logFields(), comment_id: item.object_id, status: reaction.status });
     }
     // Manki marks the reply to a PR comment as its answer, as its `markAnswers` does.
     const body = comments === 'issues' ? `${HELP_REPLY}\n<!-- manki-answered:${item.object_id} -->` : HELP_REPLY;
-    const response = await githubApi(token, `${repo}/issues/${target.number}/comments`, { method: 'POST', body: { body } });
+    const response = await this.api(token, `${repo}/issues/${target.number}/comments`, { method: 'POST', body: { body } });
     if (!response.ok) throw new Error(`posting the help reply failed with ${response.status}`);
     this.sql.exec('UPDATE work SET dispatched_at = ? WHERE id = ?', Date.now(), item.id);
     this.finish(item.id, 'done', 'answered help');
@@ -1638,7 +1642,7 @@ export class PrCoordinator extends DurableObject<Env> {
   private async readPull(target: Target): Promise<{ pr: PullRequestRead; token: string }> {
     const token = await this.token({ pull_requests: 'read' });
     if (token === null) throw new Error('could not mint a token to read the pull request');
-    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/pulls/${target.number}`);
+    const response = await this.api(token, `/repos/${target.owner}/${target.repo}/pulls/${target.number}`);
     if (!response.ok) throw new Error(`reading the pull request failed with ${response.status}`);
     return { pr: await response.json() as PullRequestRead, token };
   }
@@ -1740,7 +1744,7 @@ export class PrCoordinator extends DurableObject<Env> {
       return null;
     };
     try {
-      const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/commits/${head}/pulls?per_page=${HEAD_PULLS_PAGE}`);
+      const response = await this.api(token, `/repos/${target.owner}/${target.repo}/commits/${head}/pulls?per_page=${HEAD_PULLS_PAGE}`);
       if (!response.ok) return unsure(`listing the pull requests of the commit failed with ${response.status}`);
       const listed: unknown = await response.json();
       if (!Array.isArray(listed) || !listed.every(isHeadPull)) return unsure('the reply is not a list of pull requests');
@@ -1804,10 +1808,10 @@ export class PrCoordinator extends DurableObject<Env> {
     if (token === null) return;
     const noteId = this.getMeta<number>('conflict_note');
     const edited = noteId === null ? null
-      : await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/comments/${noteId}`, anew ? { method: 'DELETE' } : { method: 'PATCH', body: { body } });
+      : await this.api(token, `/repos/${target.owner}/${target.repo}/issues/comments/${noteId}`, anew ? { method: 'DELETE' } : { method: 'PATCH', body: { body } });
     // Manki deletes the note once a review posts, so a note that is gone is posted again.
     if (edited === null || edited.status === 404 || anew) {
-      const posted = await githubApi(token, `/repos/${target.owner}/${target.repo}/issues/${target.number}/comments`, { method: 'POST', body: { body } });
+      const posted = await this.api(token, `/repos/${target.owner}/${target.repo}/issues/${target.number}/comments`, { method: 'POST', body: { body } });
       if (!posted.ok) throw new Error(`posting the note failed with ${posted.status}`);
       this.setMeta('conflict_note', ((await posted.json()) as { id: number }).id);
     } else if (!edited.ok) {
@@ -1823,7 +1827,7 @@ export class PrCoordinator extends DurableObject<Env> {
   private async baseConfig(pr: PullRequestRead, target: Target): Promise<BaseConfig> {
     const token = await this.token({ contents: 'read', metadata: 'read' });
     if (token === null) return null;
-    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/contents/.manki.yml?ref=${encodeURIComponent(pr.base.ref)}`);
+    const response = await this.api(token, `/repos/${target.owner}/${target.repo}/contents/.manki.yml?ref=${encodeURIComponent(pr.base.ref)}`);
     if (response.status === 404) return {};
     if (!response.ok) throw new Error(`reading .manki.yml failed with ${response.status}`);
     const file = await response.json() as { type?: string; size?: number; encoding?: string; content?: string };
@@ -1914,7 +1918,7 @@ export class PrCoordinator extends DurableObject<Env> {
       if (!settings || isRunningProgress(settings.body)) continue;
       const body = withSettingsStatus(settings.body, status, untick, head);
       if (body !== settings.body) {
-        const response = await githubApi(token, `${repo}/issues/comments/${settings.id}`, { method: 'PATCH', body: { body } });
+        const response = await this.api(token, `${repo}/issues/comments/${settings.id}`, { method: 'PATCH', body: { body } });
         if (!response.ok) throw new Error(`setting the status line failed with ${response.status}`);
       }
       shown.push(settings.id);
@@ -1935,14 +1939,14 @@ export class PrCoordinator extends DurableObject<Env> {
     const held = () => this.sql.exec<WorkRow>(`SELECT * FROM work WHERE status = 'dispatching' AND check_id IS NOT NULL AND check_head = ?`, head).toArray()[0];
     const first = held();
     let waiting = first && await this.holdsVerdict(first, target, token) ? held() : undefined;
-    let response = waiting && await githubApi(token, `${repo}/check-runs/${waiting.check_id}`, { method: 'PATCH', body });
+    let response = waiting && await this.api(token, `${repo}/check-runs/${waiting.check_id}`, { method: 'PATCH', body });
     // A waiting check GitHub refuses to change is forgotten, as `endWaitingCheck` does, and the report is a new check.
     if (waiting && response && !response.ok && isRefusal(response, await response.text())) {
       log('coordinator_waiting_check_refused', { ...this.logFields(), work_id: waiting.id, check_id: waiting.check_id, status: response.status });
       this.forgetCheck(waiting.id);
       waiting = response = undefined;
     }
-    response ??= await githubApi(token, `${repo}/check-runs`, { method: 'POST', body: { name: 'Manki', head_sha: head, ...body } });
+    response ??= await this.api(token, `${repo}/check-runs`, { method: 'POST', body: { name: 'Manki', head_sha: head, ...body } });
     if (!response.ok) throw new Error(`creating the ${output.title} check failed with ${response.status}`);
     if (waiting) this.forgetCheck(waiting.id);
   }
@@ -1965,7 +1969,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const token = await this.token({ actions: 'read' });
     if (token === null) return null;
     const since = new Date((item.first_attempt_at ?? Date.now()) - MINUTE).toISOString();
-    const response = await githubApi(
+    const response = await this.api(
       token,
       `/repos/${target.owner}/${target.repo}/actions/workflows/${encodeURIComponent(item.workflow)}/runs?event=workflow_dispatch&created=${encodeURIComponent(`>=${since}`)}&per_page=50`,
     );
@@ -2011,7 +2015,7 @@ export class PrCoordinator extends DurableObject<Env> {
     }
 
     const token = await this.token({ actions: 'read' });
-    const response = token === null ? null : await githubApi(token, `/repos/${target.owner}/${target.repo}/actions/runs/${item.run_id}`);
+    const response = token === null ? null : await this.api(token, `/repos/${target.owner}/${target.repo}/actions/runs/${item.run_id}`);
     if (this.row(item.id)?.status !== 'running') return;
     if (response?.status === 404) {
       this.finish(item.id, 'done', 'run deleted');
@@ -2069,7 +2073,7 @@ export class PrCoordinator extends DurableObject<Env> {
       if (this.row(item.id)?.status === 'running') this.finish(item.id, 'timed_out', `${reason}, cannot cancel without actions: write`);
       return true;
     }
-    const response = await githubApi(token, `/repos/${target.owner}/${target.repo}/actions/runs/${item.run_id}/cancel`, { method: 'POST' });
+    const response = await this.api(token, `/repos/${target.owner}/${target.repo}/actions/runs/${item.run_id}/cancel`, { method: 'POST' });
     if (this.row(item.id)?.status !== 'running') return true;
     if (!response.ok) {
       log('coordinator_cancel_failed', { ...this.logFields(), work_id: item.id, run_id: item.run_id, reason, status: response.status });
@@ -2141,7 +2145,7 @@ export class PrCoordinator extends DurableObject<Env> {
     if (!mint.ok) {
       optIn = { optedIn: false, reason: `token mint refused with ${mint.status}` };
     } else {
-      const response = await githubApi(mint.token, `/repositories/${target.repositoryId}`);
+      const response = await this.api(mint.token, `/repositories/${target.repositoryId}`);
       if (response.status === 404) {
         optIn = { optedIn: false, reason: 'repository not found' };
       } else if (!response.ok) {
