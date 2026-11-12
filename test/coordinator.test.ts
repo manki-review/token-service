@@ -2151,44 +2151,33 @@ describe('PrCoordinator dispatch', () => {
       expect(otherGitHub.dispatches).toHaveLength(1);
       expect(logged(log, 'reconciler_check_ability').map((line) => line.takes_over_check)).toEqual([false, true, false]);
 
-      // A run that completes without asking for a token is not the Manki App's, as after a move to a custom App. Its
-      // check ends unclaimed, the stored answer is cleared, and the next review gets none.
-      const moved = await dispatched();
+      // Only a `/token` request changes the answer. A run that ends without asking keeps it, whatever its conclusion, and
+      // so does a review that never got a run. The next review still gets its waiting check.
       log.mockClear();
-      await moved.end();
-      expect(moved.github.waitingChecks).toMatchObject([{ status: 'completed', conclusion: 'cancelled', output: { title: 'Review did not run' } }]);
-      await moved.push(SHA_2);
-      expect(moved.github.waitingChecks).toHaveLength(1);
-      // A run that asks with the flag stores the answer again, also while it holds no check. The review after it gets one.
-      expect(await moved.ask({ takes_over_check: true }, 9001)).not.toHaveProperty('check_run');
-      await moved.end('success', 9001);
-      await moved.push(SHA_3);
-      expect(moved.github.waitingChecks).toMatchObject([{ head_sha: SHA_1 }, { id: 501, head_sha: SHA_3, status: 'queued' }]);
-      expect(logged(log, 'reconciler_check_ability').map((line) => line.takes_over_check)).toEqual([false, true]);
-
-      // A run that asked and ended without a review keeps the answer, and so does a review that never got a run.
-      const kept = await dispatched();
-      await kept.ask({ takes_over_check: true });
-      await kept.end();
-      await kept.push(SHA_2);
-      expect(kept.github.waitingChecks).toMatchObject([{ output: { title: 'Review did not run' } }, { head_sha: SHA_2, status: 'queued' }]);
+      for (const conclusion of ['success', 'failure', 'cancelled']) {
+        const silent = await dispatched();
+        await silent.end(conclusion);
+        await silent.push(SHA_2);
+        expect(silent.github.waitingChecks).toMatchObject([{ output: { title: 'Review did not run' } }, { head_sha: SHA_2, status: 'queued' }]);
+      }
       const refused = await dispatched(true, { dispatchStatuses: [422] });
       await refused.push(SHA_2);
       expect(refused.github.waitingChecks).toMatchObject([{ output: { title: 'Review could not start' } }, { head_sha: SHA_2, status: 'queued' }]);
-      // A run cancelled while it waited for a runner says nothing about the App, so the next review still gets its check.
-      const cancelled = await dispatched();
-      await cancelled.end('cancelled');
-      await cancelled.push(SHA_2);
-      expect(cancelled.github.waitingChecks).toMatchObject([
-        { conclusion: 'cancelled', output: { title: 'Review did not run' } }, { head_sha: SHA_2, status: 'queued' },
-      ]);
-      expect(logged(log, 'reconciler_check_ability').map((line) => line.takes_over_check)).toEqual([false, true]);
-      // A run that failed without asking clears the answer, as one that succeeded does.
-      const failed = await dispatched();
-      await failed.end('failure');
-      await failed.push(SHA_2);
-      expect(failed.github.waitingChecks).toHaveLength(1);
-      expect(logged(log, 'reconciler_check_ability').map((line) => line.takes_over_check)).toEqual([false, true, false]);
+      expect(logged(log, 'reconciler_check_ability').map((line) => line.takes_over_check)).not.toContain(false);
+
+      // An opt-out clears the answer: the dispatch workflow leaves the default branch, the coordinator reads that, and
+      // the registry forgets the repository. Opted in again, the repository gets no waiting check.
+      const moved = await dispatched();
+      await moved.end();
+      moved.github.workflows = {};
+      advanceClock(OPT_IN_TTL_MS + 1);
+      await moved.push(SHA_2);
+      expect(moved.github.dispatches).toHaveLength(1);
+      moved.github.workflows = { 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML };
+      advanceClock(OPT_IN_TTL_MS + 1);
+      await moved.push(SHA_3);
+      expect(moved.github.dispatches).toHaveLength(2);
+      expect(moved.github.waitingChecks).toMatchObject([{ head_sha: SHA_1, output: { title: 'Review did not run' } }]);
     });
 
     it('creates no waiting check while the registry cannot be read, and believes a run only once the registry stored it', async () => {
