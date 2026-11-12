@@ -95,6 +95,8 @@ export interface OidcTokenOptions {
   issuer?: string;
   audience?: string;
   key?: CryptoKey;
+  /** The `kid` of the token's header. A missing value means the key `stubGitHub` serves. */
+  kid?: string;
   expiresIn?: string | number;
   /** The `iat` claim. A missing value means now. */
   issuedAt?: number;
@@ -116,7 +118,7 @@ export async function oidcToken(options: OidcTokenOptions = {}): Promise<string>
     repository_visibility: 'public',
     ...options.claims,
   })
-    .setProtectedHeader({ alg: 'RS256', kid: OIDC_KID })
+    .setProtectedHeader({ alg: 'RS256', kid: options.kid ?? OIDC_KID })
     .setIssuer(options.issuer ?? OIDC_ISSUER)
     .setAudience(options.audience ?? OIDC_AUDIENCE);
   if (!options.omit?.includes('iat')) jwt.setIssuedAt(options.issuedAt);

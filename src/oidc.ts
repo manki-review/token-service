@@ -1,4 +1,4 @@
-import { jwtVerify, createRemoteJWKSet } from 'jose';
+import { createRemoteJWKSet, customFetch, errors, type FetchImplementation, jwtVerify } from 'jose';
 import { readBody } from './body';
 import type { Env } from './env';
 import { getInstallation, type Installation } from './github';
@@ -6,8 +6,25 @@ import { failure, log } from './log';
 
 const GITHUB_OIDC_ISSUER = 'https://token.actions.githubusercontent.com';
 
+/** A failed request for GitHub's signing keys. It says nothing about the token, so the caller may try again. */
+class KeyFetchError extends Error {
+  override name = 'KeyFetchError';
+}
+
+/** Requests the key set and throws `KeyFetchError` unless the reply is a 200 with a JSON body. */
+const fetchKeys: FetchImplementation = async (url, options) => {
+  try {
+    const response = await fetch(url, options);
+    if (response.status !== 200) throw new Error(`the key endpoint answered ${response.status}`);
+    // The body is read here, so a reply that is cut off, times out or is not JSON fails as a fetch too.
+    return Response.json(await response.json());
+  } catch (error) {
+    throw new KeyFetchError(error instanceof Error ? `${error.name}: ${error.message}` : String(error));
+  }
+};
+
 // Created once per isolate so GitHub's keys are cached across requests instead of fetched on every one.
-const GITHUB_JWKS = createRemoteJWKSet(new URL(`${GITHUB_OIDC_ISSUER}/.well-known/jwks`));
+const GITHUB_JWKS = createRemoteJWKSet(new URL(`${GITHUB_OIDC_ISSUER}/.well-known/jwks`), { [customFetch]: fetchKeys });
 
 export interface OIDCClaims {
   repository: string;
@@ -64,8 +81,9 @@ export interface WorkflowRequest {
 
 /**
  * Reads a request that carries a GitHub Actions OIDC token as its bearer token and a JSON body naming `owner` and
- * `repo`. Returns the error response when the token is missing or not from a workflow in that repository, when the
- * token's account is over its rate limit, or when the App is not installed on the repository.
+ * `repo`. Returns the error response when the token is missing or not from a workflow in that repository, when GitHub's
+ * signing keys cannot be fetched, when the token's account is over its rate limit, or when the App is not installed on
+ * the repository.
  */
 export async function verifyWorkflowRequest(request: Request, env: Env): Promise<WorkflowRequest | Response> {
   const authHeader = request.headers.get('Authorization');
@@ -90,6 +108,10 @@ export async function verifyWorkflowRequest(request: Request, env: Env): Promise
   try {
     claims = await verifyGitHubOIDC(authHeader.slice(7), `${body.owner}/${body.repo}`);
   } catch (error) {
+    // Only an error that can come from nothing but the key set is a 503. Every other error refuses the token.
+    if (error instanceof KeyFetchError || error instanceof errors.JWKSInvalid) {
+      return failure(503, 'Signing keys could not be fetched', { detail: String(error) });
+    }
     return failure(403, 'OIDC verification failed', { detail: String(error) });
   }
 

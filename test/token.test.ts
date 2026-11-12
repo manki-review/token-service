@@ -16,6 +16,7 @@ import {
   JWKS_URL,
   logged,
   OIDC_AUDIENCE,
+  OIDC_JWKS,
   oidcToken,
   OWNER,
   OWNER_ID,
@@ -227,6 +228,75 @@ describe('/token', () => {
     const seen = requests.length;
     expect((await post()).status).toBe(200);
     expect(requests.slice(seen).map((request) => request.url)).not.toContain(JWKS_URL);
+  });
+
+  it('answers 503 when GitHub\'s signing keys cannot be fetched, and still refuses a token that is invalid', async () => {
+    const MINUTE = 60_000;
+    // The key set is kept for 10 minutes, so the clock starts where any set an earlier test fetched is stale.
+    const advance = freezeClock(Date.now() + 11 * MINUTE);
+    let keys: () => Response | Promise<Response> = () => Response.json(OIDC_JWKS);
+    const requests = stubGitHub({ api: { [`GET ${new URL(JWKS_URL).pathname}`]: () => keys() } });
+    const keyRequests = () => requests.filter((request) => request.url === JWKS_URL).length;
+
+    for (const [reply, detail] of [
+      [() => Promise.reject(new DOMException('The operation was aborted due to timeout', 'TimeoutError')), 'KeyFetchError: TimeoutError: The operation was aborted due to timeout'],
+      [() => Promise.reject(new TypeError('Network connection lost')), 'KeyFetchError: TypeError: Network connection lost'],
+      [() => new Response('busy', { status: 503 }), 'KeyFetchError: Error: the key endpoint answered 503'],
+      [() => new Response(null, { status: 302, headers: { Location: 'https://example.com/keys' } }), 'KeyFetchError: Error: the key endpoint answered 302'],
+      [() => new Response('<html>Bad gateway</html>'), /^KeyFetchError: SyntaxError: /],
+      [() => Response.json({ message: 'no keys here' }), 'JWKSInvalid: JSON Web Key Set malformed'],
+    ] as Array<[typeof keys, string | RegExp]>) {
+      keys = reply;
+      const asked = keyRequests();
+      await expectFailure(await post(), 503, 'Signing keys could not be fetched', detail);
+      // A failed fetch is not remembered, so each request asks for the keys again.
+      expect(keyRequests()).toBe(asked + 1);
+    }
+    // The other endpoints verify the same way.
+    expect((await post({ path: '/state', body: { owner: OWNER, repo: REPO, pr: 7 } })).status).toBe(503);
+    // A token that is no JWT is refused without the keys.
+    const asked = keyRequests();
+    await expectFailure(await post({ token: 'not.a.jwt' }), 403, 'OIDC verification failed', /^JWSInvalid: /);
+    expect(keyRequests()).toBe(asked);
+    expect(apiRequests(requests)).toEqual([]);
+
+    // Once the keys answer again the same token is accepted.
+    keys = () => Response.json(OIDC_JWKS);
+    expect((await post()).status).toBe(200);
+    expect(keyRequests()).toBe(asked + 1);
+
+    // No matching key right after a fetch is an invalid token: 403, without another fetch.
+    const unknownKey = () => oidcToken({ kid: 'rotated-out' });
+    await expectFailure(await post({ token: await unknownKey() }), 403, 'OIDC verification failed', /^JWKSNoMatchingKey: /);
+    expect(keyRequests()).toBe(asked + 1);
+    // Later the set is fetched again for an unknown key. A fetch that fails leaves the token undecided: 503.
+    advance(MINUTE);
+    keys = () => new Response('busy', { status: 500 });
+    await expectFailure(await post({ token: await unknownKey() }), 503, 'Signing keys could not be fetched', 'KeyFetchError: Error: the key endpoint answered 500');
+    // A fetch that works and still holds no such key refuses it.
+    keys = () => Response.json(OIDC_JWKS);
+    await expectFailure(await post({ token: await unknownKey() }), 403, 'OIDC verification failed', /^JWKSNoMatchingKey: /);
+    expect(keyRequests()).toBe(asked + 3);
+
+    // A set that is cached and stale is not used when its refresh fails, also for a valid token.
+    advance(11 * MINUTE);
+    keys = () => new Response('busy', { status: 500 });
+    await expectFailure(await post(), 503, 'Signing keys could not be fetched', 'KeyFetchError: Error: the key endpoint answered 500');
+    await expectFailure(await post({ token: await oidcToken({ key: otherKeys.privateKey }) }), 503, 'Signing keys could not be fetched', /^KeyFetchError: /);
+    keys = () => Response.json(OIDC_JWKS);
+    await expectFailure(await post({ token: await oidcToken({ key: otherKeys.privateKey }) }), 403, 'OIDC verification failed', /^JWSSignatureVerificationFailed: /);
+  });
+
+  it('answers 503 when the request for the signing keys runs into its timeout', { timeout: 10_000 }, async () => {
+    freezeClock(Date.now() + 60 * 60_000);
+    // The key endpoint never answers, so the request ends when the timeout of 5 seconds aborts it.
+    const hangs = (request: Request) => new Promise<Response>((_resolve, reject) => {
+      request.signal.addEventListener('abort', () => reject(request.signal.reason));
+    });
+    stubGitHub({ api: { [`GET ${new URL(JWKS_URL).pathname}`]: hangs } });
+    const started = performance.now();
+    await expectFailure(await post(), 503, 'Signing keys could not be fetched', /^KeyFetchError: TimeoutError: /);
+    expect(performance.now() - started).toBeGreaterThan(4000);
   });
 
   it('rejects requests that are not a POST to /token', async () => {
