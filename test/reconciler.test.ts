@@ -577,6 +577,10 @@ function pull(number: number, sha: string, options: { draft?: boolean; fork?: bo
   };
 }
 
+const RECORD = '<!-- manki-context: {"meta":{}} -->';
+// A finding that shows a diff line holding the marker and a record, in a code fence.
+const QUOTED_NO_VERDICT = ['```', '<!-- manki-context: {} -->', '<!-- manki-no-verdict -->', '```'].join('\n');
+
 describe('Reconciler catch-up', () => {
   it('queues a review for an open PR whose head has no Manki review', async () => {
     const { stub, repo } = setup();
@@ -648,11 +652,14 @@ describe('Reconciler catch-up', () => {
       { author: 'alice', oid: SHA_1 },
       { author: 'manki-review', oid: SHA_2, body: 'Approved.\n<!-- manki -->\n<!-- manki-auto-approve -->' },
     ]);
+    // A review quotes the no-verdict marker above its round record, as when the reviewed diff holds it.
+    github.pulls.get(target.repo)!.push(pull(3, SHA_1, { repo: target.repo }), pull(4, SHA_1, { repo: target.repo }));
+    github.reviews.set(`${target.repo}#3`, [{ author: 'manki-review', oid: SHA_1, body: `Changes requested.\n${QUOTED_NO_VERDICT}\n<!-- manki-bot -->\n${RECORD}` }]);
+    github.reviews.set(`${target.repo}#4`, [{ author: 'manki-review', oid: SHA_1, body: `The diff ends its text with <!-- manki-no-verdict -->\n<!-- manki-bot -->` }]);
     await stub.reconcile();
     expect(logged(log, 'reconciler_caught_up')).toEqual([]);
     // No coordinator state is created for a PR that needed nothing.
-    expect(await tableNames(coordinator(target.repositoryId, 1))).toEqual([]);
-    expect(await tableNames(coordinator(target.repositoryId, 2))).toEqual([]);
+    for (const number of [1, 2, 3, 4]) expect(await tableNames(coordinator(target.repositoryId, number))).toEqual([]);
   });
 
   it.each([
@@ -662,6 +669,8 @@ describe('Reconciler catch-up', () => {
     ['a thread reply of Manki\'s', [{ author: 'manki-review', oid: SHA_1, body: '' }]],
     ['Manki\'s dismissed review', [{ author: 'manki-review', oid: SHA_1, state: 'DISMISSED' }]],
     ['Manki\'s review without a verdict', [{ author: 'manki-review', oid: SHA_1, body: 'Review incomplete.\n<!-- manki-bot -->\n<!-- manki-no-verdict -->' }]],
+    ['Manki\'s review without a verdict below its record', [{ author: 'manki-review', oid: SHA_1, body: `Review incomplete.\n<!-- manki-bot -->\n${RECORD}\n\n<!-- manki-no-verdict -->\r` }]],
+    ['Manki\'s review without a verdict that also quotes a record', [{ author: 'manki-review', oid: SHA_1, body: `${QUOTED_NO_VERDICT}\n${RECORD}\n\n<!-- manki-no-verdict -->\n\n<!-- manki-held-for-person -->` }]],
   ])('catches up a head whose only review is %s', async (_case, reviews) => {
     const { stub, repo } = setup();
     const target = repo();
