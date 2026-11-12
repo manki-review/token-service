@@ -921,7 +921,7 @@ export class PrCoordinator extends DurableObject<Env> {
         const running = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'running'`, lane).toArray()[0];
         if (running && (running.check_at ?? 0) <= now) await this.poll(running);
         if (this.sql.exec(`SELECT 1 FROM work WHERE lane = ? AND ${ACTIVE}`, lane).toArray().length > 0) return;
-        // The next run can create a `Manki` check, and a waiting check that ends after a newer one could be read ahead of it.
+        // The next run can create a `Manki` check, and none may appear on a head while a waiting check is open there.
         if (lane === 'state' && this.checksToEnd().length > 0 && !(await this.endWaitingChecks())) return;
         const next = this.nextQueued(lane);
         // A queued item's `check_at` holds it until the dispatch cap allows another run.
