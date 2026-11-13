@@ -1,273 +1,146 @@
+<div align="center">
+
 # manki-token-service
 
-Cloudflare Worker that issues GitHub App installation tokens to GitHub Actions workflows.
+**The Cloudflare Worker behind [Manki](https://github.com/manki-review/manki)'s GitHub App.**
 
-Workflows authenticate via [GitHub's OIDC provider](https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect). The service verifies the OIDC token, dynamically looks up the app installation for the requested repository, and returns a scoped installation token.
+It schedules every review from the App's webhooks, hands each Manki run a token scoped to its own repository,<br>
+and keeps the state of every pull request, so the runs themselves hold almost no power.
 
-## How it works
+[![CI](https://github.com/manki-review/token-service/actions/workflows/ci.yml/badge.svg)](https://github.com/manki-review/token-service/actions/workflows/ci.yml)
+[![Deploy](https://github.com/manki-review/token-service/actions/workflows/deploy.yml/badge.svg)](https://github.com/manki-review/token-service/actions/workflows/deploy.yml)
+[![Log watch](https://github.com/manki-review/token-service/actions/workflows/log-watch.yml/badge.svg)](https://github.com/manki-review/token-service/actions/workflows/log-watch.yml)
+<br>
+[![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/workers/)
+[![Durable Objects](https://img.shields.io/badge/Durable_Objects-SQLite-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/durable-objects/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 
-1. A GitHub Actions workflow requests an OIDC token with audience `manki-api.dustinface.me`
-2. The workflow POSTs to `https://manki-api.dustinface.me/token` with the OIDC token as a Bearer token and `{ owner, repo }` in the body
-3. The service verifies the OIDC token against GitHub's JWKS, checks that the repository claim matches, and refuses a token issued more than 10 minutes ago. A token that fails this gets `403`. The Worker keeps GitHub's key set for 10 minutes and fetches it again once it is older, or when a token names a key the set does not hold and the last fetch that worked is over 30 seconds old. A fetch that fails says nothing about the token, so it gets `503` and not `403`: a timeout after 5 seconds, a network error, a reply other than `200`, or a body that is no JSON key set. A stale key set is not used in its place, and a failed fetch is not remembered, so the next request fetches again. Every endpoint that takes an OIDC token answers this way. Manki tries `/token` once more after a `5xx`. Both answers log `request_failed` with the reason in `detail`, and [log watch](#log-watch) reports the `503`
-4. It answers `429` once the token's account (the `repository_owner_id` claim) has made 120 `/token` and `/state` requests in a minute, counted together per Cloudflare location by the `ACCOUNT_RATE_LIMIT` binding. Then it looks up the App's installation on the repository and answers `404` when there is none. A lookup, found or not, is reused for a minute, so repeated calls for one repository cost no GitHub request. A failed lookup is not reused and answers `500`
-5. Only the run a PR coordinator dispatched gets a token. The OIDC token must carry `event_name`, `workflow_ref`, `ref` and `run_id`. `event_name` must be `workflow_dispatch`, and `workflow_ref` must name a workflow file of the same repository on the run's branch `ref`. The service reads the run with an `actions: read` token (logged as `run_check`) and requires a `workflow_dispatch` run started by `manki-review[bot]` whose title names the PR. That PR's coordinator must hold the run as dispatching or running, from the workflow file it dispatched, on the default branch. A dispatch answered without its run id is matched by the delivery id in the run title, and the coordinator takes the run id. Anything else gets `403` and a `token_refused` log line with the reason, so no other workflow of an allowed repository, such as a branch workflow or a `pull_request` workflow, gets a review or memory token.
-6. It creates a GitHub App JWT and requests an installation token for the requesting repository only (`repository_ids` from the OIDC `repository_id` claim). The token holds only the permissions Manki uses (see `src/permissions.ts`), each at no more than the installation grants. `actions` never goes above `read`. `contents` never goes above `read`, so the run cannot push. GitHub requires `contents: write` to resolve a review thread, so the run resolves threads through `/resolve`. `checks` is capped at `write`, so a review in webhook mode can show a `Manki` check on the PR. An App or installation that grants only `checks: read` gets `read`. Like every other permission, both cover only the requesting repository.
-7. The installation token, its expiry and the permissions GitHub reports for it are returned to the workflow. For a review whose waiting check the run takes over, the reply also names that check as `check_run: { id, head_sha }` (see [Waiting check](#waiting-check))
+`https://manki-api.dustinface.me`
 
-### Audit log
+[What it does](#what-it-does) · [Architecture](#architecture) · [Life of a review](#life-of-a-review) · [Endpoints](#endpoints) · [Security model](#security-model) · [Operations](#operations) · [Development](#development)
 
-Every minted token logs one JSON line with `msg: token_minted`, never the token itself:
+</div>
 
-| Field | Value |
-|---|---|
-| `purpose` | `review` for `/token`, `run_check` for the run check of `/token` and `/resolve`, `resolve` for `/resolve`, `memory` for the memory endpoints, `coordinator`, `reconciler` or `writer_check` for the Worker's own calls |
-| `repository_id`, `repository` | The repository the token is for. For a `memory` token, the requesting workflow's repository, while the token covers the central memory repository and never leaves the Worker |
-| `installation_id` | The App installation the token comes from |
-| `permissions` | The permissions GitHub reports for the token |
-| `run_id`, `check_run_id` | The requesting workflow's OIDC claims, where present. `/token` mints only |
+---
 
-Filter Workers Logs on `msg = token_minted` to see who got which token.
+## What it does
 
-## Webhook
+| | Responsibility | In one sentence | Reference |
+|---|---|---|---|
+| 1 | **Review scheduling** | Verifies the App's webhooks, queues work per pull request, merges repeated pushes into one review and starts the Manki workflow with `workflow_dispatch`. | [coordinator](docs/coordinator.md) |
+| 2 | **Decisions without a run** | Answers `@manki help`, checks write access, and applies skip rules, drafts, pauses, base conflicts and one review per head commit, all without spending a runner. | [coordinator](docs/coordinator.md#decisions-without-a-run) |
+| 3 | **Waiting check** | Puts a queued `Manki` check on the commit the moment a review is dispatched, and makes sure every check it created ends. | [waiting check](docs/waiting-check.md) |
+| 4 | **Settings boxes** | Applies the ticks in Manki's progress comment: Pause, Review again, Deeper review, Cancel and Review this draft. | [settings boxes](docs/settings-boxes.md) |
+| 5 | **Tokens** | Gives the run a coordinator dispatched a GitHub App token for its own repository only, with the fewest permissions and no push. | [tokens](docs/tokens.md) |
+| 6 | **PR state** | Keeps what is queued and running, the last reviewed commit, the last approval and the pause of each PR, so Manki never parses its own comments. | [PR state](docs/state.md) |
+| 7 | **Thread resolution** | Resolves and reopens Manki's review threads for the run, which GitHub only allows with `contents: write`. | [thread resolution](docs/resolve.md) |
+| 8 | **Review memory** | Reads and writes each public repository's learnings in the central `review-memory` repository. No memory token leaves the Worker. | [memory](docs/memory.md) |
+| 9 | **Reconciler** | Every 5 minutes, redelivers failed webhooks and catches up pull requests whose head never got a review. | [reconciler](docs/reconciler.md) |
+| 10 | **Log watch** | Every hour, scans the Worker's logs for warning signs and keeps one GitHub issue open while they last. | [operations](docs/operations.md#log-watch) |
 
-`POST /webhook` receives the GitHub App's webhook deliveries for Manki's webhook mode. It checks the `X-Hub-Signature-256` HMAC against `WEBHOOK_SECRET`, checks that `X-GitHub-Hook-Installation-Target-ID` is `APP_ID`, and works out where the delivery would go: ignored, the PR's state lane (reviews, a bot's push, thread replies, `check`, `dismiss`, review state checks from reviews and from resolved or reopened threads) its chat lane (explain, questions, remember, forget) or its help lane (`help` on a PR). Work and closes go to the PR's `PrCoordinator` Durable Object before the `202` leaves.
+## Architecture
 
-`PrCoordinator` (one per PR or issue, named `<repository id>:<number>`, SQLite storage) refuses a delivery whose id or body SHA-256 it has seen in the last 7 days (only the id for a thread event, whose body can repeat), queues work per lane, collapses queued pushes into one review of the newest head, a review command into a trusted review command still queued, and the edits of one comment into one item, and drops queued work when the PR closes. Its alarm takes the oldest item of each free lane, except that a queued thread reply goes before a review and before a review state check in the state lane. The review then sees each thread as the reply leaves it, and the check reads the PR when it runs, so it loses nothing while a person waits for the reply. Once replies have gone ahead of a review or a check for 5 minutes, it goes first again. A review that was dispatched before and still holds its [waiting check](#waiting-check) lets no reply go first. Time the review spent waiting behind a run does not count. The alarm then checks that the repository opted in (a dispatch workflow on the default branch and no event-driven Manki workflow next to it, cached for 5 minutes. A workflow file over 64 KB or truncated by GitHub is never parsed and counts as event-driven), and then starts a run of the dispatch workflow on the default branch with `workflow_dispatch`. The dispatch workflow is found by its content: a file in `.github/workflows` that runs only on `workflow_dispatch` and declares all the inputs below. That input set marks it, so it need not name Manki, as manki's own file does not (it runs `uses: ./`). Naming Manki (`uses: manki-review/manki`, the `manki-review[bot]` job `if`, or a local reusable workflow that does) still decides which other files count as event-driven Manki workflows. Name it `manki.yml`. When several files qualify, `manki.yml` goes first, then the first by name. Only that file is dispatched, and `coordinator_opt_in_warning` names the others. The owner, name and default branch come from `GET /repositories/<id>`, read with the opt-in and cached with it, never from the delivery's payload. The inputs follow Manki's dispatch adapter: `event`, `action`, `pr`, `head_sha` (pushes, merges and the approval check of a PR marked ready), `comment_id` or `review_id`, and `delivery_id`. The workflow's `run-name` must be `Manki ${{ inputs.event }}.${{ inputs.action }} on #${{ inputs.pr }} (${{ inputs.delivery_id }})`: the Worker reads the PR from it to route `workflow_run`, and matches the delivery id to find a run whose dispatch response was lost. The token for that call is minted for the one repository with `actions: write` and nothing else, apart from `/token`, which stays capped. A lane stays busy until the `workflow_run` webhook reports the run's end. A poll every 2 minutes is the safety net: it ends items whose run completed or was deleted, and cancels runs still queued after 30 minutes or running after 40. An item whose run never started is queued again once. A run not seen ending 75 minutes after its dispatch is cancelled, and its lane stays busy until the cancel succeeds or the run is seen completed. When it cancels a review's run that started, for running past 40 minutes or at that deadline, the Worker ends the run's progress comment and in-progress `Manki` check itself as for a Cancel tick, since the run's post step can no longer mint a token. They say "Review stopped:" and why, such as "it ran longer than 40 minutes". A token mint that fails with a 5xx, a 429, a rate limit or a network error is retried with the same backoff as a failed start. A failed start is retried after 2, 4, 8 and then every 16 minutes. An item with no dispatch attempt waits for it in the queue, so a newer push merges into it instead of queueing behind it. Only a 403 that is no rate limit (by its headers or its message), a 404 or a 422 counts as a refusal. Failed dispatches retry after 15 seconds, 1 minute and 5 minutes, and a retry first looks for a run the earlier attempt started. A comment or review counts as trusted when its author's `author_association` is `OWNER`, `MEMBER`, `COLLABORATOR` or `CONTRIBUTOR`, or its sender opened the PR, as Manki's own check decides it. An outsider's review never replaces the trigger of a trusted review state check, and a review whose sender is not known as a writer never replaces a writer's. A writer's review or thread change takes over a trigger not known as a writer's, so the check never runs under the name of a sender the lookup would refuse. An untrusted review request queues on its own and never merges with a push review. A Manki command whose sender wrote it and has write access gets the eyes reaction in the alarm right after it is queued, so the commenter sees it before the run starts. So does a writer's reply without a command in one of Manki's review threads, also while a review of the PR runs. The payload does not say whose thread it is, so the alarm reads the comment the reply answers, one `GET` per such reply, and reacts only when Manki wrote that comment, it carries a Manki marker (`<!-- manki`) and it is the first of its thread. One alarm spends at most 18 GitHub calls on reactions, a command's costing one and a reply's two, so a burst of replies leaves the dispatch its share of the Free plan's 50 subrequests. The comments past that get their reaction in the next alarm, which is set at once. The lanes get what the waiting reactions leave of the 50, and every call they make is counted, with token mints and the opt-in read. They go one after another, state, chat, help and settings, and a lane polls its run, ends a waiting check or starts its next item only while the costliest path of that step still fits: 32 calls, or 11 for an item that only dispatches a run, answers help or ends a bot's push. A step that does not fit waits for the next alarm, which is set at once and begins with the lane that waited, so no work is dropped and none fails on the limit. Lanes that start a run in the same alarm share one minted `actions: write` token. The reaction's token holds only `issues: write` and `pull_requests: write` for a PR or issue comment, or `pull_requests: write` alone for a review comment, on the one repository. Only an opted-in repository with dispatch on gets the reaction, and a failed reaction is logged and leaves the queue alone. Each lane allows 30 dispatches per hour for trusted work and 5 for untrusted work, counted apart. A trusted review or merge over the cap waits until the hour allows it. Any other work over the cap is dropped. Installation tokens are cached in memory per permission set until 5 minutes before they expire. The coordinator deletes its storage a week after the PR closed, or 90 days after the last delivery of a PR it never saw close, and never while an item is queued, dispatching or running. A reopen, or work queued after the close such as a comment, counts the PR as open again. A reopen records its time, also for a PR without state, and a close whose `closed_at` is older is a late redelivery and changes nothing, even once its delivery id is forgotten. A run's end after the close does not.
+```mermaid
+flowchart LR
+    EV(["GitHub<br/>App webhooks"])
 
-Before a review from a push starts, the coordinator reads `skip_labels`, `skip_authors` and `skip_branches` from `.manki.yml` on the PR's base branch, so a PR cannot skip itself. A PR that matches one gets no run: the Worker completes a `Manki` check on its head as `skipped` and posts no comment. The rules match as in Manki. Labels and authors match in any case, and branches as globs on the head branch. An author rule also needs the push's sender to be a listed author, since a writer can push to a bot's PR. When the PR's head is no longer the queued push's, or for a catch-up, the pusher is unknown and no author rule matches. Label and branch rules never match a fork's head. A missing file, one over 64 KB, one that does not parse, or rules that are not lists of non-empty strings skip nothing. A review request by comment ignores the rules. The Worker only reads `.manki.yml`, so a workflow with another `config_path` gets its skips from the Action, after a run starts. A skipped head counts as handled, so neither the cron nor a redelivered push reviews it again. The check needs `checks: write` on the installation. Without it the PR is still skipped, without the check. Before any review starts, push or request, the coordinator also reads the PR's mergeability. When GitHub says it conflicts with its base (`mergeable: false` or `mergeable_state: dirty`), no run starts. The Worker posts one note, "This PR conflicts with `<base>`. Rebase it, and Manki reviews it then.", marked `<!-- manki-conflict-note -->`. A later skip edits that note instead of adding another, and Manki deletes it once a review posts. The Worker also completes a `Manki` check on the head as `action_required` with the title "Rebase needed". The item ends `skipped` with conclusion `conflict`, which `coordinator_finished` logs, and the cron leaves that head alone. While GitHub has not computed mergeability (`mergeable: null`), the review waits 5 and then 15 seconds and reads the PR again, then starts as before. A retry after a dispatch attempt skips none of this. The note's token holds `issues: write` and `pull_requests: write`, since GitHub needs `pull_requests: write` to comment on a pull request. The check needs `checks: write`. A note that fails to post is logged as `coordinator_conflict_note_failed`, and the item still ends skipped. A GitHub failure while creating the check is retried after the usual backoff, and the retry checks the conflict again, since no dispatch was tried.
+    subgraph CF["Cloudflare Worker: manki-api.dustinface.me"]
+        direction TB
+        ROUTER["Router<br/>signature, account, routing"]
+        LIM["InstallationLimiter<br/>one per installation"]
+        REC["Reconciler<br/>cron every 5 minutes"]
+        COORD["PrCoordinator<br/>one per PR, SQLite"]
+        API["Run API<br/>/token /state /resolve /memory"]
+        ROUTER --> LIM
+        ROUTER --> COORD
+        REC --> COORD
+        COORD <--> API
+    end
 
-Drafts get no automatic review. A push to a draft, or a draft opened, is still queued, and before its review starts the coordinator drops it unless `.manki.yml` on the base branch sets `drafts: review`. Any other value, or no file, skips drafts, as in Manki. Marking the PR ready for review starts a normal review when its head has no review yet, and otherwise queues the approval check described below. Converting it back to a draft stops automatic reviews again. Comments, replies and the Review this draft box still run on a draft. The cron never catches up a draft, even with `drafts: review`.
+    RUN["Manki run<br/>GitHub Actions"]
+    PR(["Pull request<br/>review, threads, Manki check"])
+    MEM[("review-memory<br/>repository")]
 
-A commit has one `Manki` status, however many pull requests have it as their head. So Manki reviews one pull request per head commit: of the repository's open pull requests whose head is that commit, on a branch of the repository itself, only the one with the lowest number. Take one branch opened into `main` as #10 and into `release` as #11. #10 is reviewed. #11 gets no run and no `Manki` check of its own, so the check it shows is the one of #10. Without the rule both would be reviewed, and whichever finished first would show its result on both while the other was still reviewing. Before any review starts (a push, an opened or ready pull request, a review command, a review box or a catch-up), the coordinator lists the pull requests of the head with `GET /repos/{owner}/{repo}/commits/{sha}/pulls`, on the first dispatch attempt and after a draft is dropped. GitHub also lists a pull request that only contains the commit, such as one stacked on the branch, and that one does not count. Every held request tells the pull request. Manki's settings comments get the status line "not reviewed, #10 has the same head commit", and the box that asked is unticked each time: on the newest settings comment and on the one the box was ticked on. Without a settings comment the Worker posts one note per head, marked `<!-- manki-conflict-note -->`, which names #10 and says how to get a review. A review command gets that note each time, as a new comment below the command, and the older note is deleted. A report that fails is logged as `coordinator_yielded_report_failed`, and the review is still held. The item ends `skipped` with no conclusion, so the head does not count as handled and each later request checks the rule again. The rule only ever holds a review back. When the list call fails, when its reply is not a list of pull requests, when it returns a full page of 100 that may be cut off, or when it does not name the pull request itself, the review runs as without the rule and `coordinator_head_pulls_unsure` logs why. Nothing starts the held review on its own when the lower pull request closes or moves to another commit: a review command, a review box or a push to the held pull request does. The lower pull request holds the other one while it is open, also as a draft, paused, skipped or in conflict. Thread replies, other commands and review state checks are not held. A pull request from a fork is neither held nor counted, since only a head on a branch of the repository counts.
+    EV -- "POST /webhook" --> ROUTER
+    COORD -- "workflow_dispatch" --> RUN
+    RUN <-- "OIDC token,<br/>scoped token" --> API
+    API --> MEM
+    RUN --> PR
+```
 
-Manki does not review a bot's push. A `pull_request` delivery whose sender is a bot, for a PR opened, pushed to or marked ready, starts no run. The coordinator records its head as handled, so the cron leaves it alone, and queues the push in the state lane, where it waits behind a run like any other work. There it reads the skip rules as for a person's push, with the bot as the sender an author rule needs. When the PR matches a rule, the Worker completes the `Manki` check on the pushed commit as `skipped`. So `skip_authors: ["dependabot[bot]"]` lets a required `Manki` check pass on that bot's own PRs, while a person's push to one of them is still reviewed. GitHub reads the `Manki` check created last on a commit, so the skipped check is added only where it cannot hide another: the pushed commit is still the head of the open PR, no pull request with a lower number is reviewed for the same head, and the commit holds no `Manki` check of the App. A list of those checks that fails is retried with the start backoff. A draft gets no check either, unless the base config sets `drafts: review`. A bot's push that matches no rule gets no review and no check. On a repository that requires the `Manki` check, such a PR waits until someone asks for a review by comment or a skip rule covers it.
+The coordinator also writes to the pull request itself where no run is needed: the waiting check, skip and conflict notes, reactions and `@manki help` answers. The reconciler talks to GitHub too, to redeliver failed webhooks and find pull requests that missed a review.
 
-A PR marked ready (`pull_request.ready_for_review`) queues a review like a push, unless its head already has one. The review of a draft holds its approval, so once a review run of the head ended in success, the coordinator queues an approval check instead of dropping the event: a `review_state` item that is dispatched as event `pull_request` with action `approval_check` and the head in `head_sha`. Manki answers that action with its approval check on that head and starts no review for it, and a Manki version that does not know the action ignores the run. A review counts by the head its push was queued for or by the commit its run was started for, so a review asked for by a settings box or a command counts too. While a review of the head is queued or running, the check is queued behind it. It starts only after that review has ended, since the lane starts its oldest queued item, only a thread reply goes ahead of an older item, and nothing starts while an item is under way. The check is a review state check like the one of a resolved thread: no pause, skip rule or draft setting stops it, it reads no config and it gets no waiting check. It joins a queued check only when that one runs after the review, and no other head's change joins it, since Manki runs it only while its head is the PR's. A head that a skip rule, a Cancel tick or a conflict handled has no review, so marking the PR ready there starts nothing. A late `opened` or push delivery of a reviewed head is still dropped, so no head is reviewed twice.
+Three [Durable Objects](https://developers.cloudflare.com/durable-objects/) hold all state:
 
-Some decisions need no model, so the coordinator makes them without a run:
-
-- **Help.** `@manki help` on a PR, in a comment or a review comment, is answered by the coordinator itself with Manki's command table and a thumbs-up on the command. It has its own lane, so it never waits behind a run. Its token holds only `issues: write` and `pull_requests: write` on the one repository. A reply that fails to post is retried with the start backoff.
-- **Write access.** Manki only acts on a comment or submitted review whose sender has write access. The webhook handler settles it before the work is queued, for a comment or review its sender wrote. An `OWNER` has it. Anyone else is looked up with `GET /repos/{owner}/{repo}/collaborators/{login}/permission`, with a `writer_check` token holding `metadata: read`, since a read-only member shows as `MEMBER`, a read-only outside collaborator as `COLLABORATOR`, and a member with private membership as `NONE`, `CONTRIBUTOR` or even `FIRST_TIME_CONTRIBUTOR`. Only `admin` or `write` counts, and a writer counts as trusted too. The answer is reused for 5 minutes per installation, repository and login. A failed lookup counts as no write access and is not reused. A comment or review item still not known as a writer, or an edit of someone else's comment, has its sender looked up again before it starts. Without `admin` or `write` it ends skipped and starts no run. Such an item can neither take over a queued push review nor take on its head, so a refused comment never costs the push its review.
-- **Pause.** While the PR's reported `pause` is set, a review from a push, a ready for review or a catch-up ends skipped. The draft and skip rules above go first, so a draft is still dropped and a PR that matches a skip rule still gets its skipped check. Like them, a pause skips only before the first dispatch attempt, since a later try may find that attempt's run. Everything a person asks for still runs: a settings box review, a review request, thread replies, other commands and review state checks, so resolving the last thread can still lead to an approval. The skipped head gets one `Manki` check, completed as `action_required` with the title "Automatic review paused" and a link to the PR. Its summary gives the reported reason or names the Pause box, and says what reviews the commit: Review again, or unticking Pause when only the box pauses. The Worker also sets the status line of Manki's newest settings comment, among the PR's newest 100 comments, to "automatic review paused, `<sha>` waits". It lists those comments without their bodies, since anyone can fill one, and reads only the bodies of Manki's 5 newest. A settings comment whose review is still in progress belongs to its run and is left alone. The check needs `checks: write` and the comment edit `issues: write` and `pull_requests: write`. A failure in either is logged as `coordinator_paused_report_failed` and the review is still skipped. A check that failed to post is posted by the next skip of that head, such as a catch-up.
-
-### Waiting check
-
-A PR shows nothing of a review until its run reaches a runner, since the run belongs to the default branch. So the coordinator creates the `Manki` check itself, as `queued` with the title "Waiting for a runner", right before it dispatches a review. It does so once the review is certain to start: the PR is open, no draft, lower pull request of the same head, skip rule, pause or conflict holds it, and the head is read. A head that already has a `Manki` check of the App gets none, and so does an installation without `checks: write`. A failure to create the check is logged and the review starts without it. A review that waits behind another run of the PR shows no check until its own dispatch.
-
-A check that nothing takes over would sit on the commit beside the review's own, so the coordinator creates one only when all of the following is certain. In doubt the review starts without a waiting check:
-
-- `WAITING_CHECK_ENABLED` in `wrangler.toml` is `"true"`. With anything else no waiting check is created, and the open ones still end as described below.
-- The repository's last Manki run said it takes a waiting check over. The coordinator stores what each `/token` request says in the reconciler's opt-in registry (`reconciler_check_ability`), and reads it together with the opt-in, so it is at most 5 minutes old. A repository new to the registry, one recorded before the registry held the answer and a registry call that fails all count as no. A run that takes checks over is believed only once the registry stored it. So the first review after a repository moves to such a Manki gets no waiting check, and the next one does. Only a `/token` request and an opt-out change the answer. A run that ends without asking leaves it as it is: one that finds the head moved, one cancelled while it waited for a runner, one that fails before Manki starts.
-- For a review nobody asked for (a push, a ready for review or a catch-up), the base branch's `.manki.yml` leaves `auto_review` on: there is no file, no `auto_review` key, or `auto_review: true`. With it off the run reviews nothing. Any other value and a file that does not parse count as off. A review someone asked for gets its check whatever `auto_review` says.
-
-A repository that moves from the Manki App to a custom App (`github_app_id`) keeps its stored yes, because the runs of a custom App never ask `/token`. Each review there gets a waiting check that no run takes over, and it ends as "Review did not run" when the run ends. That check is created before the run's own, and a required check reads the one created last (see below, tested with two checks of one App, not with checks of two Apps). A required check tied to the Manki App cannot pass for a custom App run with or without it. Opting out and in again clears the answer:
-
-1. Remove the dispatch workflow from the default branch.
-2. Push to a pull request whose last event is more than 5 minutes old. Its coordinator reads the workflows again, finds none, and the registry forgets the repository (`reconciler_opted_out`).
-3. Put the workflow back. The repository is recorded anew without an answer, which counts as no. A coordinator keeps what it read for 5 minutes, so an event on that pull request within that time still counts as opted out.
-
-The run takes the check over. Manki's `/token` request carries `takes_over_check: true`, and the reply names the check and its commit. The Action sets it in progress when it reviews that commit, and completes it with the verdict.
-
-A required check reads the `Manki` check that was created last on a commit, whatever completes last. That was tested against GitHub with two checks of one App on one head. So the verdict that counts must sit in the check created last. While a waiting check is open on a head, no other `Manki` check is created there. Where that cannot be prevented, the verdict goes into a check created after the waiting one:
-
-- A head that already has a `Manki` check of the App gets no waiting check, so a waiting check is never created after a verdict.
-- No other item of the state lane starts while a review holds a waiting check. That covers a review that went back to the queue and kept its check, after a run no runner picked up or a dispatch that failed: no thread reply goes ahead of it, since the reply's approval would create a newer check. When a review ends, its waiting check is ended before the next item of the lane starts. The lane waits while GitHub fails the call, and the alarm tries again every 2 minutes.
-- A run gets its waiting check only while that is still the only `Manki` check of the App on its head, which the coordinator lists when the run asks for its token. Another check can appear there without this PR's coordinator, such as the check of a second PR with the same head commit. Then, and when the list fails, the waiting check is completed as `cancelled` ("Review run started") before the token leaves, and the run reports in a check of its own, which is created last. A check the run already set in progress stays with it.
-- A run whose `/token` request lacks `takes_over_check` is an older Manki, which reports in a check of its own. Its waiting check is cancelled the same way before the token leaves. While GitHub fails that call, `/token` answers `500`, so the run holds no token to create a check with. The registry then holds that the repository's runs take no check over, so its later reviews get none. Another PR's coordinator may create one more until it reads the registry again, at most 5 minutes later, and that check is cancelled the same way.
-- A skip, pause or conflict report on the head of a review that is dispatched again completes the waiting check while that is the head's only `Manki` check. Otherwise the report is a new check, and the waiting one ends as `cancelled` when the review ends. The same holds for a check whose create reply was lost (see below).
-
-This makes a verdict in a waiting check count exactly when a check the run creates at its start would. One gap is left to the Action: a `Manki` check created on the head in the seconds between the `/token` reply and the run's take-over.
-
-Only the Worker cleans up. Naming the check in a `/token` reply hands nothing over: the check stays the Worker's to end until its run has completed it, however often the run asks for a token. A check its run completed is left alone. Any other is completed with one of these, never as `success`, `neutral` or `skipped`, so a required `Manki` check keeps blocking:
-
-| Why the review did not complete the check | Conclusion | Title |
+| Durable Object | One per | Holds |
 |---|---|---|
-| The PR's head left the check's commit | `cancelled` | Superseded by a newer commit |
-| The dispatch was refused or failed for good, or no run turned up | `failure` | Review could not start |
-| The Worker cancelled the run: no runner picked it up, twice, or it ran past its timeout | `timed_out` | Review timed out |
-| The PR closed, or the review was cancelled or dropped, before its run started | `cancelled` | Review not started |
-| The run ended without reviewing the commit | `cancelled`, or `failure` when the run failed | Review did not run |
-| The run took the check over and ended without completing it | `cancelled`, or `failure` when the run failed | Review stopped |
+| `PrCoordinator` | Pull request or issue (`<repository id>:<number>`) | Seen deliveries, the work queue of each lane, active runs, PR state and settings |
+| `InstallationLimiter` | App installation | The hourly count of stored deliveries from people without write access |
+| `Reconciler` | Whole Worker (singleton) | The opt-in registry and the webhook redelivery scan position |
 
-The coordinator stores the check's `external_id`, the delivery id of the review, before it asks GitHub to create the check. A create GitHub refuses (`403`, `404`, `422`) made nothing and is forgotten. After any other failure GitHub may hold a check whose reply was lost. The review then gets no other waiting check, and the Worker looks for the lost one among the App's `Manki` checks of the commit by its `external_id`: when the run asks for its token, on each alarm pass after that, and when the review ends. A check found this way (`coordinator_waiting_check_found`) is ended like any other and never handed to a run, so the run reports in a check of its own. One that GitHub does not list by the end of the review is forgotten.
+## Life of a review
 
-A check GitHub refuses to show or change (`403`, `404`, `422`) is forgotten and logged as `coordinator_waiting_check_refused`. A check nothing ended would turn `stale` at GitHub after 14 days.
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Dev as Developer
+    participant GH as GitHub
+    participant W as Worker
+    participant C as PrCoordinator
+    participant R as Manki run
 
-### Settings boxes
-
-Manki's progress comment carries the settings boxes, and the Worker applies their ticks. The Action renders the boxes that apply, and the Worker keys on each line's hidden id only, never on its label:
-
-```
-- [ ] Pause automatic reviews <!-- manki-box:pause -->
-- [ ] Review again <!-- manki-box:again -->
-- [ ] Deeper review <!-- manki-box:deeper -->
-- [ ] Cancel this review <!-- manki-box:cancel -->
-- [ ] Review this draft <!-- manki-box:draft -->
-<!-- manki-settings -->
-```
-
-An `issue_comment.edited` delivery on a comment by one of Manki's logins that holds `<!-- manki-settings -->` goes to the settings lane. Only boxes whose tick differs between `changes.body.from` and the new body count, and Manki's own edits are dropped as a bot's. The editor's write access is looked up as for any comment, and reused for 5 minutes per login. Someone without it gets the changed boxes put back and changes nothing. A writer's change applies at once:
-
-- **Pause** sets `settings.paused` until a writer unticks it. While it is set, automatic reviews end skipped as for the reported `pause`. Unticking it while no reported `pause` holds queues one review of the push the pause skipped, as if it had just arrived, unless a review ran, failed, was cancelled or waits since that skip, or a skip rule or a conflict handled a later push. Any other later review that started no run, or one still waiting for its sender's write access to be looked up, does not count. A Pause change from an edit older than the last one applied, by the comment's `updated_at`, is ignored, so a late redelivery cannot undo a newer one.
-- **Review again**, **Deeper review** and **Review this draft** each ask for one review with that mode. The mode joins a review a writer already queued. A queued push review becomes the box's review, so a pause, a skip rule or a draft cannot drop it. Otherwise a review of the edited comment is queued. The run reads its modes from `/state`, never from the dispatch inputs, and the box clears when the Action renders the comment again. While a review runs, **Deeper review** cancels it and asks for the deeper review on the current commit. **Review again** leaves a running review of the PR's current head alone, unticks itself and sets the status line to "already reviewing `<sha>`". When the head moved since that review started, it cancels it and asks for a review of the new head. A review cancelled this way shows in its progress comment and check as replaced, such as "Review replaced by a deeper review requested by @alice." Once the run is dispatched, the Worker sets the status line of that settings comment to "<box labels> requested by @<login>, starting…", naming the boxes by their labels in the comment, so the tick shows a reaction before the run's setup ends. It edits only a comment of Manki's with a settings block, and a failure is logged and leaves the run alone.
-- **Cancel** cancels the running review with the coordinator's `actions: write` token. A cancel GitHub fails is tried again. Its item ends `skipped` with conclusion `cancelled`, and the cron does not review that head again. The run's post step can no longer mint a token, so the Worker ends what the run showed. It rewrites the progress comment to "Review cancelled by @<login>." with the old progress folded away, keeps the settings block with the status "review cancelled" and no Cancel box, and marks it `<!-- manki-review-cancelled -->` as Manki does. That comment is the ticked one while its review has not ended, or else Manki's newest such comment among the PR's newest 100 comments. The Worker lists those without their bodies and reads only the bodies of Manki's 5 newest, since anyone can fill a comment. Either one must have been posted since the run started, since an older comment still in progress belongs to a run that died. It also completes each in-progress `Manki` check the App created on the review's head as `cancelled`. A failure in either is logged and leaves the cancel standing. With no review running, it changes nothing.
-- Unticking any box but Pause changes nothing.
-
-Only repositories owned by an account whose numeric id is in `WEBHOOK_ACCOUNTS` (comma-separated, in `wrangler.toml`) reach a coordinator. That is the account the App is installed on, a user or an organization. Any repository of a listed account works once it opts in as described above. A delivery for any other account is logged and answered `202` without touching Durable Object storage, so another installation cannot use up the account's daily storage write quota. Look up an account's id with `gh api users/<login> --jq .id`. Each installation may also store at most 500 comment, review and thread deliveries from people without write access an hour (per clock hour, `INSTALLATION_EVENTS_PER_HOUR` to change it). The `InstallationLimiter` Durable Object, one per installation, counts them. One over the cap is logged and answered `202` without touching a coordinator. Only stored work counts: a delivery the router ignores never reaches the limiter, and the limiter counts a delivery only after its coordinator stored it, so a refused replay writes nothing. `pull_request` deliveries are exempt, because a push to a branch of the repository takes write access and the router already drops fork pushes. A comment or review by a writer, as the lookup above settles it, is exempt too, and so is a settings edit (an edit of Manki's comment), a dismissed review and a resolved or reopened thread, which take write access as well. So outsiders can only use up their own share. Run ends are exempt, since dropping one would leave a lane busy. A run end only comes from a run the App started and writes nothing unless it ends a running item. A close that is no merge and finds no queued work writes at most its close time and delivery id, once until the next reopen. A fork's reopen is dropped, so an outsider closing and reopening a PR in a loop costs no storage. Only a stored delivery writes the count, one row each, so a flood above the cap adds no storage writes. `workflow_run` deliveries are dropped unless `manki-review[bot]` sent them, and a body over 25 MiB is refused with `413` while it is read, with or without `Content-Length`.
-
-## PR state
-
-The coordinator keeps each PR's running state, so Manki reads it there instead of from its comments. Both endpoints take the workflow's OIDC token as the bearer token and a JSON body `{ owner, repo, pr }`, checked as for `/token`, rate limit and installation lookup included, so a repository without the App reaches no coordinator. The coordinator is named from the token's `repository_id` claim, so a workflow only reaches the PRs of its own repository.
-
-- `POST /state` returns `{ active, queue, last_reviewed, last_approval, pause, settings }`:
-  - `active`: the items dispatching or running, with `lane`, `run_id`, `kind`, `event`, `head_sha`, `dispatched_at` and `modes`. A run finds its own item by `run_id`.
-  - `queue`: the queued items, with `lane`, `kind`, `event`, `head_sha`, `enqueued_at` and `modes`.
-  - `modes`: what the settings boxes asked of a review, any of `again`, `deeper` and `draft`. Empty for any other item.
-  - `last_reviewed`: `{ commit, run_id, at }`, the last commit a run reported as reviewed.
-  - `last_approval`: `{ commit, held, run_id, at }`. `held` marks an approval Manki held because the PR conflicts with its base, which resets the round count like any approval.
-  - `pause`: `{ reason, at }` while the automatic pause the Action decided is on, such as the round cap.
-  - `settings`: `{ paused }`, whether a writer ticked Pause. Its presence tells the Action that the Worker handles the settings boxes.
-  - It writes nothing, and a PR the coordinator never saw returns an empty state.
-- `POST /state/report` stores what the PR's active run found. The body adds any of `reviewed: { commit }`, `approval: { commit, held }` and `pause: { reason }` or `pause: null`. Only the run in the token's `run_id` claim may report, and only while the coordinator tracks it as dispatching or running. Any other run gets `403`. A report that changes nothing writes nothing. Each report logs one `state_report` line with the PR, the run id, the fields and the result. It returns `{ changed }`, the fields that changed.
-
-## Thread resolution
-
-`POST /resolve` resolves or reopens one of Manki's review threads for the run a coordinator dispatched. GitHub only lets a token with `contents: write` resolve a thread, so the Worker does it with a token it mints for this call alone (`contents: write` and `pull_requests: write` on the one repository, audited as `resolve`), and the run needs no `contents: write` of its own. It takes the workflow's OIDC token as the bearer token, checked as for `/token`, rate limit, installation lookup and the dispatched run included. The body is `{ owner, repo, thread_id, resolved }`, plus `reason` (`ADDRESSED`, `INVALID` or `WONT_FIX`) only with `resolved: true`. The PR is the one the run's title names, so the body names none.
-
-The thread must be on that PR of the token's repository, and its first comment must be by one of Manki's logins (`manki-review[bot]` or `github-actions[bot]`). It answers:
-
-- `200 { resolved }`, the thread's state after the change. Each change logs one `thread_resolved` line with the repository, run id, PR, thread id and `resolved`.
-- `400` for a malformed body, `401` without a bearer token, `403` for a token or workflow that is not the dispatched run (with the reason, logged as `resolve_refused`) or an installation that grants no `contents: write`, `404` for a thread that is not Manki's on the run's PR (logged as `resolve_refused`) or a repository without the App, `429` over the account's rate limit, and `500` with a `request_id` for any GitHub failure.
-
-## Memory
-
-Review memory lives in one central repository, `MEMORY_REPO` in `wrangler.toml` (`manki-review/review-memory`). The Worker reads and writes it for each repository's dispatched Manki run. No memory token leaves the Worker: it mints its own `contents: write` token for that repository alone, from the installation it finds with `GET /repos/<memory repo>/installation`, logged as `memory`.
-
-**Folders.** A repository's memory is the folder `<owner>/<repo>/`, from the OIDC `repository` claim in lower case, never from the body. A login never holds `_`, so no repository's folder can be inside `_global/`. A renamed repository keeps its memory only once its folder is moved.
-
-**Identity.** Every endpoint takes the run's OIDC token as the bearer token and a JSON body with `owner`, `repo` and `pr`, the PR or issue number of the run. The token must be for that repository, from `workflow_dispatch`, from a workflow file of the repository on a branch, as for `/token`. The coordinator of `pr` must hold the token's `run_id` as dispatching or running, from that workflow file, on the default branch. Otherwise the answer is `403` with `Only the run Manki dispatched may use memory: <reason>` and a `memory_refused` log line, before the Worker touches the memory repository.
-
-**Public repositories only.** Central memory is shared, so a private repository never uses it. A token whose `repository_visibility` claim is not `public`, such as `private`, `internal` or a missing claim, gets `403` with `Only a public repository may use memory: repository visibility is <visibility>` and a `memory_refused` log line. This check comes before the dispatched-run check.
-
-**`POST /memory/read`** with `{ owner, repo, pr }` returns `200`:
-
-```json
-{
-  "repo": { "learnings.yml": { "text": "...", "sha": "<blob sha>" }, "suppressions.yml": null, "patterns.yml": null },
-  "global": { "learnings.yml": null, "conventions.md": { "text": "...", "sha": "<blob sha>" } }
-}
+    Dev->>GH: push to a pull request
+    GH->>W: POST /webhook (pull_request.synchronize)
+    W->>W: verify signature, check account, route
+    W->>C: queue a review in the state lane
+    W-->>GH: 202
+    Note over C: alarm: dedup, skip rules, draft,<br/>pause, conflict, one PR per head
+    C->>GH: create Manki check "Waiting for a runner"
+    C->>GH: workflow_dispatch manki.yml
+    GH->>R: start the run
+    R->>W: POST /token (OIDC)
+    W->>C: is this the dispatched run?
+    W-->>R: scoped token and the waiting check
+    R->>W: POST /state
+    R->>GH: post the review, complete the check
+    R->>W: POST /resolve, /memory/*, /state/report
+    GH->>W: POST /webhook (workflow_run.completed)
+    W->>C: end the run, start the next item
 ```
 
-Each file is its raw text with its blob sha, or `null` when it does not exist. `repo` holds the files of the repository's folder and `global` those of `_global/`. Nothing else is read, so `metrics/fix-rate.jsonl` is never returned.
+## Endpoints
 
-**`POST /memory/write`** with `{ owner, repo, pr, file, content, sha, message }` replaces one file of the repository's own folder.
+Every endpoint except `/webhook` takes the run's [GitHub OIDC token](https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect) as the bearer token and answers only the run a coordinator dispatched.
 
-- `file`: `learnings.yml`, `suppressions.yml` or `patterns.yml`. Anything else, such as a path or a file of `_global/`, gets `400`. No run writes `_global/`.
-- `content`: the whole new text, at most 512 KB, or `413`.
-- `sha`: the blob sha the run read the file at, or `null` for a file that does not exist yet. Anything else gets `400`.
-- `message`: the commit message, at most 200 characters after control characters become spaces. The Worker adds ` (<owner>/<repo> run <run id>)`. An empty one gets `400`.
-- Returns `200` with `{ sha }`, the file's new blob sha. When the file changed since the run read it, or the run sent `null` for a file that exists, it returns `409` with `{ "error": "the file changed since it was read" }`: read again, apply the edit to the new text, and write again.
+| Endpoint | Called by | Does | Reference |
+|---|---|---|---|
+| `POST /webhook` | GitHub App | Receives deliveries, checked by HMAC signature | [coordinator](docs/coordinator.md#receiving-deliveries) |
+| `POST /token` | Manki run | Mints a scoped installation token | [tokens](docs/tokens.md) |
+| `POST /state` | Manki run | Reads the PR's queue, active runs, last review, approval, pause and settings | [PR state](docs/state.md) |
+| `POST /state/report` | The PR's active run | Records the reviewed commit, an approval or a pause | [PR state](docs/state.md) |
+| `POST /resolve` | Manki run | Resolves or reopens one of Manki's threads | [thread resolution](docs/resolve.md) |
+| `POST /memory/read` | Run of a public repository | Reads the repository's and the global memory files | [memory](docs/memory.md) |
+| `POST /memory/write` | Run of a public repository | Replaces one memory file, guarded by its blob sha | [memory](docs/memory.md) |
+| `POST /memory/append` | Run of a public repository | Appends lines to the fix-rate metrics | [memory](docs/memory.md) |
 
-**`POST /memory/append`** with `{ owner, repo, pr, file, lines, message }` appends lines to a file of the repository's own folder, creating it when missing.
+## Security model
 
-- `file`: `metrics/fix-rate.jsonl`. Anything else gets `400`.
-- `lines`: 1 to 10 strings, each one JSON object of at most 16 KB with no line break. The Worker writes each on its own line. Anything else gets `400`.
-- `message`: as for a write.
-- The Worker reads the file and writes it back itself, trying 3 times when another run appended meanwhile. Returns `200` with `{ sha }`, `409` when all 3 tries met a conflict, and `413` when the file would grow over 1,000,000 bytes, with a `memory_append_full` log line. Each append reads and writes the whole file, which has to fit the Free plan's CPU time, so a full file is moved aside by hand.
+The Worker holds the App's private key, so the runs never do. What a run can reach:
 
-Every endpoint answers `400` for a body without a positive integer `pr`, `413` for a body over 1 MiB (also without `Content-Length`, and for `/token` and `/state` too), `429` when the account is over its share of requests (`ACCOUNT_RATE_LIMIT`, shared with `/token` and `/state`), `404` when the App is not installed on the requesting repository, `503` when no memory repository is configured or the App is not installed on it, and `502` with `{ error, request_id }` when GitHub fails, including a write GitHub refuses for another reason than the sha. The details go to a `request_failed` log line under that request id. Redacting secrets is the caller's job: the Worker stores what it gets. Each write and append logs `memory_write` or `memory_append` with the repository, PR, run id and file.
+- **Only the dispatched run gets anything.** A workflow of an allowed repository that the coordinator did not start, such as a `pull_request` or branch workflow, gets `403`.
+- **Only its own repository.** Every token covers the one repository in the OIDC `repository_id` claim, and every coordinator is named from that claim, never from the request body.
+- **No push.** `contents` is capped at `read` and `actions` at `read`. The writes that need more, such as resolving a thread or writing memory, happen inside the Worker with a token minted for that call alone.
+- **Outsiders pay only their own share.** Webhooks are accepted only for listed accounts, deliveries are deduplicated for 7 days, and comments from people without write access are capped per installation.
+- **Every token is audited.** Each mint logs one `token_minted` line with its purpose, repository and permissions, never the token. See [audit log](docs/tokens.md#audit-log).
 
-## Reconciler
+## Operations
 
-A cron trigger every 5 minutes runs one pass of the `Reconciler` Durable Object, a singleton.
-
-- **Opt-in registry.** Each time a coordinator reads the workflows it reports the result, with the owning account's id from `GET /repositories/<id>`. The first sighting of a dispatch workflow records the repository's opt-in time, and opting out removes it. Redelivery and catch-up only touch repositories whose account is in `WEBHOOK_ACCOUNTS`. A repository recorded before the account id was stored gets it from `GET /repositories/<id>` at the start of the next pass, once.
-- **Redelivery.** It lists the App's webhook deliveries, newest first, down to the newest delivery the last finished scan reached. A scan that hits the limit of 10 pages goes on from the same page in the next pass, so failures behind a burst of `workflow_run` deliveries are still found. Each failed delivery is redelivered at most twice, those not retried yet first. Only deliveries whose first attempt is under 6 hours old, the same limit as for stale comments, for a repository that had opted in by then, are sent again. So failures from before the Worker was ready stay failed.
-- **Catch-up.** For each opted-in repository it lists open PRs updated in the last day.
-  - A same-repository, non-draft PR goes to its coordinator as a review when its head has no Manki review, no review run in the coordinator that ended in success and no match of a skip rule. Only a review by `manki-review[bot]` that is not dismissed and whose body carries a Manki marker (`<!-- manki`) but not Manki's own `<!-- manki-no-verdict -->` counts, as Manki decides it. That marker is Manki's own on a line of its own below the review's round record (`<!-- manki-context`), or on any line of its own in a body without a record. Anywhere else it is quoted text, such as a diff line that holds it. Manki's thread replies are reviews of the head too, with an empty body. A review that was otherwise skipped, dropped, failed, cancelled or deleted does not count, so its head is caught up again, at most once a day.
-  - PRs opened by a bot are skipped, as Manki does not review them. A bot's push to a person's PR reaches the coordinator, which records the head as handled. If that delivery was lost, the catch-up cannot tell it from a person's push and reviews the head.
-- Each pass makes at most 40 calls, counting GitHub and coordinator calls together, within the Free plan's 50 subrequests. The next pass resumes with the next repository.
-
-With `DISPATCH_ENABLED` (in `wrangler.toml`) set to anything but `"true"`, the coordinators only log what they would dispatch. `WAITING_CHECK_ENABLED` switches the [waiting check](#waiting-check) the same way.
-
-### App events
-
-The GitHub App subscribes to these events. They all arrive at `/webhook`:
-
-| Event | Used for |
-|---|---|
-| Pull request | Reviews on open, push and ready for review. A close clears the queue, and a merge records the fix rate |
-| Pull request review | The review state check (auto-approve) |
-| Pull request review comment | Thread replies and thread commands |
-| Pull request review thread | The review state check when a thread is resolved or reopened. GitHub Actions has no trigger for this one |
-| Issue comment | Review requests, settings box edits, commands and questions |
-| Workflow run | The end of a dispatched run. Every other run is ignored |
-
-### Cost on the Workers Free plan
-
-The Free plan includes [100,000 Worker requests a day](https://developers.cloudflare.com/workers/platform/pricing/) and [100,000 Durable Object requests a day](https://developers.cloudflare.com/durable-objects/platform/pricing/), counting each RPC call and each alarm, plus 100,000 SQLite rows written. Past a limit, calls fail until 00:00 UTC.
-
-- Every delivery is one Worker request, including `workflow_run` for every CI run in every installed repository, which is ignored after the signature check.
-- A routed delivery adds one coordinator call and usually one or two alarms. A comment, review or thread delivery also adds a limiter call before it and, once stored, one after it. One over the installation cap adds only the first call.
-- A dispatched run adds an alarm for each poll, every 2 minutes or less often after errors.
-- The cron adds 288 requests a day, plus one call for each PR it checks.
-
-Watch the daily request counts in the dashboard as more repositories opt in.
-
-## Configuration
-
-The following secrets must be set in the Cloudflare Worker environment:
-
-| Secret | Description |
-|---|---|
-| `APP_ID` | GitHub App ID for the manki-review app. `/webhook` checks deliveries against it |
-| `APP_CLIENT_ID` | Optional. The App's client ID (`Iv…`, on the App's settings page). When set, it is the `iss` of the App JWT, as [GitHub recommends](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app). Otherwise `APP_ID` is |
-| `APP_PRIVATE_KEY` | PEM private key for the GitHub App |
-| `WEBHOOK_SECRET` | The App's webhook secret. `/webhook` answers `500` until it is set |
-| `WEBHOOK_SECRET_PREVIOUS` | Optional. The secret before a rotation, accepted as well until it is deleted |
-
-```sh
-wrangler secret put APP_ID
-wrangler secret put APP_CLIENT_ID  # optional
-wrangler secret put APP_PRIVATE_KEY
-wrangler secret put WEBHOOK_SECRET
-```
-
-The client ID is not secret, so `APP_CLIENT_ID` can also go into `[vars]` in `wrangler.toml` instead of a secret.
-
-To rotate the webhook secret, put the current one into `WEBHOOK_SECRET_PREVIOUS`, then the new one into `WEBHOOK_SECRET` and the App's settings, and delete `WEBHOOK_SECRET_PREVIOUS` once deliveries verify under the new one.
-
-## Deployment
-
-`.github/workflows/deploy.yml` deploys the Worker with [`cloudflare/wrangler-action`](https://github.com/cloudflare/wrangler-action) on a manual run (`workflow_dispatch`) and on a push to `main` that changes what goes into the Worker: `src/`, `wrangler.toml`, `package.json`, `package-lock.json`, `tsconfig.json` or the workflow itself. A push that changes only other files, such as the README, `.manki.yml` or the tests, deploys nothing. It runs the same tests as CI first. The deploy job runs in the `production` environment, so it waits for the owner's approval, and only that job can read the Cloudflare API token.
-
-GitHub never holds the App key or the webhook secret. The Worker secrets above stay set by hand with `wrangler secret put`, and a deploy keeps them.
-
-The `production` environment is set up in the repository settings:
-
-- Required reviewers: the owner, with Prevent self-review off, since the owner approves their own merges.
-- Deployment branches and tags: only `main`.
-- Environment secret `CLOUDFLARE_API_TOKEN`: a Cloudflare API token with only these permissions:
-  - Account, Workers Scripts, Edit, with Account Resources set to the account that runs the Worker.
-  - Zone, Workers Routes, Edit, with Zone Resources set to the specific zone `dustinface.me`.
-  - Zone, Zone, Read, on the same zone. Wrangler looks up the zone of the route in `wrangler.toml` by its name.
-- Environment variable `CLOUDFLARE_ACCOUNT_ID`: the account ID from the account's overview page in the dashboard. Wrangler needs it to deploy from CI.
-
-To rotate the token, create a new one with the same permissions (My Profile, API Tokens, Create Token, Create Custom Token), replace the secret in `production`, and delete the old token in the dashboard. For a manual deploy from a laptop, use `wrangler login` rather than a token in the shell environment.
-
-## Log watch
-
-`.github/workflows/log-watch.yml` runs `scripts/log-watch/main.ts` every hour. It reads Workers Logs back to 15 minutes before the start of its last successful run, at least 75 minutes and at most 6 hours, so a late or dropped run leaves no gap. A log query reply without a list of events fails the run rather than reading as a clean window. It looks for these warning signs:
-
-- `coordinator_start_error`.
-- Failed writes of a note, comment or check: the conflict note, the note or status line of a pull request held for another of the same head, the starting status, a cancelled review's report, the waiting check and the eyes reaction. A waiting check GitHub forbids the Worker to end (`coordinator_waiting_check_refused` with `403`) counts too, since it stays queued on its commit.
-- Runs the safety poll cancelled (`timed_out`) or queued again.
-- Any line with a 5xx status or an error naming one.
-- Work queued over 20 minutes ago that no dispatch, end or close of its PR has followed, looked for over the last 6 hours. That includes a review a settings box queued. Work waiting while its lane on the PR has a run going is not stuck, and work in a lane no routed `webhook` line names waits while any lane of its PR runs. A review held by the hourly cap counts from when the cap releases it.
-
-It keeps one issue titled "Worker logs show warning signs", marked `<!-- log-watch -->`. A window with warning signs opens the issue, or replaces the body of the open one with that window's lines and Workers Logs request ids, at most 10 lines and 50 ids per sign. The issue is public, so only a line naming a repository that GitHub shows as public to the job's token names its repository, PR, work and error. Any other line shows only its time, its message and its request id. That covers a private repository, one whose visibility could not be read, and a line naming no repository, whose error can still quote one. A clean window comments on the open issue and closes it. The next warning sign opens a new one.
-
-It reads the logs with the repository secret `CF_LOGS_READ_TOKEN`, a Cloudflare API token with only Account, Workers Observability, Read on the account that runs the Worker. Its job holds `actions: read`, to find its last successful run, `contents: read` and `issues: write`. It changes nothing in the Worker, so it needs no deploy.
+| Topic | In short | Reference |
+|---|---|---|
+| Configuration | Secrets `APP_ID`, `APP_PRIVATE_KEY`, `WEBHOOK_SECRET` (plus optional ones), switches in `wrangler.toml` | [configuration](docs/operations.md#configuration) |
+| Deployment | A merge to `main` that changes the Worker deploys from GitHub Actions after the owner approves | [deployment](docs/operations.md#deployment) |
+| Log watch | Hourly scan of Workers Logs that opens one issue for warning signs | [log watch](docs/operations.md#log-watch) |
+| Cost | Runs on the Workers Free plan, with the request budget explained | [cost](docs/operations.md#cost-on-the-workers-free-plan) |
 
 ## Development
 
@@ -278,3 +151,19 @@ npm run typecheck  # type-check the Worker and the tests
 npm test           # run the tests
 npm run deploy     # deploy by hand, outside the workflow
 ```
+
+<details>
+<summary>Source layout</summary>
+
+| Path | Holds |
+|---|---|
+| `src/index.ts` | Entry point and routing of requests and the cron |
+| `src/webhook.ts`, `src/signature.ts`, `src/routing.ts` | Webhook verification and routing to lanes |
+| `src/coordinator.ts`, `src/dispatch.ts`, `src/opt-in.ts` | `PrCoordinator`: queues, dispatch, opt-in |
+| `src/limiter.ts` | `InstallationLimiter` |
+| `src/reconciler.ts` | `Reconciler`: redelivery and catch-up |
+| `src/oidc.ts`, `src/run-check.ts`, `src/app-jwt.ts`, `src/github.ts`, `src/permissions.ts` | OIDC checks, the dispatched-run check and token minting |
+| `src/state.ts`, `src/resolve.ts`, `src/memory.ts` | `/state`, `/resolve` and `/memory` |
+| `scripts/log-watch/` | The hourly log watch |
+
+</details>
