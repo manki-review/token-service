@@ -1407,7 +1407,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const { body, user } = await read.json() as IssueCommentRead;
     if (!MANKI_LOGINS.includes(user?.login ?? '')) return;
     const labels = boxLabels(body ?? '', modesOf(item));
-    const starting = withSettingsStatus(body ?? '', `${labels.join(' and ') || 'Review'} requested by @${item.sender}, starting…`, [], item.run_head ?? undefined);
+    const starting = withSettingsStatus(body ?? '', `${labels.join(' and ') || 'Review'} requested by \`@${item.sender}\`, starting…`, [], item.run_head ?? undefined);
     if (starting === body) return;
     const response = await this.api(token, path, { method: 'PATCH', body: { body: starting } });
     if (!response.ok) throw new Error(`showing the review as starting failed with ${response.status}`);
@@ -1583,7 +1583,7 @@ export class PrCoordinator extends DurableObject<Env> {
     }
     const ended = this.row(running.id);
     if (ended?.status === 'skipped' && ended.conclusion === 'cancelled') {
-      const headline = replacement ? `Review replaced by ${replacement} requested by @${item.sender}.` : `Review cancelled by @${item.sender}.`;
+      const headline = replacement ? `Review replaced by ${replacement} requested by \`@${item.sender}\`.` : `Review cancelled by \`@${item.sender}\`.`;
       await this.reportStopped(running, target, item.object_id, 'Review cancelled', headline);
     }
     return `${replacement ? 'replacing' : 'cancel of'} work ${running.id} requested`;

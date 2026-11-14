@@ -2687,12 +2687,12 @@ describe('PrCoordinator dispatch', () => {
     const progress = (ticked: string[] = [], status = 'review running', head = SHA_1) => ['**Review in progress**', '', '**Planner**', '<!-- manki-bot -->', '', '---',
       `Last reviewed \`1111111\` · head \`${head.slice(0, 7)}\` · ${status}`, ...boxLines(ticked), '<!-- manki-settings -->', '<!-- manki-answered:7 -->'].join('\n');
     /** `progress` once `login` cancelled the review: the progress folded away and the block kept without its Cancel box. */
-    const cancelled = (login: string) => [`**Review cancelled by @${login}.**`, '', '<details><summary>Original progress</summary>', '',
+    const cancelled = (login: string) => [`**Review cancelled by \`@${login}\`.**`, '', '<details><summary>Original progress</summary>', '',
       '**Review in progress**', '', '**Planner**', '<!-- manki-bot -->', '', '</details>', '', '<!-- manki-review-cancelled -->', '', '---',
       'Last reviewed `1111111` · head `1111111` · review cancelled', ...boxLines([], ['pause', 'deeper', 'draft']),
       '<!-- manki-settings -->', '<!-- manki-answered:7 -->'].join('\n');
     const cancelledCheck = (id: number, login: string) => ({
-      id, body: { status: 'completed', conclusion: 'cancelled', output: { title: 'Review cancelled', summary: `Review cancelled by @${login}.` } },
+      id, body: { status: 'completed', conclusion: 'cancelled', output: { title: 'Review cancelled', summary: `Review cancelled by \`@${login}\`.` } },
     });
     const setup = () => {
       const pr = pullRequest();
@@ -2996,7 +2996,7 @@ describe('PrCoordinator dispatch', () => {
        */
       const replaced = (headline: string, ticked: string, head: string) => [`**${headline}**`, '', '<details><summary>Original progress</summary>', '',
         '**Review in progress**', '<!-- manki-bot -->', '', '</details>', '', '<!-- manki-review-cancelled -->', '', '---',
-        `Last reviewed \`1111111\` · head \`${head.slice(0, 7)}\` · ${ticked} requested by @alice, starting…`,
+        `Last reviewed \`1111111\` · head \`${head.slice(0, 7)}\` · ${ticked} requested by \`@alice\`, starting…`,
         ...(['pause', 'again', 'deeper'] as const).map((box) => `- [${box === ticked ? 'x' : ' '}] ${box} <!-- manki-box:${box} -->`),
         '<!-- manki-settings -->'].join('\n');
       const reviewing = running('review running');
@@ -3022,7 +3022,7 @@ describe('PrCoordinator dispatch', () => {
       github.openChecks = [{ id: 70, head_sha: SHA_1 }];
       await edit([], ['again'], 'alice', new Date().toISOString(), reviewing);
       expect(github.cancels).toEqual([9000]);
-      const newCommits = 'Review replaced by a review of the new commits requested by @alice.';
+      const newCommits = 'Review replaced by a review of the new commits requested by `@alice`.';
       // The status line names the head the new review starts on.
       expect(github.issueComments.get(SETTINGS)).toBe(replaced(newCommits, 'again', SHA_2));
       expect(github.checkEdits).toEqual([{ id: 70, body: { status: 'completed', conclusion: 'cancelled', output: { title: 'Review cancelled', summary: newCommits } } }]);
@@ -3034,7 +3034,7 @@ describe('PrCoordinator dispatch', () => {
       github.openChecks = [{ id: 71, head_sha: SHA_2 }];
       await edit([], ['deeper'], 'alice', new Date().toISOString(), reviewing);
       expect(github.cancels).toEqual([9000, 9001]);
-      const deeper = 'Review replaced by a deeper review requested by @alice.';
+      const deeper = 'Review replaced by a deeper review requested by `@alice`.';
       expect(github.issueComments.get(SETTINGS)).toBe(replaced(deeper, 'deeper', SHA_3));
       expect(github.checkEdits.at(-1)).toEqual({ id: 71, body: { status: 'completed', conclusion: 'cancelled', output: { title: 'Review cancelled', summary: deeper } } });
       expect(await state()).toMatchObject({ active: [{ kind: 'review', run_id: 9002, modes: ['deeper'] }] });
@@ -3049,7 +3049,7 @@ describe('PrCoordinator dispatch', () => {
       github.head = SHA_2;
       await edit([], ['deeper', 'draft'], 'alice', new Date().toISOString(), progress);
       expect(github.dispatches).toHaveLength(1);
-      expect(github.issueComments.get(SETTINGS)).toBe(progress(['deeper', 'draft'], 'Deeper review and Review this draft requested by @alice, starting…', SHA_2));
+      expect(github.issueComments.get(SETTINGS)).toBe(progress(['deeper', 'draft'], 'Deeper review and Review this draft requested by `@alice`, starting…', SHA_2));
       // Without a head, the status line keeps the one it names.
       expect(withSettingsStatus(progress([], 'review running', SHA_2), 'up to date', [])).toBe(progress([], 'up to date', SHA_2));
       github.head = SHA_1;
@@ -3062,7 +3062,7 @@ describe('PrCoordinator dispatch', () => {
       advanceClock(DISPATCH_BACKOFF_MS[0]);
       await runDurableObjectAlarm(pr.stub);
       expect(github.dispatches).toHaveLength(3);
-      expect(github.issueComments.get(SETTINGS)).toBe(progress(['deeper'], 'Deeper review requested by @alice, starting…'));
+      expect(github.issueComments.get(SETTINGS)).toBe(progress(['deeper'], 'Deeper review requested by `@alice`, starting…'));
       await pr.stub.runCompleted(key('d-retry'), 9001, 'success');
 
       // Someone else's comment, or a status edit GitHub fails, changes nothing, and the review still runs.
