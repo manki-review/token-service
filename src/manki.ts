@@ -173,7 +173,7 @@ export function isRunningProgress(body: string): boolean {
 }
 
 /**
- * Returns the progress comment `body` marked as cancelled with `headline`, such as "Review cancelled by @alice.", as
+ * Returns the progress comment `body` marked as cancelled with `headline`, such as "Review cancelled by `@alice`.", as
  * Manki's `markProgressCommentCancelled` writes it: the original progress folded away, and the settings block kept with
  * the status "review cancelled" and no Cancel box.
  */
