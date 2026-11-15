@@ -67,7 +67,7 @@ function fakeGitHub() {
     pages: [[]] as Delivery[][],
     redelivered: [] as number[],
     pulls: new Map<string, Pull[]>(),
-    /** Reviews as GraphQL returns them, keyed `<repo>#<number>`. */
+    /** Reviews as GraphQL returns them, keyed `<repo>#<number>`. `oid` is the commit GitHub reports for the review. */
     reviews: new Map<string, Array<{ author: string; oid: string; body?: string; state?: string }>>(),
     pullsStatus: new Map<string, number>(),
     graphqlCalls: 0,
@@ -150,9 +150,10 @@ function fakeGitHub() {
       const { query, variables } = await request.json() as { query: string; variables: { name: string; number: number; author: string } };
       if (query.includes('reviews')) {
         state.graphqlCalls++;
-        // GraphQL filters by the REST login, `<slug>[bot]` for a bot. A review given no body gets Manki's review body.
+        // GraphQL filters by the REST login, `<slug>[bot]` for a bot. A review given no body gets Manki's review body,
+        // which names its `oid`.
         const reviews = (state.reviews.get(`${variables.name}#${variables.number}`) ?? []).filter((review) => `${review.author}[bot]` === variables.author);
-        const nodes = reviews.map((review) => ({ commit: { oid: review.oid }, state: review.state ?? 'CHANGES_REQUESTED', body: review.body ?? 'Changes requested.\n<!-- manki-bot -->' }));
+        const nodes = reviews.map((review) => ({ commit: { oid: review.oid }, state: review.state ?? 'CHANGES_REQUESTED', body: review.body ?? `Changes requested.\n\n${reviewedLine(review.oid)}\n\n<!-- manki-bot -->` }));
         return Response.json({ data: { repository: { pullRequest: { reviews: { nodes } } } } });
       }
       return Response.json(workflowsReply({ 'manki-dispatch.yml': DISPATCH_WORKFLOW_YAML }).body);
@@ -579,6 +580,11 @@ function pull(number: number, sha: string, options: { draft?: boolean; fork?: bo
 
 const RECORD = '<!-- manki-context: {"meta":{}} -->';
 // A finding that shows a diff line holding the marker and a record, in a code fence.
+/** The footer line in which a Manki round review names `sha` as the commit it reviewed. */
+function reviewedLine(sha: string): string {
+  return `- Reviewed [\`${sha.slice(0, 7)}\`](https://github.com/${OWNER}/manki/commit/${sha})`;
+}
+
 const QUOTED_NO_VERDICT = ['```', '<!-- manki-context: {} -->', '<!-- manki-no-verdict -->', '```'].join('\n');
 
 describe('Reconciler catch-up', () => {
@@ -647,19 +653,24 @@ describe('Reconciler catch-up', () => {
     const github = fakeGitHub();
     github.pulls.set(target.repo, [pull(1, SHA_1, { repo: target.repo }), pull(2, SHA_2, { repo: target.repo })]);
     github.reviews.set(`${target.repo}#1`, [{ author: 'manki-review', oid: SHA_1 }]);
-    // Manki approves a rebased head on its unchanged verdict with a review of its own markers.
+    // Manki approves a rebased head on its unchanged verdict with a review that names the head in its head marker.
     github.reviews.set(`${target.repo}#2`, [
       { author: 'alice', oid: SHA_1 },
-      { author: 'manki-review', oid: SHA_2, body: 'Approved.\n<!-- manki -->\n<!-- manki-auto-approve -->' },
+      { author: 'manki-review', oid: SHA_2, body: `Approved.\n\n<!-- manki-bot -->\n<!-- manki-auto-approve-head: ${SHA_2} -->` },
     ]);
     // A review quotes the no-verdict marker above its round record, as when the reviewed diff holds it.
     github.pulls.get(target.repo)!.push(pull(3, SHA_1, { repo: target.repo }), pull(4, SHA_1, { repo: target.repo }));
-    github.reviews.set(`${target.repo}#3`, [{ author: 'manki-review', oid: SHA_1, body: `Changes requested.\n${QUOTED_NO_VERDICT}\n<!-- manki-bot -->\n${RECORD}` }]);
-    github.reviews.set(`${target.repo}#4`, [{ author: 'manki-review', oid: SHA_1, body: `The diff ends its text with <!-- manki-no-verdict -->\n<!-- manki-bot -->` }]);
+    github.reviews.set(`${target.repo}#3`, [{ author: 'manki-review', oid: SHA_1, body: `Changes requested.\n${QUOTED_NO_VERDICT}\n${RECORD}\n\n${reviewedLine(SHA_1)}\n\n<!-- manki-bot -->` }]);
+    github.reviews.set(`${target.repo}#4`, [{ author: 'manki-review', oid: SHA_1, body: `The diff ends its text with <!-- manki-no-verdict -->\n\n${reviewedLine(SHA_1)}\n\n<!-- manki-bot -->` }]);
+    // A review names the head in its own lines and an older commit in a line it quotes, and GitHub reports it on the older commit.
+    github.pulls.get(target.repo)!.push(pull(5, SHA_1, { repo: target.repo }), pull(6, SHA_1, { repo: target.repo }));
+    github.reviews.set(`${target.repo}#5`, [{ author: 'manki-review', oid: SHA_2, body: `Changes requested.\n${reviewedLine(SHA_2)}\n${RECORD}\n\n${reviewedLine(SHA_1)}\n\n<!-- manki-bot -->` }]);
+    // An approval after its threads were resolved names the head in its approval record.
+    github.reviews.set(`${target.repo}#6`, [{ author: 'manki-review', oid: SHA_1, body: `Approved.\n\n<!-- manki -->\n<!-- manki-approval-record: {"decision":"approved","head":"${SHA_1}"} -->` }]);
     await stub.reconcile();
     expect(logged(log, 'reconciler_caught_up')).toEqual([]);
     // No coordinator state is created for a PR that needed nothing.
-    for (const number of [1, 2, 3, 4]) expect(await tableNames(coordinator(target.repositoryId, number))).toEqual([]);
+    for (const number of [1, 2, 3, 4, 5, 6]) expect(await tableNames(coordinator(target.repositoryId, number))).toEqual([]);
   });
 
   it.each([
@@ -668,9 +679,14 @@ describe('Reconciler catch-up', () => {
     ['by another bot', [{ author: 'acme-review', oid: SHA_1 }]],
     ['a thread reply of Manki\'s', [{ author: 'manki-review', oid: SHA_1, body: '' }]],
     ['Manki\'s dismissed review', [{ author: 'manki-review', oid: SHA_1, state: 'DISMISSED' }]],
-    ['Manki\'s review without a verdict', [{ author: 'manki-review', oid: SHA_1, body: 'Review incomplete.\n<!-- manki-bot -->\n<!-- manki-no-verdict -->' }]],
-    ['Manki\'s review without a verdict below its record', [{ author: 'manki-review', oid: SHA_1, body: `Review incomplete.\n<!-- manki-bot -->\n${RECORD}\n\n<!-- manki-no-verdict -->\r` }]],
-    ['Manki\'s review without a verdict that also quotes a record', [{ author: 'manki-review', oid: SHA_1, body: `${QUOTED_NO_VERDICT}\n${RECORD}\n\n<!-- manki-no-verdict -->\n\n<!-- manki-held-for-person -->` }]],
+    ['Manki\'s review without a verdict', [{ author: 'manki-review', oid: SHA_1, body: `Review incomplete.\n\n${reviewedLine(SHA_1)}\n\n<!-- manki-bot -->\n<!-- manki-no-verdict -->` }]],
+    ['Manki\'s review without a verdict below its record', [{ author: 'manki-review', oid: SHA_1, body: `Review incomplete.\n<!-- manki-bot -->\n${RECORD}\n\n${reviewedLine(SHA_1)}\n\n<!-- manki-no-verdict -->\r` }]],
+    ['Manki\'s review without a verdict that also quotes a record', [{ author: 'manki-review', oid: SHA_1, body: `${QUOTED_NO_VERDICT}\n${RECORD}\n\n${reviewedLine(SHA_1)}\n\n<!-- manki-no-verdict -->\n\n<!-- manki-held-for-person -->` }]],
+    ['Manki\'s review of an older commit that GitHub reports on the head', [{ author: 'manki-review', oid: SHA_1, body: `Approved.\n\n${reviewedLine(SHA_2)}\n\n<!-- manki-bot -->` }]],
+    ['Manki\'s review whose body names no commit', [{ author: 'manki-review', oid: SHA_1, body: 'Approved.\n\n<!-- manki-bot -->' }]],
+    ['Manki\'s review that names the head only by a short hash', [{ author: 'manki-review', oid: SHA_1, body: `Approved.\n\n<!-- manki-bot -->\n<!-- manki-auto-approve-head: ${SHA_1.slice(0, 7)} -->` }]],
+    ['Manki\'s review that names the head only in a line it quotes', [{ author: 'manki-review', oid: SHA_1, body: `Changes requested.\n${reviewedLine(SHA_1)}\n${RECORD}\n\n${reviewedLine(SHA_2)}\n\n<!-- manki-bot -->` }]],
+    ['Manki\'s review whose approval record does not parse', [{ author: 'manki-review', oid: SHA_1, body: `Approved.\n\n<!-- manki -->\n<!-- manki-approval-record: {"head":"${SHA_1}" -->` }]],
   ])('catches up a head whose only review is %s', async (_case, reviews) => {
     const { stub, repo } = setup();
     const target = repo();
