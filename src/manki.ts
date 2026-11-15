@@ -2,8 +2,8 @@ import { minimatch } from 'minimatch';
 import { parse } from 'yaml';
 
 // Ports of the pure checks Manki runs on an event before it does any work. Each mirrors the function of the same
-// name in manki `src/interaction.ts`, `src/index.ts`, `src/config.ts` or `src/review-record.ts`. A change there must be
-// made here too, or the Worker drops an event the action would have handled.
+// name in manki `src/interaction.ts`, `src/index.ts`, `src/config.ts`, `src/github.ts` or `src/review-record.ts`. A
+// change there must be made here too, or the Worker drops an event the action would have handled.
 
 export const BOT_LOGIN = 'manki-review[bot]';
 
@@ -32,6 +32,45 @@ export function hasOwnMarker(body: string, marker: string): boolean {
   const lines = body.split('\n');
   const record = lines.map((line) => line.startsWith(RECORD_OPENER) && line.includes('-->')).lastIndexOf(true);
   return lines.slice(record + 1).some((line) => line.trimEnd() === marker);
+}
+
+/** The footer line of a Manki review that links the commit it reviewed. */
+const REVIEWED_COMMIT_LINE = /^- Reviewed \[`[0-9a-f]{7}`\]\(\S+\/commit\/([0-9a-f]{40})\)/;
+/** Opens the marker that names the head an approval without a round approves. */
+const HEAD_MARKER_OPENER = '<!-- manki-auto-approve-head: ';
+/** Opens the record of an approval decision. Its `head` is the approved commit. */
+const APPROVAL_RECORD_OPENER = '<!-- manki-approval-record: ';
+
+/** Returns what the hidden marker with `opener` holds when `line` starts with it and closes it. */
+function markerText(line: string, opener: string): string | undefined {
+  if (!line.startsWith(opener) || !line.includes('-->', opener.length)) return undefined;
+  return line.slice(opener.length, line.indexOf('-->', opener.length)).trimEnd();
+}
+
+/** Returns the full commit hash that `line` of a Manki review body names: in the footer, the head marker or the approval record. */
+function commitNamedBy(line: string): string | undefined {
+  const record = markerText(line, APPROVAL_RECORD_OPENER);
+  let named: unknown = line.match(REVIEWED_COMMIT_LINE)?.[1] ?? markerText(line, HEAD_MARKER_OPENER);
+  try {
+    if (record) named = (JSON.parse(record) as { head?: unknown }).head;
+  } catch {
+    // A record that does not parse names no commit.
+  }
+  return typeof named === 'string' && /^[0-9a-f]{40}$/.test(named) ? named : undefined;
+}
+
+/**
+ * Returns the commit a Manki review gave its verdict on, or `undefined` when its `body` names no full commit hash. The
+ * last line that names a commit decides, which Manki writes below all text it quotes. GitHub's commit of a review never
+ * counts, since GitHub moves it to the new head when a push leaves the PR's change as it was.
+ */
+export function reviewedCommit(body: string): string | undefined {
+  const lines = body.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const named = commitNamedBy(lines[i]);
+    if (named) return named;
+  }
+  return undefined;
 }
 
 /** The answer to a help command, as Manki's `handleHelp` posts it. */

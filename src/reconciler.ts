@@ -3,7 +3,7 @@ import { createAppJWT } from './app-jwt';
 import { allowedAccounts, type Env } from './env';
 import { githubApi, githubGraphql, isRateLimited, mintRepositoryToken } from './github';
 import { log } from './log';
-import { BOT_LOGIN, hasOwnMarker, MANKI_COMMENT_MARKER } from './manki';
+import { BOT_LOGIN, hasOwnMarker, MANKI_COMMENT_MARKER, reviewedCommit } from './manki';
 import { STALE_COMMENT_MS, type Target } from './routing';
 
 const MINUTE = 60_000;
@@ -65,12 +65,12 @@ interface PullSummary {
 // The `author` filter takes the REST login `<slug>[bot]` of an App. The plain `<slug>` matches no review.
 const REVIEWS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $author: String!) {
   repository(owner: $owner, name: $name) {
-    pullRequest(number: $number) { reviews(last: 100, author: $author) { nodes { commit { oid } state body } } }
+    pullRequest(number: $number) { reviews(last: 100, author: $author) { nodes { state body } } }
   }
 }`;
 
 interface ReviewsResponse {
-  repository: { pullRequest: { reviews: { nodes: Array<{ commit: { oid: string } | null; state: string; body: string }> } } | null } | null;
+  repository: { pullRequest: { reviews: { nodes: Array<{ state: string; body: string }> } } | null } | null;
 }
 
 /** Marks a Manki review that reached no verdict, which Manki does not count as covering its head. */
@@ -432,9 +432,10 @@ export class Reconciler extends DurableObject<Env> {
       const data = await githubGraphql<ReviewsResponse>(mint.token, REVIEWS_QUERY, {
         owner: repo.owner, name: repo.repo, number: pull.number, author: BOT_LOGIN,
       });
-      // A review counts as Manki's `coveredCommit` counts it. Thread replies are reviews too, with an empty body.
+      // A review counts for the commit its own body names, by the rule of Manki's `reviewedCommit`. GitHub's commit of
+      // a review is not read, as a rebase can move it to a head Manki never reviewed. A thread reply names no commit.
       const reviewed = data.repository?.pullRequest?.reviews.nodes.some((review) =>
-        review.commit?.oid === pull.head.sha && review.state !== 'DISMISSED'
+        reviewedCommit(review.body) === pull.head.sha && review.state !== 'DISMISSED'
         && review.body.includes(MANKI_COMMENT_MARKER) && !hasOwnMarker(review.body, NO_VERDICT_MARKER));
       if (reviewed) {
         this.markChecked(repo, pull);
