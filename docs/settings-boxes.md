@@ -1,6 +1,6 @@
 # Settings boxes
 
-Manki's progress comment carries the settings boxes, and the Worker applies their ticks. The Action renders the boxes that apply, and the Worker keys on each line's hidden id only, never on its label:
+Manki's progress comment carries the settings boxes, and the Worker applies their ticks. The Action renders the boxes that apply, and the Worker keys on each line's hidden id only, never on its label. The one block the Worker writes itself ends the [notice on a PR from a fork](coordinator.md#pull-requests-from-forks), with Review again and Deeper review, as the Action writes it:
 
 ```
 - [ ] Pause automatic reviews <!-- manki-box:pause -->
