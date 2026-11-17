@@ -2077,6 +2077,8 @@ describe('PrCoordinator dispatch', () => {
     await runDurableObjectAlarm(pr.stub);
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches).toHaveLength(1);
+    expect(HELP_REPLY).toContain('\n\n`@manki-review` works as the prefix too. A reply to a Manki review comment gets an answer in its thread.\n\n<!-- manki -->');
+    expect(HELP_REPLY).not.toMatch(/@manki(?![\w-])/);
     expect(github.comments).toEqual([`${HELP_REPLY}\n<!-- manki-answered:1001 -->`, HELP_REPLY]);
     expect(github.thumbsUp).toEqual(['issues/1001', 'pulls/1001']);
     // The eyes reaction on the explain minted the token the replies reuse, which holds nothing else.
