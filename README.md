@@ -28,7 +28,7 @@ and keeps the state of every pull request, so the runs themselves hold almost no
 | | Responsibility | In one sentence | Reference |
 |---|---|---|---|
 | 1 | **Review scheduling** | Verifies the App's webhooks, queues work per pull request, merges repeated pushes into one review and starts the Manki workflow with `workflow_dispatch`. | [coordinator](docs/coordinator.md) |
-| 2 | **Decisions without a run** | Answers `@manki help`, checks write access, and applies skip rules, drafts, pauses, base conflicts and one review per head commit, all without spending a runner. | [coordinator](docs/coordinator.md#decisions-without-a-run) |
+| 2 | **Decisions without a run** | Answers `/manki help`, checks write access, and applies skip rules, drafts, pauses, base conflicts and one review per head commit, all without spending a runner. | [coordinator](docs/coordinator.md#decisions-without-a-run) |
 | 3 | **Waiting check** | Puts a queued `Manki` check on the commit the moment a review is dispatched, and makes sure every check it created ends. | [waiting check](docs/waiting-check.md) |
 | 4 | **Settings boxes** | Applies the ticks in Manki's progress comment: Pause, Review again, Deeper review, Cancel and Review this draft. | [settings boxes](docs/settings-boxes.md) |
 | 5 | **Tokens** | Gives the run a coordinator dispatched a GitHub App token for its own repository only, with the fewest permissions and no push. | [tokens](docs/tokens.md) |
@@ -68,7 +68,7 @@ flowchart LR
     RUN --> PR
 ```
 
-The coordinator also writes to the pull request itself where no run is needed: the waiting check, skip and conflict notes, reactions and `@manki help` answers. The reconciler talks to GitHub too, to redeliver failed webhooks and find pull requests that missed a review.
+The coordinator also writes to the pull request itself where no run is needed: the waiting check, skip and conflict notes, reactions and `/manki help` answers. The reconciler talks to GitHub too, to redeliver failed webhooks and find pull requests that missed a review.
 
 Three [Durable Objects](https://developers.cloudflare.com/durable-objects/) hold all state:
 

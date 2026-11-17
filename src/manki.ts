@@ -85,7 +85,7 @@ export const HELP_REPLY = [
   '| `/manki forget <text>` | Removes a learning or suppression |',
   '| `/manki help` | Shows this message |',
   '',
-  '`@manki` and `@manki-review` work as the prefix too. A reply to a Manki review comment gets an answer in its thread.',
+  '`@manki-review` works as the prefix too. A reply to a Manki review comment gets an answer in its thread.',
   '',
   '<!-- manki -->',
 ].join('\n');
