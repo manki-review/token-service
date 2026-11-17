@@ -239,6 +239,18 @@ export type ReviewMode = Extract<SettingsBox, 'again' | 'deeper' | 'draft'>;
 
 export const REVIEW_MODES: readonly ReviewMode[] = ['again', 'deeper', 'draft'];
 
+/** The boxes of a PR that has no review yet, with the labels Manki's `BOX_LABELS` gives them, in its order. */
+const UNREVIEWED_BOXES: ReadonlyArray<[ReviewMode, string]> = [['again', 'Review again'], ['deeper', 'Deeper review']];
+
+/**
+ * Returns the settings block of a PR that has no review yet, with `status` and both review boxes unticked. Manki reads
+ * the block and writes it again, so it is what `renderSettingsBlock` in manki `src/settings.ts` returns, byte for byte.
+ */
+export function renderSettingsBlock(head: string, status: string): string {
+  const boxes = UNREVIEWED_BOXES.map(([box, label]) => `- [ ] ${label} <!-- manki-box:${box} -->`);
+  return ['---', `Not reviewed yet · head \`${head.slice(0, 7)}\` · ${status}`, ...boxes, SETTINGS_MARKER].join('\n');
+}
+
 /** Returns the head commit the settings block of `body` names, as Manki writes it, or null without a block. */
 export function settingsHead(body: string): string | null {
   return SETTINGS_BLOCK.exec(body)?.[1].match(/head `([0-9a-f]+)`/)?.[1] ?? null;

@@ -5,7 +5,7 @@ import { githubApi, githubGraphql, hasWriteAccess, isRateLimited, isRefusal, typ
 import { log } from './log';
 import {
   autoReviewIsOn, type BaseConfig, BOT_LOGIN, boxLabels, type BoxChange, cancelledProgress, HELP_REPLY, isMankiGraphqlLogin, isRunningProgress, MANKI_COMMENT_MARKER,
-  MANKI_LOGINS, matchSkipRule, parseConfig, REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes, type SettingsBox, settingsHead, skipRulesOf, withSettingsStatus,
+  MANKI_LOGINS, matchSkipRule, parseConfig, renderSettingsBlock, REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes, type SettingsBox, settingsHead, skipRulesOf, withSettingsStatus,
 } from './manki';
 import { type OptIn, readOptIn, type Repository } from './opt-in';
 import type { Permissions } from './permissions';
@@ -81,10 +81,16 @@ const HEAD_PULLS_PAGE = 100;
 export const CONFLICT_NOTE_MARKER = '<!-- manki-conflict-note -->';
 /** Marks the Worker's notice on a PR from a fork, so a PR that holds one gets no second. */
 const FORK_NOTICE_MARKER = '<!-- manki-fork-notice -->';
-/** The notice a PR from a fork gets once. It quotes nothing from the PR, whose text anyone can write. */
-export const FORK_NOTICE = 'This pull request comes from a fork, so Manki does not review it automatically. '
-  + 'Someone with write access to this repository can start a review by commenting `/manki review`, and has to do so again after each push.'
-  + `\n\n${FORK_NOTICE_MARKER}`;
+/**
+ * Returns the notice a PR from a fork gets once. It ends with a settings block as Manki writes one, so a tick of its
+ * boxes is a settings edit like any other. It quotes nothing from the PR, whose text anyone can write, but the id of
+ * its head commit `head`.
+ */
+export function forkNotice(head: string): string {
+  const text = 'This pull request comes from a fork, so Manki does not review it automatically. Someone with write access to this repository '
+    + 'can start a review by ticking a box in the settings block below or by commenting `/manki review`, and has to do so again after each push.';
+  return `${text}\n\n${FORK_NOTICE_MARKER}\n\n${renderSettingsBlock(head, 'no automatic review')}`;
+}
 const FORK_NOTICE_POSTED = 'fork notice already posted';
 const NOT_STARTED = new Set(['queued', 'requested', 'waiting', 'pending']);
 /** A larger `.manki.yml` is not parsed for skip rules, as it costs too much CPU in an alarm. */
@@ -1741,14 +1747,18 @@ export class PrCoordinator extends DurableObject<Env> {
   /**
    * Tells a PR from a fork once that it gets no automatic review, and how someone with write access starts one. The
    * notice is a comment and never a `Manki` check, since a completed check satisfies a branch protection rule that
-   * requires it. The coordinator records the notice, and without a record it looks for the marker among Manki's newest
-   * comments. A failure GitHub may recover from throws, and the retry looks for the marker again before it posts.
+   * requires it. Its boxes start nothing here: a tick arrives as a settings edit, whose editor needs write access. The
+   * coordinator records the notice, and without a record it looks for the marker among Manki's newest comments. A
+   * failure GitHub may recover from throws, and the retry looks for the marker again before it posts.
    */
   private async postForkNotice(item: WorkRow): Promise<void> {
     const end = (status: WorkStatus, note: string) => {
       if (this.isDispatching(item.id)) this.finish(item.id, status, note);
     };
     if (this.getMeta<boolean>('fork_notice')) return end('skipped', FORK_NOTICE_POSTED);
+    const notice = forkNotice(item.head_sha ?? '');
+    // The block names the head the delivery gave. With a head that is no commit id it would not read as a settings block.
+    if (settingsHead(notice) === null) return end('skipped', 'the delivery names no head commit');
     const target = await this.verifiedTarget();
     if (!target) throw new Error('the repository could not be read');
     const token = await this.token({ issues: 'write', pull_requests: 'write' });
@@ -1757,7 +1767,7 @@ export class PrCoordinator extends DurableObject<Env> {
     if (held === null) {
       // A close may have dropped the item during the calls above.
       if (!this.isDispatching(item.id)) return;
-      const response = await this.api(token, `/repos/${target.owner}/${target.repo}/issues/${target.number}/comments`, { method: 'POST', body: { body: FORK_NOTICE } });
+      const response = await this.api(token, `/repos/${target.owner}/${target.repo}/issues/${target.number}/comments`, { method: 'POST', body: { body: notice } });
       if (!response.ok) {
         if (!isRefusal(response, await response.text())) throw new Error(`posting the fork notice failed with ${response.status}`);
         return end('failed', `posting the fork notice was refused with ${response.status}`);
