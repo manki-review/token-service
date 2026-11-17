@@ -29,8 +29,8 @@ export function pullRequestEvent(action: string, pr: Record<string, unknown> = {
   return { ...base(action), sender, pull_request: pullRequest(pr) };
 }
 
-export function forkPullRequestEvent(action: string): WebhookPayload {
-  return pullRequestEvent(action, { head: FORK_HEAD });
+export function forkPullRequestEvent(action: string, pr: Record<string, unknown> = {}): WebhookPayload {
+  return pullRequestEvent(action, { head: FORK_HEAD, ...pr });
 }
 
 export function reviewEvent(action: string, review: Record<string, unknown> = {}, pr: Record<string, unknown> = {}): WebhookPayload {

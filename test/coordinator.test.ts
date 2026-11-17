@@ -7,6 +7,7 @@ import {
   DISPATCHES_PER_HOUR,
   CONFLICT_NOTE_MARKER,
   FINISHED_RETENTION_MS,
+  FORK_NOTICE,
   IDLE_RETENTION_MS,
   OPT_IN_TTL_MS,
   backoff,
@@ -51,6 +52,7 @@ import {
   COMMENT_ID,
   DISPATCH_WORKFLOW_YAML,
   EVENT_WORKFLOW_YAML,
+  forkPullRequestEvent,
   issueCommentEvent,
   MANKI_AUTHOR,
   pullRequestEvent,
@@ -2100,6 +2102,117 @@ describe('PrCoordinator dispatch', () => {
     await runDurableObjectAlarm(pr.stub);
     expect(github.comments).toHaveLength(2);
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'done', note: 'answered help' }]);
+  });
+
+  /** Delivers a `pull_request` event of `pr` to `/webhook`, as one of a PR from a fork unless `payload` is given, and runs its alarm. */
+  const deliver = async (pr: ReturnType<typeof pullRequest>, action: string, fields: Record<string, unknown> = {}, delivery?: string, payload?: WebhookPayload) => {
+    const sent = payload ?? forkPullRequestEvent(action, { number: pr.number, ...fields });
+    expect((await postWebhook({ event: 'pull_request', payload: sent, delivery })).status).toBe(202);
+    await runDurableObjectAlarm(pr.stub);
+  };
+  const notices = async (pr: ReturnType<typeof pullRequest>) =>
+    (await workRows(pr.stub)).filter((row) => row.kind === 'fork_notice').map((row) => [row.lane, row.status, row.note]);
+
+  it('tells a PR from a fork once that it gets no automatic review, in a comment and never a check', async () => {
+    const pr = pullRequest();
+    const github = fakeGitHub(pr.number);
+    const opened = crypto.randomUUID();
+    await deliver(pr, 'opened', {}, opened);
+    expect(FORK_NOTICE).toBe(
+      'This pull request comes from a fork, so Manki does not review it automatically. Someone with write access to this repository can start a review '
+      + 'by commenting `/manki review`, and has to do so again after each push.\n\n<!-- manki-fork-notice -->',
+    );
+    expect(github.comments).toEqual([FORK_NOTICE]);
+    // The Worker reads the opt-in and posts the comment, and nothing else: no check, no status and no run.
+    const comments = `/repos/${OWNER}/${REPO}/issues/${pr.number}/comments`;
+    const mint = `/app/installations/${INSTALLATION_ID}/access_tokens`;
+    expect(vi.mocked(fetch).mock.calls.map(([input, init]) => `${init?.method ?? 'GET'} ${new URL(String(input)).pathname}`)).toEqual([
+      `POST ${mint}`, `GET /repositories/${REPOSITORY_ID}`, 'POST /graphql', `POST ${mint}`, 'POST /graphql', `POST ${comments}`,
+    ]);
+    expect(github.mints).toEqual([
+      { permissions: { contents: 'read', metadata: 'read' }, repository_ids: [REPOSITORY_ID] },
+      { permissions: { issues: 'write', pull_requests: 'write' }, repository_ids: [REPOSITORY_ID] },
+    ]);
+
+    // A redelivery, a second ready for review, a push and a reopen post no second one.
+    await deliver(pr, 'opened', {}, opened);
+    await deliver(pr, 'ready_for_review', { updated_at: '2030-01-02T00:00:00Z' });
+    await deliver(pr, 'synchronize', { head: { sha: SHA_2, repo: { full_name: 'mallory/manki' } } });
+    await deliver(pr, 'reopened');
+    expect(github.comments).toHaveLength(1);
+    expect(await notices(pr)).toEqual([['help', 'done', 'posted the fork notice'], ['help', 'skipped', 'fork notice already posted']]);
+    expect([github.checkRuns, github.waitingChecks, github.dispatches]).toEqual([[], [], []]);
+
+    // A PR whose state is gone holds the notice among its comments, so it is not told again.
+    const forgotten = pullRequest();
+    const told = fakeGitHub(forgotten.number);
+    told.issueComments.set(1, FORK_NOTICE);
+    told.issueComments.set(2, 'Why not a map?');
+    told.commentAuthors.set(2, 'alice');
+    await deliver(forgotten, 'ready_for_review');
+    expect(told.comments).toEqual([]);
+    expect(await notices(forgotten)).toEqual([['help', 'skipped', 'fork notice already posted']]);
+
+    // A failed post is tried again. When GitHub stored the comment and only its reply was lost, the retry finds it.
+    const flaky = pullRequest();
+    const failing = Object.assign(fakeGitHub(flaky.number), { commentStatus: 502 });
+    await deliver(flaky, 'opened');
+    expect(await workRows(flaky.stub)).toMatchObject([{ status: 'queued', errors: 1 }]);
+    failing.commentStatus = 0;
+    advanceClock(backoff(0));
+    await runDurableObjectAlarm(flaky.stub);
+    expect(await workRows(flaky.stub)).toMatchObject([{ status: 'queued', errors: 2 }]);
+    failing.issueComments.set(5005, FORK_NOTICE);
+    advanceClock(backoff(1));
+    await runDurableObjectAlarm(flaky.stub);
+    expect(failing.comments).toHaveLength(2);
+    expect(await notices(flaky)).toEqual([['help', 'skipped', 'fork notice already posted']]);
+  });
+
+  it('posts no fork notice on a draft until it is marked ready, on a bot\'s PR, on a branch of the repository, without the opt-in or when GitHub refuses it', async () => {
+    const draft = pullRequest();
+    let github = fakeGitHub(draft.number);
+    await deliver(draft, 'opened', { draft: true });
+    expect(await tableNames(draft.stub)).toEqual([]);
+    await deliver(draft, 'ready_for_review');
+    expect(github.comments).toEqual([FORK_NOTICE]);
+
+    const bot = pullRequest();
+    github = fakeGitHub(bot.number);
+    await deliver(bot, 'opened', { user: BOT_SENDER });
+    expect(await tableNames(bot.stub)).toEqual([]);
+    expect(github.comments).toEqual([]);
+
+    // A PR on a branch of the repository is reviewed instead.
+    const own = pullRequest();
+    github = fakeGitHub(own.number);
+    await deliver(own, 'opened', {}, undefined, own.push(SHA_1, 'opened'));
+    expect(github.comments).toEqual([]);
+    expect(await workRows(own.stub)).toMatchObject([{ kind: 'review', status: 'running' }]);
+
+    const plain = pullRequest();
+    github = Object.assign(fakeGitHub(plain.number), { workflows: { 'manki.yml': EVENT_WORKFLOW_YAML } });
+    await deliver(plain, 'opened');
+    expect(github.comments).toEqual([]);
+    expect(await notices(plain)).toEqual([['help', 'skipped', 'not opted in: no Manki workflow runs on workflow_dispatch']]);
+
+    const off = pullRequest();
+    github = fakeGitHub(off.number);
+    setDispatchEnabled(false);
+    await deliver(off, 'opened');
+    setDispatchEnabled(true);
+    expect(github.comments).toEqual([]);
+    expect(await notices(off)).toEqual([['help', 'skipped', 'dispatch is not enabled']]);
+
+    // A refusal, as on a locked PR, is not tried again. A later ready for review asks once more.
+    const locked = pullRequest();
+    github = Object.assign(fakeGitHub(locked.number), { commentStatus: 403 });
+    await deliver(locked, 'opened');
+    expect(await notices(locked)).toEqual([['help', 'failed', 'posting the fork notice was refused with 403']]);
+    github.commentStatus = 201;
+    await deliver(locked, 'ready_for_review', { updated_at: '2030-01-02T00:00:00Z' });
+    expect(github.comments).toEqual([FORK_NOTICE, FORK_NOTICE]);
+    expect((await notices(locked)).at(-1)).toEqual(['help', 'done', 'posted the fork notice']);
   });
 
   it('looks up a commenter the payload does not show as a writer, and skips their comment without write access', async () => {
