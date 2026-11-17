@@ -4,7 +4,7 @@ import { verifyWebhookSignature } from '../src/signature';
 import worker from '../src/index';
 import { DEFAULT_EVENTS_PER_HOUR, eventsPerHour, InstallationLimiter } from '../src/limiter';
 import { coordinator, DELIVERY_ID, freezeClock, INSTALLATION_ID, logged, OIDC_AUDIENCE, OWNER, OWNER_ID, postWebhook, REPO, signWebhook, stubGitHub, TEST_ENV, workRows } from './helpers';
-import { HEAD_SHA, issueCommentEvent, MANKI_AUTHOR, PR_NUMBER, pullRequestEvent, REPOSITORY_ID, reviewEvent, reviewThreadEvent, workflowRunEvent } from './payloads';
+import { forkPullRequestEvent, HEAD_SHA, issueCommentEvent, MANKI_AUTHOR, PR_NUMBER, pullRequestEvent, REPOSITORY_ID, reviewEvent, reviewThreadEvent, workflowRunEvent } from './payloads';
 
 const encoder = new TextEncoder();
 
@@ -133,11 +133,12 @@ describe('/webhook', () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const untouched = { getByName: () => { throw new Error('no coordinator may be called'); } };
     const env = { ...TEST_ENV, WEBHOOK_ACCOUNTS: accounts, PR_COORDINATOR: untouched as unknown as typeof TEST_ENV.PR_COORDINATOR };
-    for (const [event, payload] of [['pull_request', pullRequestEvent('synchronize')], ['workflow_run', workflowRunEvent()]] as const) {
+    const deliveries = [['pull_request', pullRequestEvent('synchronize')], ['pull_request', forkPullRequestEvent('opened')], ['workflow_run', workflowRunEvent()]] as const;
+    for (const [event, payload] of deliveries) {
       expect((await postWebhook({ event, payload, env })).status).toBe(202);
     }
     const reason = `account ${OWNER_ID} is not in WEBHOOK_ACCOUNTS`;
-    expect(logged(log)).toMatchObject([{ route: 'ignore', reason }, { route: 'ignore', reason }]);
+    expect(logged(log)).toMatchObject([{ route: 'ignore', reason }, { route: 'ignore', reason }, { route: 'ignore', reason }]);
   });
 
   it('accepts any repository of an account anywhere in WEBHOOK_ACCOUNTS', async () => {
@@ -306,6 +307,11 @@ describe('/webhook', () => {
     expect(logged(log, 'coordinator_receive')).toMatchObject([{ accepted: true }, { accepted: false, reason: 'duplicate delivery' }, { accepted: true }]);
     expect(await workRows(coordinator(REPOSITORY_ID, 62))).toHaveLength(1);
     expect(await workRows(coordinator(REPOSITORY_ID, 63))).toEqual([]);
+    // Anyone can open a PR from a fork, so its notice is dropped over the cap like an outsider's comment.
+    const forkOpened = (number: number) =>
+      postWebhook({ event: 'pull_request', payload: { ...forkPullRequestEvent('opened', { number }), installation: { id: installation } }, env });
+    expect((await forkOpened(67)).status).toBe(202);
+    expect(await workRows(coordinator(REPOSITORY_ID, 67))).toEqual([]);
     // A writer's comment, a settings edit, a dismissed review, a resolved thread, a push to a branch of the
     // repository, a close and a run's end still get through.
     for (const association of ['OWNER', 'MEMBER', 'COLLABORATOR']) {
@@ -344,6 +350,11 @@ describe('/webhook', () => {
     advanceClock(60 * 60_000);
     expect((await send(65)).status).toBe(202);
     expect(await workRows(coordinator(REPOSITORY_ID, 65))).toHaveLength(1);
+    // A stored fork notice counts toward the cap.
+    expect((await forkOpened(71)).status).toBe(202);
+    expect(await workRows(coordinator(REPOSITORY_ID, 71))).toMatchObject([{ lane: 'help', kind: 'fork_notice', writer: 0, trusted: 0 }]);
+    expect((await send(72)).status).toBe(202);
+    expect(await workRows(coordinator(REPOSITORY_ID, 72))).toEqual([]);
   });
 
   it.each([

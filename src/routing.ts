@@ -25,9 +25,10 @@ const WORKFLOW_PATH = /^\.github\/workflows\/[^/@]+\.ya?ml(@.+)?$/;
 
 /**
  * The state lane carries everything that reads or changes threads, verdicts or approval. The chat lane carries
- * answers that change no PR state, so a question does not wait behind a review. The help lane carries help commands,
- * which the Worker answers itself, so they wait behind no run. The settings lane carries edits of Manki's settings
- * boxes, which the Worker applies itself, so a Cancel tick never waits behind the run it cancels.
+ * answers that change no PR state, so a question does not wait behind a review. The help lane carries help commands
+ * and the notice for a PR from a fork, which the Worker answers itself, so they wait behind no run. The settings lane
+ * carries edits of Manki's settings boxes, which the Worker applies itself, so a Cancel tick never waits behind the run
+ * it cancels.
  */
 export type Lane = 'state' | 'chat' | 'help' | 'settings';
 
@@ -43,8 +44,10 @@ export type Lane = 'state' | 'chat' | 'help' | 'settings';
  * - `help`: answered by the Worker, with no run
  * - `settings`: applied by the Worker, with no run
  * - `bot_push`: a bot's push, which Manki does not review. The Worker reads the skip rules for it, with no run
+ * - `fork_notice`: a PR from a fork that was opened or marked ready. The Worker tells it once that it gets no automatic
+ *   review, with no run
  */
-export type WorkKind = 'review' | 'merged' | 'review_state' | 'thread' | 'comment' | 'issue' | 'help' | 'settings' | 'bot_push';
+export type WorkKind = 'review' | 'merged' | 'review_state' | 'thread' | 'comment' | 'issue' | 'help' | 'settings' | 'bot_push' | 'fork_notice';
 
 /** The pull request or issue a delivery is about. Every field comes from the signed payload. */
 export interface Target {
@@ -228,8 +231,8 @@ function isOwnCommand(payload: WebhookPayload): boolean {
 }
 
 function work(lane: Lane, kind: WorkKind, payload: WebhookPayload, event: string, objectId: number | null = null): Work {
-  // Fork heads are dropped before this, so a push and a thread resolution, which only a writer or the PR's author
-  // can make, both take write access. So does dismissing a review.
+  // A fork head is routed only for its notice, which sets `writer` itself. So a push and a thread resolution, which
+  // only a writer or the PR's author can make, both take write access. So does dismissing a review.
   const byEvent = event === 'pull_request' || event === 'pull_request_review_thread'
     || (event === 'pull_request_review' && payload.action === 'dismissed');
   return {
@@ -285,7 +288,9 @@ export function routeDelivery(event: string, payload: WebhookPayload, now = Date
   if ((event === 'issue_comment' || event === 'pull_request_review_comment') && now - commentAt > STALE_COMMENT_MS) {
     return ignore('comment is over 6 hours old');
   }
-  if (payload.pull_request && isForkHead(payload)) return ignore('head is on a fork');
+  if (payload.pull_request && isForkHead(payload)) {
+    return event === 'pull_request' ? routeForkPullRequest(target, payload) : ignore('head is on a fork');
+  }
 
   switch (event) {
     case 'pull_request':
@@ -310,6 +315,18 @@ function routePullRequest(target: Target, payload: WebhookPayload): Route {
   }
   // A draft's push still queues, since `drafts: review` on the base branch reviews it. The coordinator decides.
   return { type: 'work', target, work: work('state', 'review', payload, 'pull_request') };
+}
+
+/**
+ * Routes a `pull_request` event of a PR from a fork, which starts no review. A person's PR that is opened or marked
+ * ready, and is no draft, queues the notice that says so. Anyone can open one, so it counts as work by someone
+ * without write access.
+ */
+function routeForkPullRequest(target: Target, payload: WebhookPayload): Route {
+  const { action, pull_request: pr } = payload;
+  const told = (action === 'opened' || action === 'ready_for_review') && pr?.draft === false && !isBot(pr.user);
+  if (!told) return ignore('head is on a fork');
+  return { type: 'work', target, work: { ...work('help', 'fork_notice', payload, 'pull_request'), trusted: false, writer: false } };
 }
 
 function routeReview(target: Target, payload: WebhookPayload): Route {

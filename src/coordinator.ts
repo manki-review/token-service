@@ -79,6 +79,13 @@ const MERGEABILITY_RETRY_MS = [5_000, 15_000];
 const HEAD_PULLS_PAGE = 100;
 /** Marks the Worker's note that a review waits for a rebase. Manki removes it once a review posts. */
 export const CONFLICT_NOTE_MARKER = '<!-- manki-conflict-note -->';
+/** Marks the Worker's notice on a PR from a fork, so a PR that holds one gets no second. */
+const FORK_NOTICE_MARKER = '<!-- manki-fork-notice -->';
+/** The notice a PR from a fork gets once. It quotes nothing from the PR, whose text anyone can write. */
+export const FORK_NOTICE = 'This pull request comes from a fork, so Manki does not review it automatically. '
+  + 'Someone with write access to this repository can start a review by commenting `/manki review`, and has to do so again after each push.'
+  + `\n\n${FORK_NOTICE_MARKER}`;
+const FORK_NOTICE_POSTED = 'fork notice already posted';
 const NOT_STARTED = new Set(['queued', 'requested', 'waiting', 'pending']);
 /** A larger `.manki.yml` is not parsed for skip rules, as it costs too much CPU in an alarm. */
 const MAX_CONFIG_BYTES = 64 * 1024;
@@ -1132,6 +1139,10 @@ export class PrCoordinator extends DurableObject<Env> {
         await this.skipBotPush(item);
         return;
       }
+      if (item.kind === 'fork_notice') {
+        await this.postForkNotice(item);
+        return;
+      }
       if (this.capped(item)) return;
       if (item.kind === 'help') await this.answerHelp(item);
       else await this.dispatch(item, optIn.workflow);
@@ -1725,6 +1736,35 @@ export class PrCoordinator extends DurableObject<Env> {
     if (!response.ok) throw new Error(`posting the help reply failed with ${response.status}`);
     this.sql.exec('UPDATE work SET dispatched_at = ? WHERE id = ?', Date.now(), item.id);
     this.finish(item.id, 'done', 'answered help');
+  }
+
+  /**
+   * Tells a PR from a fork once that it gets no automatic review, and how someone with write access starts one. The
+   * notice is a comment and never a `Manki` check, since a completed check satisfies a branch protection rule that
+   * requires it. The coordinator records the notice, and without a record it looks for the marker among Manki's newest
+   * comments. A failure GitHub may recover from throws, and the retry looks for the marker again before it posts.
+   */
+  private async postForkNotice(item: WorkRow): Promise<void> {
+    const end = (status: WorkStatus, note: string) => {
+      if (this.isDispatching(item.id)) this.finish(item.id, status, note);
+    };
+    if (this.getMeta<boolean>('fork_notice')) return end('skipped', FORK_NOTICE_POSTED);
+    const target = await this.verifiedTarget();
+    if (!target) throw new Error('the repository could not be read');
+    const token = await this.token({ issues: 'write', pull_requests: 'write' });
+    if (token === null) return end('skipped', 'installation lacks issues: write');
+    const held = await this.newestMankiComment(token, target, (body) => body.includes(FORK_NOTICE_MARKER));
+    if (held === null) {
+      // A close may have dropped the item during the calls above.
+      if (!this.isDispatching(item.id)) return;
+      const response = await this.api(token, `/repos/${target.owner}/${target.repo}/issues/${target.number}/comments`, { method: 'POST', body: { body: FORK_NOTICE } });
+      if (!response.ok) {
+        if (!isRefusal(response, await response.text())) throw new Error(`posting the fork notice failed with ${response.status}`);
+        return end('failed', `posting the fork notice was refused with ${response.status}`);
+      }
+    }
+    this.setMeta('fork_notice', true);
+    end(held === null ? 'done' : 'skipped', held === null ? 'posted the fork notice' : FORK_NOTICE_POSTED);
   }
 
   /** Reads the PR, and returns it with the token that read it. Throws when it cannot be read. */

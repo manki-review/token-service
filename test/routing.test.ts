@@ -62,7 +62,13 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['a PR opened as a draft', 'pull_request', pullRequestEvent('opened', { draft: true }), 'state:review'],
   ['a PR converted to a draft', 'pull_request', pullRequestEvent('converted_to_draft', { draft: true }), 'ignore'],
   ['a push to a fork PR', 'pull_request', forkPullRequestEvent('synchronize'), 'ignore'],
-  ['a fork PR marked ready', 'pull_request', forkPullRequestEvent('ready_for_review'), 'ignore'],
+  ['an opened fork PR', 'pull_request', forkPullRequestEvent('opened'), 'help:fork_notice'],
+  ['a fork PR marked ready', 'pull_request', forkPullRequestEvent('ready_for_review'), 'help:fork_notice'],
+  ['a fork PR opened as a draft', 'pull_request', forkPullRequestEvent('opened', { draft: true }), 'ignore'],
+  ['an opened fork PR that does not say whether it is a draft', 'pull_request', forkPullRequestEvent('opened', { draft: undefined }), 'ignore'],
+  ['a bot\'s fork PR marked ready by a person', 'pull_request', forkPullRequestEvent('ready_for_review', { user: BOT_SENDER }), 'ignore'],
+  ['a fork PR opened by a bot', 'pull_request', { ...forkPullRequestEvent('opened'), sender: BOT_SENDER }, 'ignore'],
+  ['an opened PR whose fork was deleted', 'pull_request', pullRequestEvent('opened', { head: { sha: HEAD_SHA, repo: null } }), 'help:fork_notice'],
   ['a PR marked ready by a bot', 'pull_request', pullRequestEvent('ready_for_review', {}, BOT_SENDER), 'state:bot_push'],
   ['a push to a PR whose fork was deleted', 'pull_request', pullRequestEvent('synchronize', { head: { sha: HEAD_SHA, repo: null } }), 'ignore'],
   ['a push by a bot', 'pull_request', pullRequestEvent('synchronize', {}, BOT_SENDER), 'state:bot_push'],
@@ -220,6 +226,7 @@ describe('routeDelivery', () => {
     ['a review by an outsider', 'pull_request_review', reviewEvent('submitted', { author_association: 'NONE' }), false],
     ['a review by the PR author', 'pull_request_review', reviewEvent('submitted', { author_association: 'NONE' }, { user: { login: 'alice', type: 'User' } }), true],
     ['a resolved thread', 'pull_request_review_thread', reviewThreadEvent('resolved'), true],
+    ['an opened fork PR', 'pull_request', forkPullRequestEvent('opened'), false],
     ...['OWNER', 'MEMBER', 'COLLABORATOR', 'CONTRIBUTOR'].map((association): [string, string, WebhookPayload, boolean] =>
       [`a review request by a ${association}`, 'issue_comment', issueCommentEvent('@manki review', { association }), true]),
     ['a review request by a first-time contributor', 'issue_comment', issueCommentEvent('@manki review', { association: 'FIRST_TIME_CONTRIBUTOR' }), false],
@@ -270,6 +277,8 @@ describe('routeDelivery', () => {
     ['an outsider\'s review', 'pull_request_review', reviewEvent('submitted', { author_association: 'NONE' }), false, true],
     ['a dismissed review', 'pull_request_review', reviewEvent('dismissed', { author_association: 'NONE' }), true, false],
     ['a push', 'pull_request', pullRequestEvent('synchronize'), true, false],
+    // Anyone can open a PR from a fork, so its notice passes the installation cap like an outsider's comment.
+    ['an opened fork PR', 'pull_request', forkPullRequestEvent('opened'), false, false],
     // The editor of Manki's comment is looked up, so a writer's tick counts as trusted work.
     ['a tick in Manki\'s finding', 'pull_request_review_comment', findingEdit(TICKED_FINDING, FINDING_COMMENT), false, true],
   ])('marks %s as a writer or not, and whether to look the sender up', (_case, event, payload, writer, checkWriter) => {
