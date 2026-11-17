@@ -68,7 +68,7 @@ flowchart LR
     RUN --> PR
 ```
 
-The coordinator also writes to the pull request itself where no run is needed: the waiting check, skip and conflict notes, the notice on a pull request from a fork, reactions and `/manki help` answers. The reconciler talks to GitHub too, to redeliver failed webhooks and find pull requests that missed a review.
+The coordinator also writes to the pull request itself where no run is needed: the waiting check, skip and conflict notes, the notice with its review boxes on a pull request from a fork, reactions and `/manki help` answers. The reconciler talks to GitHub too, to redeliver failed webhooks and find pull requests that missed a review.
 
 Three [Durable Objects](https://developers.cloudflare.com/durable-objects/) hold all state:
 

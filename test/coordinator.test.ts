@@ -7,7 +7,7 @@ import {
   DISPATCHES_PER_HOUR,
   CONFLICT_NOTE_MARKER,
   FINISHED_RETENTION_MS,
-  FORK_NOTICE,
+  forkNotice,
   IDLE_RETENTION_MS,
   OPT_IN_TTL_MS,
   backoff,
@@ -53,6 +53,7 @@ import {
   DISPATCH_WORKFLOW_YAML,
   EVENT_WORKFLOW_YAML,
   forkPullRequestEvent,
+  HEAD_SHA,
   issueCommentEvent,
   MANKI_AUTHOR,
   pullRequestEvent,
@@ -2112,16 +2113,31 @@ describe('PrCoordinator dispatch', () => {
   };
   const notices = async (pr: ReturnType<typeof pullRequest>) =>
     (await workRows(pr.stub)).filter((row) => row.kind === 'fork_notice').map((row) => [row.lane, row.status, row.note]);
+  /** The notice of a PR whose head is the one `forkPullRequestEvent` names. */
+  const FORK_NOTICE = forkNotice(HEAD_SHA);
+  /** `BLOCK_RE` of manki `src/settings.ts`, by which the Action reads, rewrites and removes a settings block. */
+  const MANKI_BLOCK_RE = /(?:^|\n+)---\n(?:Last reviewed `([0-9a-f]+)`|Not reviewed yet) · head `([0-9a-f]+)` · ([^\n]*)\n((?:- \[[ xX]\] [^\n]*\n)*)<!-- manki-settings -->((?:\n<!-- [^\n]* -->)*)\s*$/;
 
   it('tells a PR from a fork once that it gets no automatic review, in a comment and never a check', async () => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
     const opened = crypto.randomUUID();
     await deliver(pr, 'opened', {}, opened);
-    expect(FORK_NOTICE).toBe(
+    expect(FORK_NOTICE).toBe([
       'This pull request comes from a fork, so Manki does not review it automatically. Someone with write access to this repository can start a review '
-      + 'by commenting `/manki review`, and has to do so again after each push.\n\n<!-- manki-fork-notice -->',
-    );
+      + 'by ticking a box in the settings block below or by commenting `/manki review`, and has to do so again after each push.',
+      '',
+      '<!-- manki-fork-notice -->',
+      '',
+      '---',
+      'Not reviewed yet · head `aaaaaaa` · no automatic review',
+      '- [ ] Review again <!-- manki-box:again -->',
+      '- [ ] Deeper review <!-- manki-box:deeper -->',
+      '<!-- manki-settings -->',
+    ].join('\n'));
+    // The Action reads the block as one of its own, and leaves the notice with its marker when it removes the block.
+    expect(MANKI_BLOCK_RE.exec(FORK_NOTICE)?.slice(1, 4)).toEqual([undefined, 'aaaaaaa', 'no automatic review']);
+    expect(FORK_NOTICE.replace(MANKI_BLOCK_RE, '')).toMatch(/after each push\.\n\n<!-- manki-fork-notice -->$/);
     expect(github.comments).toEqual([FORK_NOTICE]);
     // The Worker reads the opt-in and posts the comment, and nothing else: no check, no status and no run.
     const comments = `/repos/${OWNER}/${REPO}/issues/${pr.number}/comments`;
@@ -2143,10 +2159,10 @@ describe('PrCoordinator dispatch', () => {
     expect(await notices(pr)).toEqual([['help', 'done', 'posted the fork notice'], ['help', 'skipped', 'fork notice already posted']]);
     expect([github.checkRuns, github.waitingChecks, github.dispatches]).toEqual([[], [], []]);
 
-    // A PR whose state is gone holds the notice among its comments, so it is not told again.
+    // A PR whose state is gone holds the notice among its comments, here without the block a review took, so it is not told again.
     const forgotten = pullRequest();
     const told = fakeGitHub(forgotten.number);
-    told.issueComments.set(1, FORK_NOTICE);
+    told.issueComments.set(1, FORK_NOTICE.replace(MANKI_BLOCK_RE, ''));
     told.issueComments.set(2, 'Why not a map?');
     told.commentAuthors.set(2, 'alice');
     await deliver(forgotten, 'ready_for_review');
@@ -2213,6 +2229,100 @@ describe('PrCoordinator dispatch', () => {
     await deliver(locked, 'ready_for_review', { updated_at: '2030-01-02T00:00:00Z' });
     expect(github.comments).toEqual([FORK_NOTICE, FORK_NOTICE]);
     expect((await notices(locked)).at(-1)).toEqual(['help', 'done', 'posted the fork notice']);
+
+    // The notice names the head, so a delivery whose head is no commit id posts nothing.
+    const headless = pullRequest();
+    github = fakeGitHub(headless.number);
+    await deliver(headless, 'opened', { head: { sha: '`x` <!-- manki-settings -->', repo: { full_name: 'mallory/manki' } } });
+    expect(github.comments).toEqual([]);
+    expect(await notices(headless)).toEqual([['help', 'skipped', 'the delivery names no head commit']]);
+  });
+
+  it('starts one review of a fork PR for a writer\'s tick of a box in its notice, and puts back the tick of anyone else', async () => {
+    const pr = pullRequest();
+    const github = Object.assign(fakeGitHub(pr.number), { headRepositoryId: 999, permissions: { alice: 'write', bob: 'triage' } as Record<string, string> });
+    await deliver(pr, 'opened', { head: { sha: SHA_1, repo: { full_name: 'mallory/manki' } } });
+    const NOTICE = 5005;
+    expect(github.comments).toEqual([forkNotice(SHA_1)]);
+    github.issueComments.set(NOTICE, github.comments[0]);
+    /** Delivers an edit of the notice to `/webhook` and runs the alarm twice, so a review it queues starts. */
+    const send = async (payload: WebhookPayload, delivery?: string) => {
+      expect((await postWebhook({ event: 'issue_comment', payload, delivery })).status).toBe(202);
+      await runDurableObjectAlarm(pr.stub);
+      await runDurableObjectAlarm(pr.stub);
+    };
+    /** Returns the edit GitHub delivers when `sender` ticks the box labelled `label` in the notice. The PR's author is `mallory`. */
+    const tick = (label: string, sender: string): WebhookPayload => {
+      const before = github.issueComments.get(NOTICE)!;
+      const after = before.replace(`- [ ] ${label}`, `- [x] ${label}`);
+      github.issueComments.set(NOTICE, after);
+      const payload = issueCommentEvent(after, {
+        number: pr.number, action: 'edited', author: MANKI_AUTHOR, sender: { login: sender, type: 'User' }, previousBody: before, issueAuthor: 'mallory',
+      });
+      return { ...payload, comment: { ...payload.comment!, id: NOTICE } };
+    };
+    const state = async () => {
+      const token = await oidcToken({ claims: { repository_id: String(REPOSITORY_ID), run_id: '9000' } });
+      return (await postToken({ path: '/state', token, body: { owner: OWNER, repo: REPO, pr: pr.number } })).json() as Promise<Record<string, unknown>>;
+    };
+
+    // The PR's author and a collaborator without write access start nothing, and their tick is put back.
+    for (const sender of ['mallory', 'bob']) {
+      await send(tick('Review again', sender));
+      await send(tick('Deeper review', sender));
+      expect(github.issueComments.get(NOTICE)).toBe(forkNotice(SHA_1));
+    }
+    expect(github.permissionReads).toEqual(['mallory', 'bob']);
+    expect((await workRows(pr.stub)).slice(1).map((row) => [row.kind, row.status, row.note])).toEqual(
+      Array.from({ length: 4 }, () => ['settings', 'skipped', 'commenter has no write access']),
+    );
+    expect([github.dispatches, github.checkRuns, github.waitingChecks]).toEqual([[], [], []]);
+    expect(github.mints.flatMap((mint) => Object.keys(mint.permissions)).filter((name) => name === 'actions' || name === 'checks')).toEqual([]);
+
+    // A writer's tick starts one review of the head, as the box of any settings block does. The run reads its mode from `/state`.
+    const ticked = tick('Review again', 'alice');
+    const delivery = crypto.randomUUID();
+    await send(ticked, delivery);
+    expect(github.dispatches.map((dispatch) => dispatch.inputs)).toEqual([
+      { event: 'issue_comment', action: 'edited', pr: String(pr.number), comment_id: String(NOTICE), delivery_id: delivery },
+    ]);
+    expect(await state()).toMatchObject({ active: [{ kind: 'review', event: 'issue_comment.edited', head_sha: null, modes: ['again'], run_id: 9000 }], queue: [] });
+    expect(github.issueComments.get(NOTICE)).toContain('\nNot reviewed yet · head `1111111` · Review again requested by `@alice`, starting…\n- [x] Review again <!-- manki-box:again -->\n');
+    /** What a PR got from GitHub's side: its waiting checks, its other checks and the permissions of the tokens minted for it. */
+    const granted = (from: typeof github) => ({
+      waiting: from.waitingChecks.map(({ id: _id, external_id: _delivery, ...check }) => check),
+      checks: from.checkRuns,
+      tokens: [...new Set(from.mints.flatMap((mint) => Object.entries(mint.permissions).map(([name, level]) => `${name}: ${level}`)))].sort(),
+    });
+    const got = granted(github);
+    expect(got).toMatchObject({ waiting: [{ head_sha: SHA_1, status: 'queued' }], checks: [] });
+
+    // A redelivery starts nothing, under its own id or a new one, since the coordinator knows a delivery by its body too.
+    const rows = (await workRows(pr.stub)).length;
+    await send(ticked, delivery);
+    await send(ticked);
+    expect(github.dispatches).toHaveLength(1);
+    expect(await workRows(pr.stub)).toHaveLength(rows);
+
+    // Once that review ended, a tick of the notice's other box asks for one deeper review of the current head.
+    await pr.stub.runCompleted(key('d-first-review'), 9000, 'success');
+    github.head = SHA_2;
+    await send(tick('Deeper review', 'alice'));
+    expect(github.dispatches).toHaveLength(2);
+    expect((await workRows(pr.stub)).filter((row) => row.kind === 'review').map((row) => [row.status, row.modes, row.run_head])).toEqual([
+      ['done', '["again"]', SHA_1], ['running', '["deeper"]', SHA_2],
+    ]);
+    expect(await notices(pr)).toEqual([['help', 'done', 'posted the fork notice']]);
+
+    // The tick got nothing a review command by the same writer does not get on a PR from a fork.
+    const commanded = pullRequest();
+    const plain = Object.assign(fakeGitHub(commanded.number), { headRepositoryId: 999, permissions: { alice: 'write' } as Record<string, string> });
+    const alice = { login: 'alice', type: 'User' };
+    const command = issueCommentEvent('/manki review', { number: commanded.number, author: alice, sender: alice, association: 'NONE', issueAuthor: 'mallory' });
+    expect((await postWebhook({ event: 'issue_comment', payload: command })).status).toBe(202);
+    await runDurableObjectAlarm(commanded.stub);
+    expect(plain.dispatches).toHaveLength(1);
+    expect(granted(plain)).toEqual({ ...got, tokens: expect.arrayContaining(got.tokens) });
   });
 
   it('looks up a commenter the payload does not show as a writer, and skips their comment without write access', async () => {
