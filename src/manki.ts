@@ -333,3 +333,79 @@ export function setBoxes(body: string, changes: BoxChange[]): string {
   return body.replace(BOX_LINE, (line, start: string, _tick: string, end: string, box: SettingsBox) =>
     wanted.has(box) ? `${start}${wanted.get(box) ? 'x' : ' '}${end}` : line);
 }
+
+/** Starts the line above each box Manki puts into a message for the next step it names, as Manki's `BOX_ANCHOR`. */
+const MESSAGE_BOX_ANCHOR = '<!-- manki-issue-box -->';
+
+/** The boxes Manki puts into a message other than the settings block, as its `MessageBox`. */
+export type MessageBox = 'again' | 'check' | 'forget' | 'dismiss';
+
+const MESSAGE_BOXES: readonly string[] = ['again', 'check', 'forget', 'dismiss'] satisfies MessageBox[];
+
+/** A message box ticked in an edit, with the id of what it acts on, such as a learning, when it has one. */
+export interface MessageTick {
+  box: MessageBox;
+  id?: string;
+}
+
+// Manki's `BOX_LINE` in `src/issue-box.ts`, with the tick and the label taken apart.
+const ANCHORED_BOX_LINE = /^([ \t]*[-*] \[)([ xX])(\] (.*)<!-- manki-box:([a-z]+)(?::(.+?))? -->[ \t]*\r?)$/;
+const FENCE_LINE = /^[ \t]*(`{3,}|~{3,})/;
+
+/** Returns, for each of `lines`, whether it is a code fence or inside one, as Manki's `fencedLines`. */
+function fencedLines(lines: string[]): boolean[] {
+  let fence: string | undefined;
+  return lines.map((text) => {
+    const opener = text.match(FENCE_LINE)?.[1];
+    if (fence) {
+      if (opener && opener[0] === fence[0] && opener.length >= fence.length && text.trim() === opener) fence = undefined;
+      return true;
+    }
+    if (opener) fence = opener;
+    return !!opener;
+  });
+}
+
+/**
+ * Returns the message boxes in `lines`, as Manki's `anchoredBoxes` reads them. A box counts only right under its anchor
+ * and outside a code fence, so a box line a model wrote into Manki's text is never one.
+ */
+function messageBoxes(lines: string[]): Array<MessageTick & { line: number; ticked: boolean; label: string }> {
+  const fenced = fencedLines(lines);
+  return lines.flatMap((text, line) => {
+    const match = fenced[line] || lines[line - 1]?.trim() !== MESSAGE_BOX_ANCHOR ? null : ANCHORED_BOX_LINE.exec(text);
+    if (!match || !MESSAGE_BOXES.includes(match[5])) return [];
+    const tick = { box: match[5] as MessageBox, ...(match[6] !== undefined && { id: match[6] }) };
+    return [{ ...tick, line, ticked: match[2] !== ' ', label: match[4].trim() }];
+  });
+}
+
+const tickKey = ({ box, id }: MessageTick) => (id === undefined ? box : `${box}:${id}`);
+
+/** Returns the message boxes that are ticked in `after` and were unticked in `before`, each once. */
+export function tickedMessageBoxes(before: string, after: string): MessageTick[] {
+  const old = new Map(messageBoxes(before.split('\n')).map((box) => [tickKey(box), box.ticked]));
+  const ticks = new Map<string, MessageTick>();
+  for (const { box, id, ticked } of messageBoxes(after.split('\n'))) {
+    const tick = { box, ...(id !== undefined && { id }) };
+    if (ticked && old.get(tickKey(tick)) === false) ticks.set(tickKey(tick), tick);
+  }
+  return [...ticks.values()];
+}
+
+/**
+ * Returns `body` with the ticked line of each box in `ticks` unticked. With `editor`, the line is replaced by the one
+ * Manki's `settleTickedBox` writes once the step started, "<label> requested by `@<editor>`". Every other line stays.
+ */
+export function settleMessageBoxes(body: string, ticks: MessageTick[], editor?: string): string {
+  const lines = body.split('\n');
+  const keys = new Set(ticks.map(tickKey));
+  for (const box of messageBoxes(lines)) {
+    if (!box.ticked || !keys.has(tickKey(box))) continue;
+    const text = lines[box.line];
+    lines[box.line] = editor === undefined
+      ? text.replace(ANCHORED_BOX_LINE, (_line, start: string, _tick: string, end: string) => `${start} ${end}`)
+      : `${box.label} requested by \`@${editor}\`${text.endsWith('\r') ? '\r' : ''}`;
+  }
+  return lines.join('\n');
+}

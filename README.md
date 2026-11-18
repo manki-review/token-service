@@ -30,7 +30,7 @@ and keeps the state of every pull request, so the runs themselves hold almost no
 | 1 | **Review scheduling** | Verifies the App's webhooks, queues work per pull request, merges repeated pushes into one review and starts the Manki workflow with `workflow_dispatch`. | [coordinator](docs/coordinator.md) |
 | 2 | **Decisions without a run** | Answers `/manki help`, checks write access, and applies skip rules, drafts, pauses, base conflicts and one review per head commit, all without spending a runner. | [coordinator](docs/coordinator.md#decisions-without-a-run) |
 | 3 | **Waiting check** | Puts a queued `Manki` check on the commit the moment a review is dispatched, and makes sure every check it created ends. | [waiting check](docs/waiting-check.md) |
-| 4 | **Settings boxes** | Applies the ticks in Manki's progress comment: Pause, Review again, Deeper review, Cancel and Review this draft. | [settings boxes](docs/settings-boxes.md) |
+| 4 | **Settings boxes** | Applies the ticks in Manki's progress comment: Pause, Review again, Deeper review, Cancel and Review this draft. Routes the ticks of the boxes Manki puts below a next step in its other messages. | [settings boxes](docs/settings-boxes.md) |
 | 5 | **Tokens** | Gives the run a coordinator dispatched a GitHub App token for its own repository only, with the fewest permissions and no push. | [tokens](docs/tokens.md) |
 | 6 | **PR state** | Keeps what is queued and running, the last reviewed commit, the last approval and the pause of each PR, so Manki never parses its own comments. | [PR state](docs/state.md) |
 | 7 | **Thread resolution** | Resolves and reopens Manki's review threads for the run, which GitHub only allows with `contents: write`. | [thread resolution](docs/resolve.md) |

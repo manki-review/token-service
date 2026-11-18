@@ -23,6 +23,15 @@ import {
 const SETTINGS_COMMENT = '- [ ] Pause automatic reviews <!-- manki-box:pause -->\n- [ ] Review again <!-- manki-box:again -->\n<!-- manki-settings -->';
 const FINDING_COMMENT = '**Off by one**\n\n- [ ] Create an issue for this <!-- manki-box:issue:src/a.ts:3:3:Off-by-one -->\n\n<!-- manki-finding: {} -->';
 const TICKED_FINDING = FINDING_COMMENT.replace('[ ] Create', '[x] Create');
+/** A message of Manki's with the box `box` below the step it names, as Manki writes it, and the same message ticked. */
+const message = (box: string, label = 'Review again', text = 'Retry with `/manki review`.') =>
+  `${text}\n\n<!-- manki-issue-box -->\n- [ ] ${label} <!-- manki-box:${box} -->\n\n<!-- manki -->`;
+const ticked = (body: string) => body.replace('- [ ]', '- [x]');
+const AGAIN = message('again');
+const CHECK = message('check', 'Check approval', 'Comment `/manki check`.');
+const FORGET = message('forget:abc123', 'Forget this learning', 'Saved a learning. `/manki forget abc123` removes it.');
+const DISMISS = `${FINDING_COMMENT}\n<!-- manki-issue-box -->\n- [ ] Dismiss this finding <!-- manki-box:dismiss -->`;
+const TICKED_DISMISS = DISMISS.replace('[ ] Dismiss', '[x] Dismiss');
 
 /** An edit of Manki's review body from `before` to `after`. GitHub names the review's author, Manki, as the sender. */
 function reviewEdit(after: string, before?: string, review: Record<string, unknown> = {}): WebhookPayload {
@@ -94,6 +103,11 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['a Manki review edit without the earlier body', 'pull_request_review', reviewEdit(TICKED_FINDING), 'ignore'],
   ['a ticked box in Manki\'s review without its node id', 'pull_request_review', reviewEdit(TICKED_FINDING, FINDING_COMMENT, { node_id: undefined }), 'ignore'],
   ['a ticked box in Manki\'s review on a fork PR', 'pull_request_review', { ...reviewEdit(TICKED_FINDING, FINDING_COMMENT), pull_request: forkPullRequestEvent('x').pull_request }, 'ignore'],
+  ['a ticked Review again box in Manki\'s review', 'pull_request_review', reviewEdit(ticked(AGAIN), AGAIN), 'settings:settings'],
+  ['a ticked Check approval box in Manki\'s review', 'pull_request_review', reviewEdit(ticked(CHECK), CHECK), 'state:thread'],
+  ['an unticked Review again box in Manki\'s review', 'pull_request_review', reviewEdit(AGAIN, ticked(AGAIN)), 'ignore'],
+  ['an edit of Manki\'s review that names a command and ticks no box', 'pull_request_review', reviewEdit(`${AGAIN}\nmore`, AGAIN), 'ignore'],
+  ['a ticked message box in Manki\'s review on a fork PR', 'pull_request_review', { ...reviewEdit(ticked(AGAIN), AGAIN), pull_request: forkPullRequestEvent('x').pull_request }, 'ignore'],
   ['a review by a bot', 'pull_request_review', reviewEvent('submitted', { user: MANKI_AUTHOR }), 'ignore'],
   ['a review on a stale commit', 'pull_request_review', reviewEvent('submitted', { commit_id: 'b'.repeat(40) }), 'ignore'],
   ['a review on a fork PR', 'pull_request_review', { ...reviewEvent('submitted'), pull_request: forkPullRequestEvent('x').pull_request }, 'ignore'],
@@ -125,6 +139,12 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['an edit of a Manki finding that ticks no box', 'pull_request_review_comment', findingEdit(`${FINDING_COMMENT}\nmore`, FINDING_COMMENT), 'ignore'],
   ['a Manki finding edit without the earlier body', 'pull_request_review_comment', findingEdit(TICKED_FINDING), 'ignore'],
   ['a ticked issue box in a copy by someone else', 'pull_request_review_comment', findingEdit(TICKED_FINDING, FINDING_COMMENT, { login: 'mallory', type: 'User' }), 'ignore'],
+  ['a ticked Dismiss box in a Manki finding', 'pull_request_review_comment', findingEdit(TICKED_DISMISS, DISMISS), 'state:thread'],
+  ['a ticked Forget box in Manki\'s thread answer', 'pull_request_review_comment', findingEdit(ticked(FORGET), FORGET), 'state:thread'],
+  ['a ticked Review again box in Manki\'s thread answer', 'pull_request_review_comment', findingEdit(ticked(AGAIN), AGAIN), 'settings:settings'],
+  ['an unticked Forget box in Manki\'s thread answer that names the command', 'pull_request_review_comment', findingEdit(FORGET, ticked(FORGET)), 'ignore'],
+  ['an edit of Manki\'s thread answer that names a command and ticks no box', 'pull_request_review_comment', findingEdit(`${FORGET}\nmore`, FORGET), 'ignore'],
+  ['a ticked Dismiss box in a copy by someone else', 'pull_request_review_comment', findingEdit(TICKED_DISMISS, DISMISS, { login: 'mallory', type: 'User' }), 'ignore'],
   ['a review comment on a fork PR', 'pull_request_review_comment', reviewCommentEvent('@manki hi', {}, 'created', { head: { sha: HEAD_SHA, repo: { full_name: 'mallory/manki' } } }), 'ignore'],
 
   // issue_comment on a PR
@@ -155,6 +175,20 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['a settings edit that changes no box', 'issue_comment', issueCommentEvent(`${SETTINGS_COMMENT}\nmore`, { action: 'edited', author: MANKI_AUTHOR, previousBody: SETTINGS_COMMENT }), 'ignore'],
   ['a settings edit without the earlier body', 'issue_comment', issueCommentEvent(SETTINGS_COMMENT, { action: 'edited', author: MANKI_AUTHOR }), 'ignore'],
   ['a ticked box on a copy of the settings by someone else', 'issue_comment', issueCommentEvent(SETTINGS_COMMENT.replace('[ ] Pause', '[x] Pause'), { action: 'edited', previousBody: SETTINGS_COMMENT }), 'ignore'],
+  // The text above a box names its command, so the box goes before the command it names.
+  ['a ticked Review again box in Manki\'s comment', 'issue_comment', issueCommentEvent(ticked(AGAIN), { action: 'edited', author: MANKI_AUTHOR, previousBody: AGAIN }), 'settings:settings'],
+  ['a ticked Check approval box in Manki\'s comment', 'issue_comment', issueCommentEvent(ticked(CHECK), { action: 'edited', author: MANKI_AUTHOR, previousBody: CHECK }), 'state:comment'],
+  ['a ticked Forget box in Manki\'s comment', 'issue_comment', issueCommentEvent(ticked(FORGET), { action: 'edited', author: MANKI_AUTHOR, previousBody: FORGET }), 'chat:comment'],
+  ['a message box edit without the earlier body', 'issue_comment', issueCommentEvent(ticked(message('again', 'Review again', 'Done.')), { action: 'edited', author: MANKI_AUTHOR }), 'ignore'],
+  ['an unticked message box in Manki\'s comment', 'issue_comment', issueCommentEvent(message('again', 'Review again', 'Done.'), { action: 'edited', author: MANKI_AUTHOR, previousBody: ticked(message('again', 'Review again', 'Done.')) }), 'ignore'],
+  ['a ticked box on a copy of Manki\'s comment by someone else', 'issue_comment', issueCommentEvent(ticked(message('again', 'Review again', 'Done.')), { action: 'edited', previousBody: message('again', 'Review again', 'Done.') }), 'ignore'],
+  // Manki's own comment is never a command, also when its text names one: an edit of it counts only as a box tick.
+  ['an unticked Review again box in Manki\'s comment that names the review command', 'issue_comment', issueCommentEvent(AGAIN, { action: 'edited', author: MANKI_AUTHOR, previousBody: ticked(AGAIN) }), 'ignore'],
+  ['an unticked Check approval box in Manki\'s comment that names the command', 'issue_comment', issueCommentEvent(CHECK, { action: 'edited', author: MANKI_AUTHOR, previousBody: ticked(CHECK) }), 'ignore'],
+  ['an edit of Manki\'s comment that names a command and ticks no box', 'issue_comment', issueCommentEvent(`${AGAIN}\nmore`, { action: 'edited', author: MANKI_AUTHOR, previousBody: AGAIN }), 'ignore'],
+  ['an edit of Manki\'s comment without a box that names a command', 'issue_comment', issueCommentEvent('Comment `/manki review` to review it.\n\n<!-- manki -->', { action: 'edited', author: MANKI_AUTHOR, previousBody: 'x' }), 'ignore'],
+  ['an edit of a Manki comment by github-actions that names a command', 'issue_comment', issueCommentEvent('@manki explain\n\n<!-- manki -->', { action: 'edited', author: ACTIONS_AUTHOR, previousBody: 'x' }), 'ignore'],
+  ['a ticked message box in Manki\'s comment on an issue', 'issue_comment', issueCommentEvent(ticked(message('again', 'Review again', 'Done.')), { action: 'edited', author: MANKI_AUTHOR, previousBody: message('again', 'Review again', 'Done.'), onIssue: true }), 'ignore'],
 
   // issue_comment on an issue
   ['a mention on an issue', 'issue_comment', issueCommentEvent('@manki help', { onIssue: true }), 'chat:issue'],
@@ -281,6 +315,8 @@ describe('routeDelivery', () => {
     ['an opened fork PR', 'pull_request', forkPullRequestEvent('opened'), false, false],
     // The editor of Manki's comment is looked up, so a writer's tick counts as trusted work.
     ['a tick in Manki\'s finding', 'pull_request_review_comment', findingEdit(TICKED_FINDING, FINDING_COMMENT), false, true],
+    ['a tick of a message box in Manki\'s comment', 'issue_comment', issueCommentEvent(ticked(CHECK), { action: 'edited', author: MANKI_AUTHOR, association: 'OWNER', previousBody: CHECK }), false, true],
+    ['a tick of Review again in Manki\'s comment', 'issue_comment', issueCommentEvent(ticked(AGAIN), { action: 'edited', author: MANKI_AUTHOR, previousBody: AGAIN }), false, true],
   ])('marks %s as a writer or not, and whether to look the sender up', (_case, event, payload, writer, checkWriter) => {
     const route = routeDelivery(event, payload);
     expect(route.type === 'work' && { writer: route.work.writer, checkWriter: route.work.checkWriter }).toEqual({ writer, checkWriter });
@@ -317,6 +353,53 @@ describe('routeDelivery', () => {
       const route = routeDelivery('issue_comment', issueCommentEvent(body.replace('[ ]', '[x]'), { action: 'edited', author: MANKI_AUTHOR, previousBody: body }));
       expect(route.type === 'work' ? route.work.boxes ?? [] : []).toEqual([]);
     }
+  });
+
+  it('names the message boxes an edit of Manki\'s message ticked, counting only a box below its anchor and outside a code fence', () => {
+    const edit = (after: string, before: string) => routeDelivery('issue_comment', issueCommentEvent(after, { action: 'edited', author: MANKI_AUTHOR, previousBody: before }));
+    expect(routeDelivery('issue_comment', {
+      ...issueCommentEvent(ticked(AGAIN), { action: 'edited', author: MANKI_AUTHOR, previousBody: AGAIN }),
+      comment: { id: COMMENT_ID, body: ticked(AGAIN), user: MANKI_AUTHOR, updated_at: '2030-01-01T00:00:00Z' },
+    })).toMatchObject({
+      type: 'work',
+      work: {
+        lane: 'settings', kind: 'settings', event: 'issue_comment.edited', objectId: COMMENT_ID, writer: false, checkWriter: true, acknowledge: false,
+        boxes: [{ box: 'again', ticked: true }], ticks: [{ box: 'again' }], editedAt: Date.parse('2030-01-01T00:00:00Z'),
+      },
+    });
+    expect(edit(ticked(FORGET), FORGET)).toMatchObject({ work: { lane: 'chat', kind: 'comment', ticks: [{ box: 'forget', id: 'abc123' }] } });
+    const check = edit(ticked(CHECK), CHECK);
+    expect(check.type === 'work' && [check.work.lane, check.work.kind, check.work.boxes, check.work.ticks]).toEqual(['state', 'comment', undefined, [{ box: 'check' }]]);
+    // A body saved in the web editor ends its lines with CRLF.
+    expect(edit(ticked(AGAIN).replace(/\n/g, '\r\n'), AGAIN.replace(/\n/g, '\r\n'))).toMatchObject({ work: { kind: 'settings', ticks: [{ box: 'again' }] } });
+    // One edit that ticks two boxes is one item, and a Review again among them asks for the review.
+    const both = `${CHECK}\n<!-- manki-issue-box -->\n- [ ] Review again <!-- manki-box:again -->`;
+    expect(edit(both.replace(/- \[ \]/g, '- [x]'), both)).toMatchObject({ work: { kind: 'settings', ticks: [{ box: 'check' }, { box: 'again' }] } });
+    // A box line without its anchor, or one inside a code fence, is text a model wrote. So is a kind Manki never writes there.
+    const loose = 'Done.\n\n- [ ] Review again <!-- manki-box:again -->';
+    const fenced = `\`\`\`\n${message('again', 'Review again', 'Done.')}\n\`\`\``;
+    for (const body of [loose, fenced, ...['explain', 'issue:src/a.ts:3:3:Off-by-one', 'pause'].map((box) => message(box, 'Do it', 'Done.'))]) {
+      expect(edit(ticked(body), body)).toMatchObject({ type: 'ignore' });
+    }
+
+    // A review names only when it was submitted, so a review's edit counts from when its delivery arrived.
+    const arrived = Date.parse('2030-01-01T12:00:00Z');
+    const review = routeDelivery('pull_request_review', reviewEdit(ticked(AGAIN), AGAIN, { submitted_at: '2029-12-31T00:00:00Z' }), arrived);
+    expect(review.type === 'work' && review.work).toMatchObject({
+      lane: 'settings', kind: 'settings', event: 'pull_request_review.edited', objectId: REVIEW_ID, sender: '', editorOf: 'PRR_1',
+      writer: false, checkWriter: true, boxes: [{ box: 'again', ticked: true }], ticks: [{ box: 'again' }], editedAt: arrived,
+    });
+    const answer = routeDelivery('pull_request_review_comment', {
+      ...findingEdit(ticked(AGAIN), AGAIN), comment: { id: COMMENT_ID, body: ticked(AGAIN), user: MANKI_AUTHOR, updated_at: '2030-01-01T11:00:00Z' },
+    }, arrived);
+    expect(answer.type === 'work' && answer.work.editedAt).toBe(Date.parse('2030-01-01T11:00:00Z'));
+    // An issue box and a message box ticked in one edit of a finding are one dispatched item.
+    const finding = TICKED_DISMISS.replace('[ ] Create', '[x] Create');
+    expect(routeDelivery('pull_request_review_comment', findingEdit(finding, DISMISS))).toMatchObject({
+      type: 'work', work: { lane: 'state', kind: 'thread', objectId: COMMENT_ID, checkWriter: true, ticks: [{ box: 'dismiss' }] },
+    });
+    const issue = routeDelivery('pull_request_review_comment', findingEdit(TICKED_FINDING, FINDING_COMMENT));
+    expect(issue.type === 'work' && issue.work.ticks).toBeUndefined();
   });
 
   it('fills the merge work and the run end', () => {
