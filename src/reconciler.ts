@@ -3,7 +3,7 @@ import { createAppJWT } from './app-jwt';
 import { allowedAccounts, type Env } from './env';
 import { githubApi, githubGraphql, isRateLimited, mintRepositoryToken } from './github';
 import { log } from './log';
-import { BOT_LOGIN, hasOwnMarker, MANKI_COMMENT_MARKER, reviewedCommit } from './manki';
+import { BOT_LOGIN, hasOwnMarker, MANKI_COMMENT_MARKER, retryAfter, reviewedCommit } from './manki';
 import { STALE_COMMENT_MS, type Target } from './routing';
 
 const MINUTE = 60_000;
@@ -382,11 +382,14 @@ export class Reconciler extends DurableObject<Env> {
     }
   }
 
-  /** Remembers a head as settled for a day, so later passes neither ask its coordinator nor GitHub again. */
-  private markChecked(repo: OptInRow, pull: PullSummary): void {
+  /**
+   * Remembers a head as settled until `until`, a day by default, so passes before then neither ask its coordinator nor
+   * GitHub again. A row goes a day after its `checked_at`, so that is stored as a day before `until`.
+   */
+  private markChecked(repo: OptInRow, pull: PullSummary, until = Date.now() + CATCH_UP_WINDOW_MS): void {
     this.sql.exec(
       'INSERT OR REPLACE INTO checked_heads (repository_id, number, head_sha, checked_at) VALUES (?, ?, ?, ?)',
-      repo.repository_id, pull.number, pull.head.sha, Date.now(),
+      repo.repository_id, pull.number, pull.head.sha, until - CATCH_UP_WINDOW_MS,
     );
   }
 
@@ -434,11 +437,18 @@ export class Reconciler extends DurableObject<Env> {
       });
       // A review counts for the commit its own body names, by the rule of Manki's `reviewedCommit`. GitHub's commit of
       // a review is not read, as a rebase can move it to a head Manki never reviewed. A thread reply names no commit.
-      const reviewed = data.repository?.pullRequest?.reviews.nodes.some((review) =>
-        reviewedCommit(review.body) === pull.head.sha && review.state !== 'DISMISSED'
-        && review.body.includes(MANKI_COMMENT_MARKER) && !hasOwnMarker(review.body, NO_VERDICT_MARKER));
-      if (reviewed) {
+      const ofHead = (data.repository?.pullRequest?.reviews.nodes ?? []).filter((review) =>
+        reviewedCommit(review.body) === pull.head.sha && review.state !== 'DISMISSED' && review.body.includes(MANKI_COMMENT_MARKER));
+      if (ofHead.some((review) => !hasOwnMarker(review.body, NO_VERDICT_MARKER))) {
         this.markChecked(repo, pull);
+        continue;
+      }
+      // A review that limits stopped names when they lift, and a retry before then meets them again. The head is left
+      // until then, at most a day, so a time far off keeps no row longer than any other.
+      const lifts = retryAfter(ofHead.at(-1)?.body ?? '');
+      if (lifts !== undefined && lifts > Date.now()) {
+        this.markChecked(repo, pull, Math.min(lifts, Date.now() + CATCH_UP_WINDOW_MS));
+        log('reconciler_catch_up_waits', { repo: `${repo.owner}/${repo.repo}`, pr: pull.number, head_sha: pull.head.sha, retry_after: new Date(lifts).toISOString() });
         continue;
       }
       if (!budget.take()) return false;

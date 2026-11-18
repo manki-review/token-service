@@ -25,13 +25,18 @@ export const BOT_MARKER = '<!-- manki-bot -->';
 const RECORD_OPENER = '<!-- manki-context';
 
 /**
- * Whether Manki itself wrote the flag `marker` in the review `body`: on a line of its own below the last round record,
- * or anywhere when the body holds no record. A marker above the record is quoted text.
+ * The lines of the review `body` that Manki itself wrote: those below the last round record, or all of them when the body
+ * holds no record. A line above the record can quote code and model text.
  */
-export function hasOwnMarker(body: string, marker: string): boolean {
+function ownLines(body: string): string[] {
   const lines = body.split('\n');
   const record = lines.map((line) => line.startsWith(RECORD_OPENER) && line.includes('-->')).lastIndexOf(true);
-  return lines.slice(record + 1).some((line) => line.trimEnd() === marker);
+  return lines.slice(record + 1);
+}
+
+/** Whether Manki itself wrote the flag `marker` in the review `body`, on a line of its own. */
+export function hasOwnMarker(body: string, marker: string): boolean {
+  return ownLines(body).some((line) => line.trimEnd() === marker);
 }
 
 /** The footer line of a Manki review that links the commit it reviewed. */
@@ -71,6 +76,20 @@ export function reviewedCommit(body: string): string | undefined {
     if (named) return named;
   }
   return undefined;
+}
+
+/** Opens the marker of a Manki review without a verdict that limits stopped. It holds the time at which they lift. */
+const RETRY_AFTER_OPENER = '<!-- manki-retry-after: ';
+/** The time in the marker, as JavaScript's `toISOString` writes it. */
+const RETRY_AFTER_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+/**
+ * Returns when the limits that stopped the Manki review `body` lift, in milliseconds since the epoch, or `undefined` when
+ * Manki itself named no such time. Manki's `postReview` writes the marker on a review without a verdict.
+ */
+export function retryAfter(body: string): number | undefined {
+  const time = ownLines(body).map((line) => markerText(line, RETRY_AFTER_OPENER)).filter((text) => text !== undefined).at(-1);
+  return time && RETRY_AFTER_TIME.test(time) ? Date.parse(time) : undefined;
 }
 
 /** The answer to a help command, as Manki's `handleHelp` posts it. */
