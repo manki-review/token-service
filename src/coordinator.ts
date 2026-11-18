@@ -307,7 +307,7 @@ async function startsMankiThread(token: string, target: Target, id: number): Pro
 function pausedSummary(reason: string | null, paused: boolean): string {
   const box = paused ? ' by the **Pause automatic reviews** box' : '';
   // While the Action's pause holds, unticking Pause alone reviews nothing.
-  const how = paused && reason === null ? 'Tick **Review again** or untick **Pause automatic reviews**' : 'Tick **Review again**';
+  const how = paused && reason === null ? 'Tick the review box or untick **Pause automatic reviews**' : 'Tick the review box';
   return `${reason ? `${reason} ` : ''}Automatic review is paused${box}, so this commit waits. ${how} on Manki's settings comment to review it.`;
 }
 
@@ -387,7 +387,7 @@ function waitingCheckEnd(item: WorkRow, status: string, superseded: boolean): Ch
     return {
       conclusion: failed,
       title: 'Review did not run',
-      summary: `The review run ended without reviewing ${sha}. Tick **Review again** on Manki's settings comment to review it.`,
+      summary: `The review run ended without reviewing ${sha}. Tick the review box on Manki's settings comment to review it.`,
     };
   }
   return { conclusion: 'cancelled', title: 'Review not started', summary: `Manki did not start the review of ${sha}: ${item.note ?? 'it was dropped'}.` };

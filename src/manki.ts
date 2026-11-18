@@ -96,7 +96,7 @@ export function retryAfter(body: string): number | undefined {
 export const HELP_REPLY = [
   '| Command | What it does |',
   '|---|---|',
-  '| `/manki review` | Reviews the head commit unless Manki\'s newest review of it is complete. Tick Review again in the settings block to review it again |',
+  '| `/manki review` | Reviews the head commit unless Manki\'s newest review of it is complete. Tick the review box in the settings block to review it again |',
   '| `/manki explain [topic]` | Explains something about this PR |',
   '| `/manki check` | Checks for open blocking threads and approves when there are none |',
   '| `/manki dismiss [finding]` | Dismisses a finding |',
@@ -258,8 +258,8 @@ export type ReviewMode = Extract<SettingsBox, 'again' | 'deeper' | 'draft'>;
 
 export const REVIEW_MODES: readonly ReviewMode[] = ['again', 'deeper', 'draft'];
 
-/** The boxes of a PR that has no review yet, with the labels Manki's `BOX_LABELS` gives them, in its order. */
-const UNREVIEWED_BOXES: ReadonlyArray<[ReviewMode, string]> = [['again', 'Review again'], ['deeper', 'Deeper review']];
+/** The boxes of a PR that has no review yet, with the labels Manki's `renderSettingsBlock` gives them then, in its order. */
+const UNREVIEWED_BOXES: ReadonlyArray<[ReviewMode, string]> = [['again', 'Review now'], ['deeper', 'Deeper review']];
 
 /**
  * Returns the settings block of a PR that has no review yet, with `status` and both review boxes unticked. Manki reads

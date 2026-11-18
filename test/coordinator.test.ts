@@ -1308,7 +1308,7 @@ describe('PrCoordinator dispatch', () => {
       name: 'Manki', head_sha: SHA_2, status: 'completed', conclusion: 'action_required', details_url: `https://github.com/${OWNER}/${REPO}/pull/${pr.number}`,
       output: {
         title: 'Automatic review paused',
-        summary: "Round cap reached. Automatic review is paused, so this commit waits. Tick **Review again** on Manki's settings comment to review it.",
+        summary: "Round cap reached. Automatic review is paused, so this commit waits. Tick the review box on Manki's settings comment to review it.",
       },
     };
     const catchUp = { installationId: INSTALLATION_ID, repositoryId: REPOSITORY_ID, owner: OWNER, ownerId: OWNER_ID, repo: REPO, defaultBranch: 'main', number: pr.number };
@@ -2131,7 +2131,7 @@ describe('PrCoordinator dispatch', () => {
       '',
       '---',
       'Not reviewed yet · head `aaaaaaa` · no automatic review',
-      '- [ ] Review again <!-- manki-box:again -->',
+      '- [ ] Review now <!-- manki-box:again -->',
       '- [ ] Deeper review <!-- manki-box:deeper -->',
       '<!-- manki-settings -->',
     ].join('\n'));
@@ -2268,7 +2268,7 @@ describe('PrCoordinator dispatch', () => {
 
     // The PR's author and a collaborator without write access start nothing, and their tick is put back.
     for (const sender of ['mallory', 'bob']) {
-      await send(tick('Review again', sender));
+      await send(tick('Review now', sender));
       await send(tick('Deeper review', sender));
       expect(github.issueComments.get(NOTICE)).toBe(forkNotice(SHA_1));
     }
@@ -2280,14 +2280,14 @@ describe('PrCoordinator dispatch', () => {
     expect(github.mints.flatMap((mint) => Object.keys(mint.permissions)).filter((name) => name === 'actions' || name === 'checks')).toEqual([]);
 
     // A writer's tick starts one review of the head, as the box of any settings block does. The run reads its mode from `/state`.
-    const ticked = tick('Review again', 'alice');
+    const ticked = tick('Review now', 'alice');
     const delivery = crypto.randomUUID();
     await send(ticked, delivery);
     expect(github.dispatches.map((dispatch) => dispatch.inputs)).toEqual([
       { event: 'issue_comment', action: 'edited', pr: String(pr.number), comment_id: String(NOTICE), delivery_id: delivery },
     ]);
     expect(await state()).toMatchObject({ active: [{ kind: 'review', event: 'issue_comment.edited', head_sha: null, modes: ['again'], run_id: 9000 }], queue: [] });
-    expect(github.issueComments.get(NOTICE)).toContain('\nNot reviewed yet · head `1111111` · Review again requested by `@alice`, starting…\n- [x] Review again <!-- manki-box:again -->\n');
+    expect(github.issueComments.get(NOTICE)).toContain('\nNot reviewed yet · head `1111111` · Review now requested by `@alice`, starting…\n- [x] Review now <!-- manki-box:again -->\n');
     /** What a PR got from GitHub's side: its waiting checks, its other checks and the permissions of the tokens minted for it. */
     const granted = (from: typeof github) => ({
       waiting: from.waitingChecks.map(({ id: _id, external_id: _delivery, ...check }) => check),
@@ -2507,7 +2507,7 @@ describe('PrCoordinator dispatch', () => {
     });
 
     type Dispatched = Awaited<ReturnType<typeof dispatched>>;
-    const DID_NOT_RUN = "The review run ended without reviewing `1111111`. Tick **Review again** on Manki's settings comment to review it.";
+    const DID_NOT_RUN = "The review run ended without reviewing `1111111`. Tick the review box on Manki's settings comment to review it.";
 
     // Each case is a way a run ends before Manki takes its check over. Its `/token` requests say `takes_over_check`.
     it.each<[string, (run: Dispatched) => unknown, string, Record<string, string>, Partial<ReturnType<typeof fakeGitHub>>?]>([
@@ -2960,7 +2960,7 @@ describe('PrCoordinator dispatch', () => {
         output: {
           title: 'Automatic review paused',
           summary: 'Automatic review is paused by the **Pause automatic reviews** box, so this commit waits. '
-            + "Tick **Review again** or untick **Pause automatic reviews** on Manki's settings comment to review it.",
+            + "Tick the review box or untick **Pause automatic reviews** on Manki's settings comment to review it.",
         },
       }]);
       expect(github.issueComments.get(1400)).toBe(notice(`automatic review paused, \`${SHA_1.slice(0, 7)}\` waits`));
@@ -3024,7 +3024,7 @@ describe('PrCoordinator dispatch', () => {
       expect(github.checkRuns.at(-1)?.output).toEqual({
         title: 'Automatic review paused',
         summary: 'Round cap reached. Automatic review is paused by the **Pause automatic reviews** box, so this commit waits. '
-          + "Tick **Review again** on Manki's settings comment to review it.",
+          + "Tick the review box on Manki's settings comment to review it.",
       });
       await edit(['pause'], []);
       expect(github.dispatches).toHaveLength(3);
