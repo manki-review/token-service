@@ -25,13 +25,18 @@ export const BOT_MARKER = '<!-- manki-bot -->';
 const RECORD_OPENER = '<!-- manki-context';
 
 /**
- * Whether Manki itself wrote the flag `marker` in the review `body`: on a line of its own below the last round record,
- * or anywhere when the body holds no record. A marker above the record is quoted text.
+ * The lines of the review `body` that Manki itself wrote: those below the last round record, or all of them when the body
+ * holds no record. A line above the record can quote code and model text.
  */
-export function hasOwnMarker(body: string, marker: string): boolean {
+function ownLines(body: string): string[] {
   const lines = body.split('\n');
   const record = lines.map((line) => line.startsWith(RECORD_OPENER) && line.includes('-->')).lastIndexOf(true);
-  return lines.slice(record + 1).some((line) => line.trimEnd() === marker);
+  return lines.slice(record + 1);
+}
+
+/** Whether Manki itself wrote the flag `marker` in the review `body`, on a line of its own. */
+export function hasOwnMarker(body: string, marker: string): boolean {
+  return ownLines(body).some((line) => line.trimEnd() === marker);
 }
 
 /** The footer line of a Manki review that links the commit it reviewed. */
