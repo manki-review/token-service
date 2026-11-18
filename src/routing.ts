@@ -279,7 +279,7 @@ export function routeDelivery(event: string, payload: WebhookPayload, now = Date
 
   // A tick in Manki's own review arrives with Manki as the sender, so it is routed before bot events are dropped.
   if (event === 'pull_request_review' && payload.action === 'edited' && MANKI_LOGINS.includes(payload.review?.user?.login ?? '')) {
-    return routeReviewBoxTick(target, payload);
+    return routeReviewBoxTick(target, payload, now);
   }
 
   // Manki skips a bot's push. The coordinator still records the head, so the cron does not review it later, and
@@ -349,8 +349,9 @@ function routeReview(target: Target, payload: WebhookPayload): Route {
  * Routes an edit of Manki's review that ticks a finding's issue box or a message box. The sender is left to the editor
  * lookup, and the editor must have write access. Manki's own rewrite of its review ticks no box, so it is dropped here.
  */
-function routeReviewBoxTick(target: Target, payload: WebhookPayload): Route {
-  const tick = boxTick(payload, 'pull_request_review', payload.review?.id ?? null, payload.review?.body ?? '', 'thread');
+function routeReviewBoxTick(target: Target, payload: WebhookPayload, now: number): Route {
+  // A review names only when it was submitted, so the edit's time is when its delivery arrived.
+  const tick = boxTick(payload, 'pull_request_review', payload.review?.id ?? null, payload.review?.body ?? '', 'thread', now);
   if (!tick) return ignore('no box ticked');
   if (isForkHead(payload)) return ignore('head is on a fork');
   const nodeId = payload.review?.node_id;
@@ -362,9 +363,13 @@ function routeReviewBoxTick(target: Target, payload: WebhookPayload): Route {
  * Returns the work of an edit of Manki's comment, review or review comment that ticks a message box, or a finding's
  * issue box in a review or review comment (`thread`). Null when the edit ticks none. A Review again tick asks for a
  * review as the settings box does, so it goes to the settings lane. Any other tick is dispatched as the edited object,
- * on the lane of its command. The editor's write access is looked up before the work counts.
+ * on the lane of its command. The editor's write access is looked up before the work counts. `editedAt` is when the
+ * edit was made, by default the comment's last edit.
  */
-function boxTick(payload: WebhookPayload, event: string, objectId: number | null, body: string, kind: 'thread' | 'comment'): Work | null {
+function boxTick(
+  payload: WebhookPayload, event: string, objectId: number | null, body: string, kind: 'thread' | 'comment',
+  editedAt = Date.parse(payload.comment?.updated_at ?? '') || 0,
+): Work | null {
   const before = payload.changes?.body?.from;
   if (before === undefined) return null;
   const ticks = tickedMessageBoxes(before, body);
@@ -375,7 +380,7 @@ function boxTick(payload: WebhookPayload, event: string, objectId: number | null
     ...(again ? work('settings', 'settings', payload, event, objectId) : work(lane, kind, payload, event, objectId)),
     acknowledge: false, writer: false, checkWriter: true,
     ...(ticks.length > 0 && { ticks }),
-    ...(again && { boxes: [{ box: 'again', ticked: true }], editedAt: Date.parse(payload.comment?.updated_at ?? '') || 0 }),
+    ...(again && { boxes: [{ box: 'again', ticked: true }], editedAt }),
   };
 }
 
@@ -415,13 +420,14 @@ function routeIssueComment(target: Target, payload: WebhookPayload): Route {
   const objectId = comment?.id ?? null;
   const onPullRequest = Boolean(payload.issue?.pull_request);
 
-  const mankis = onPullRequest && action === 'edited' && MANKI_LOGINS.includes(comment?.user?.login ?? '');
-  // A box below a next step in any other comment of Manki's. Manki's text can name a command, so the box goes first.
-  const tick = mankis && !body.includes(SETTINGS_MARKER) ? boxTick(payload, 'issue_comment', objectId, body, 'comment') : null;
-  if (tick) return { type: 'work', target, work: tick };
-
-  // Only the box ticks matter. Editing Manki's comment takes write access, which the coordinator checks for the editor.
-  if (mankis && body.includes(SETTINGS_MARKER)) {
+  // Manki's own comment is never a command, also when its text names one. Only its box ticks matter. Editing Manki's
+  // comment takes write access, which is checked for the editor.
+  if (action === 'edited' && MANKI_LOGINS.includes(comment?.user?.login ?? '')) {
+    if (!onPullRequest) return ignore('edit of Manki\'s comment on an issue');
+    if (!body.includes(SETTINGS_MARKER)) {
+      const tick = boxTick(payload, 'issue_comment', objectId, body, 'comment');
+      return tick ? { type: 'work', target, work: tick } : ignore('no box ticked');
+    }
     const before = payload.changes?.body?.from;
     const boxes = before === undefined ? [] : changedBoxes(before, body);
     if (boxes.length === 0) return ignore('no settings box changed');

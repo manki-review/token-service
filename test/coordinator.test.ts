@@ -3489,8 +3489,13 @@ describe('PrCoordinator dispatch', () => {
       await runInDurableObject(pr.stub, async (_instance, ctx) => {
         ctx.storage.sql.exec(`UPDATE work SET check_at = ? WHERE kind = 'review'`, Date.now() + MINUTE);
       });
-      await edit([], ['again'], 'alice', new Date().toISOString(), again);
-      expect(github.issueComments.get(SETTINGS)).toBe(settled('alice'));
+      // The box line is replaced in the message as it is when settled, so a box ticked meanwhile stays ticked.
+      const checked = (body: string) => `${body}\n<!-- manki-issue-box -->\n- [x] Check approval <!-- manki-box:check -->`;
+      const payload = issueCommentEvent(again(['again']), { number: pr.number, action: 'edited', author: MANKI_AUTHOR, previousBody: again() });
+      github.issueComments.set(SETTINGS, checked(again(['again'])));
+      await pr.send('issue_comment', { ...payload, comment: { ...payload.comment!, id: SETTINGS } });
+      await runDurableObjectAlarm(pr.stub);
+      expect(github.issueComments.get(SETTINGS)).toBe(checked(settled('alice')));
       expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'done', note: 'again review in work 1' });
       advanceClock(MINUTE);
       await runDurableObjectAlarm(pr.stub);
