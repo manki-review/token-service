@@ -1,6 +1,6 @@
 # Settings boxes
 
-Manki's progress comment carries the settings boxes, and the Worker applies their ticks. The Action renders the boxes that apply, and the Worker keys on each line's hidden id only, never on its label. The one block the Worker writes itself ends the [notice on a PR from a fork](coordinator.md#pull-requests-from-forks), with Review again and Deeper review, as the Action writes it:
+Manki's progress comment carries the settings boxes, and the Worker applies their ticks. The Action renders the boxes that apply, and the Worker keys on each line's hidden id only, never on its label. The one block the Worker writes itself ends the [notice on a PR from a fork](coordinator.md#pull-requests-from-forks), with Review now and Deeper review. The Action writes the boxes like this:
 
 ```
 - [ ] Pause automatic reviews <!-- manki-box:pause -->
@@ -10,6 +10,8 @@ Manki's progress comment carries the settings boxes, and the Worker applies thei
 - [ ] Review this draft <!-- manki-box:draft -->
 <!-- manki-settings -->
 ```
+
+The Review again box reads Review now on a PR Manki has not reviewed yet. Both labels end with the `again` id, so a tick of either is the same box, also in an older comment. A check summary cannot hold a box, so one that asks for a tick names both labels and says the box is on Manki's settings comment. The `/manki help` answer says "the review box", as Manki's own answer does.
 
 An `issue_comment.edited` delivery on a comment by one of Manki's logins that holds `<!-- manki-settings -->` goes to the settings lane. Only boxes whose tick differs between `changes.body.from` and the new body count, and Manki's own edits are dropped as a bot's. The editor's write access is looked up as for any comment, and reused for 5 minutes per login. Someone without it gets the changed boxes put back and changes nothing. A writer's change applies at once:
 

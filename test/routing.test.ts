@@ -300,6 +300,13 @@ describe('routeDelivery', () => {
       type: 'work',
       work: { lane: 'settings', kind: 'settings', event: 'issue_comment.edited', writer: false, acknowledge: false, boxes: [{ box: 'pause', ticked: true }, { box: 'again', ticked: false }] },
     });
+    // The marker names the box, so Review now before any review and Review again in an older comment tick the same box.
+    for (const label of ['Review now', 'Review again']) {
+      const body = SETTINGS_COMMENT.replace('Review again', label);
+      expect(routeDelivery('issue_comment', issueCommentEvent(body.replace(`[ ] ${label}`, `[x] ${label}`), { action: 'edited', author: MANKI_AUTHOR, previousBody: body }))).toMatchObject({
+        type: 'work', work: { boxes: [{ box: 'again', ticked: true }] },
+      });
+    }
     const deeper = '- [ ] Deeper review <!-- manki-box:deeper -->\n<!-- manki-settings -->';
     expect(routeDelivery('issue_comment', issueCommentEvent(deeper.replace('[ ]', '[x]'), { action: 'edited', author: MANKI_AUTHOR, previousBody: deeper }))).toMatchObject({
       type: 'work', work: { boxes: [{ box: 'deeper', ticked: true }] },
