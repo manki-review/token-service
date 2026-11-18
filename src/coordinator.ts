@@ -303,12 +303,15 @@ async function startsMankiThread(token: string, target: Target, id: number): Pro
   return MANKI_LOGINS.includes(user?.login ?? '') && (body ?? '').includes(MANKI_COMMENT_MARKER) && !in_reply_to_id;
 }
 
+// A check summary cannot hold the box, so it says where the box is and names both labels Manki gives it.
+const TICK_AGAIN = "Tick **Review now** or **Review again**, whichever Manki's settings comment shows,";
+
 /** Returns why a push waits out the pause, from the reported `reason` and the Pause box, and what reviews it. */
 function pausedSummary(reason: string | null, paused: boolean): string {
   const box = paused ? ' by the **Pause automatic reviews** box' : '';
   // While the Action's pause holds, unticking Pause alone reviews nothing.
-  const how = paused && reason === null ? 'Tick the review box or untick **Pause automatic reviews**' : 'Tick the review box';
-  return `${reason ? `${reason} ` : ''}Automatic review is paused${box}, so this commit waits. ${how} on Manki's settings comment to review it.`;
+  const how = paused && reason === null ? `${TICK_AGAIN} or untick **Pause automatic reviews** there,` : TICK_AGAIN;
+  return `${reason ? `${reason} ` : ''}Automatic review is paused${box}, so this commit waits. ${how} to review it.`;
 }
 
 // Each entry runs once, in order. Append new entries; never edit a shipped one.
@@ -387,7 +390,7 @@ function waitingCheckEnd(item: WorkRow, status: string, superseded: boolean): Ch
     return {
       conclusion: failed,
       title: 'Review did not run',
-      summary: `The review run ended without reviewing ${sha}. Tick the review box on Manki's settings comment to review it.`,
+      summary: `The review run ended without reviewing ${sha}. ${TICK_AGAIN} to review it.`,
     };
   }
   return { conclusion: 'cancelled', title: 'Review not started', summary: `Manki did not start the review of ${sha}: ${item.note ?? 'it was dropped'}.` };
