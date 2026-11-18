@@ -58,6 +58,7 @@ import {
   MANKI_AUTHOR,
   pullRequestEvent,
   REPOSITORY_ID,
+  REVIEW_ID,
   reviewCommentEvent,
   reviewEvent,
   reviewThreadEvent,
@@ -763,6 +764,8 @@ function fakeGitHub(number: number) {
     reviewComments: new Map<number, { user?: { login: string }; body?: string; in_reply_to_id?: number }>(),
     reviewCommentStatus: 200,
     reviewCommentReads: [] as number[],
+    /** The bodies of Manki's reviews by id, which an edit of a ticked box reads and writes. */
+    reviews: new Map<number, string>(),
     /** When a comment was posted, by default at the request. */
     commentCreated: new Map<number, string>(),
     commentListStatus: 200,
@@ -931,6 +934,17 @@ function fakeGitHub(number: number) {
       const id = Number(reviewComment[1]);
       state.reviewCommentReads.push(id);
       return Response.json(state.reviewComments.get(id) ?? { user: { login: 'bob' }, body: 'Why not a map?' }, { status: state.reviewCommentStatus });
+    }
+    if (reviewComment && request.method === 'PATCH') {
+      const id = Number(reviewComment[1]);
+      state.reviewComments.set(id, { ...state.reviewComments.get(id), body: ((await request.json()) as { body: string }).body });
+      return Response.json({});
+    }
+    const review = url.pathname.match(new RegExp(`^${repo}/pulls/${number}/reviews/(\\d+)$`));
+    if (review && request.method === 'GET') return Response.json({ body: state.reviews.get(Number(review[1])) });
+    if (review && request.method === 'PUT') {
+      state.reviews.set(Number(review[1]), ((await request.json()) as { body: string }).body);
+      return Response.json({});
     }
     const reaction = url.pathname.match(new RegExp(`^${repo}/(issues|pulls)/comments/(\\d+)/reactions$`));
     if (reaction && request.method === 'POST') {
@@ -3425,6 +3439,121 @@ describe('PrCoordinator dispatch', () => {
       expect(await state()).toMatchObject({ settings: { paused: true } });
       expect(github.permissionReads).toEqual(['mallory', 'alice']);
       expect(github.dispatches).toEqual([]);
+    });
+
+    /** A message of Manki's that names a step, with the box `box` below it, ticked when `ticked` holds it. */
+    const note = (box: string, label: string) => (ticked: string[] = []) => ['**Approval held:** comment `/manki review`.', '',
+      '<!-- manki-issue-box -->', `- [${ticked.includes(box) ? 'x' : ' '}] ${label} <!-- manki-box:${box} -->`, '', '<!-- manki -->'].join('\n');
+    const again = note('again', 'Review again');
+    const settled = (login: string) => again().replace('- [ ] Review again <!-- manki-box:again -->', `Review again requested by \`@${login}\``);
+
+    it('asks for a review on a writer\'s tick of a box in another message of Manki\'s, and puts back anyone else\'s tick', async () => {
+      const { pr, github, state, edit } = setup();
+      // Someone without write access gets the box put back, and nothing a settings tick would not give them.
+      await edit([], ['again'], 'mallory', new Date().toISOString(), again);
+      expect(github.issueComments.get(SETTINGS)).toBe(again());
+      expect((await workRows(pr.stub)).map((row) => [row.kind, row.status, row.note])).toEqual([['settings', 'skipped', 'commenter has no write access']]);
+      expect([github.dispatches, github.checkRuns, github.waitingChecks]).toEqual([[], [], []]);
+      expect(github.mints.flatMap((mint) => Object.keys(mint.permissions)).filter((name) => name === 'actions' || name === 'checks')).toEqual([]);
+
+      // A writer's Review again asks for one review of that message, and its run names who asked in place of the box.
+      await edit([], ['again'], 'alice', new Date().toISOString(), again);
+      expect(github.dispatches.map((dispatch) => dispatch.inputs)).toMatchObject([{ event: 'issue_comment', action: 'edited', comment_id: String(SETTINGS) }]);
+      expect(await state()).toMatchObject({ active: [{ kind: 'review', event: 'issue_comment.edited', modes: ['again'] }] });
+      expect(github.issueComments.get(SETTINGS)).toBe(again(['again']));
+      await pr.stub.runCompleted(key('d-again'), 9000, 'success');
+
+      // Any other box is dispatched as the edited comment, for a writer only. One tick is one item, and a redelivery adds none.
+      const check = note('check', 'Check approval');
+      await edit([], ['check'], 'mallory', new Date().toISOString(), check);
+      expect(github.issueComments.get(SETTINGS)).toBe(check());
+      const tick = { ...issueCommentEvent(check(['check']), { number: pr.number, action: 'edited', author: MANKI_AUTHOR, previousBody: check() }) };
+      github.issueComments.set(SETTINGS, check(['check']));
+      const ticked = { ...tick, comment: { ...tick.comment!, id: SETTINGS } };
+      expect(await pr.send('issue_comment', ticked, 'd-check')).toMatchObject({ accepted: true });
+      expect(await pr.send('issue_comment', ticked, 'd-check')).toEqual({ accepted: false, reason: 'duplicate delivery' });
+      await runDurableObjectAlarm(pr.stub);
+      expect(github.dispatches.map((dispatch) => dispatch.inputs).at(-1)).toMatchObject({ event: 'issue_comment', action: 'edited', comment_id: String(SETTINGS), delivery_id: 'd-check' });
+      expect(github.issueComments.get(SETTINGS)).toBe(check(['check']));
+      expect((await workRows(pr.stub)).slice(-2).map((row) => [row.lane, row.kind, row.status, row.note])).toEqual([
+        ['state', 'comment', 'skipped', 'commenter has no write access'],
+        ['state', 'comment', 'running', 'dispatched'],
+      ]);
+      expect(github.permissionReads).toEqual(['mallory', 'alice']);
+    });
+
+    it('settles a Review again tick in another message of Manki\'s that no run answers, and replaces a review of an old head', async () => {
+      const { pr, github, edit } = setup();
+      // A review command waits behind the settings lane, so the tick joins it and its run answers the command.
+      await pr.send('issue_comment', pr.comment('@manki review'));
+      await runInDurableObject(pr.stub, async (_instance, ctx) => {
+        ctx.storage.sql.exec(`UPDATE work SET check_at = ? WHERE kind = 'review'`, Date.now() + MINUTE);
+      });
+      await edit([], ['again'], 'alice', new Date().toISOString(), again);
+      expect(github.issueComments.get(SETTINGS)).toBe(settled('alice'));
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'done', note: 'again review in work 1' });
+      advanceClock(MINUTE);
+      await runDurableObjectAlarm(pr.stub);
+      expect(github.dispatches.map((dispatch) => dispatch.inputs)).toMatchObject([{ event: 'issue_comment', action: 'created', comment_id: String(COMMENT_ID) }]);
+
+      // The running review of the head answers the tick, so the box is put back for a later one.
+      await edit([], ['again'], 'alice', new Date().toISOString(), again);
+      expect(github.cancels).toEqual([]);
+      expect(github.issueComments.get(SETTINGS)).toBe(again());
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'settings', status: 'done', note: 'already reviewing 1111111' });
+
+      // Once the head moved, the tick replaces the running review with one of that message, whose run settles the box.
+      github.head = SHA_2;
+      await edit([], ['again'], 'alice', new Date().toISOString(), again);
+      expect(github.cancels).toEqual([9000]);
+      expect(github.dispatches.map((dispatch) => dispatch.inputs).at(-1)).toMatchObject({ event: 'issue_comment', action: 'edited', comment_id: String(SETTINGS) });
+      expect(github.issueComments.get(SETTINGS)).toBe(again(['again']));
+    });
+
+    it('puts back or settles a box ticked in Manki\'s review or review comment through the endpoints of each', async () => {
+      const { pr, github, state } = setup();
+      /** Delivers the edit of Manki's review or review comment from `before` to `after`, by `login` as the webhook names the editor. */
+      const tick = async (event: 'pull_request_review' | 'pull_request_review_comment', before: string, after: string, login: string) => {
+        const payload = event === 'pull_request_review'
+          ? { ...reviewEvent('edited', { user: MANKI_AUTHOR, node_id: 'PRR_1', body: after }, { number: pr.number }), sender: MANKI_AUTHOR }
+          : { ...reviewCommentEvent(after, { user: MANKI_AUTHOR }, 'edited', { number: pr.number }), sender: { login, type: 'User' } };
+        if (event === 'pull_request_review') github.reviews.set(REVIEW_ID, after);
+        else github.reviewComments.set(COMMENT_ID, { user: { login: 'manki-review[bot]' }, body: after });
+        const route = routeDelivery(event, { ...payload, changes: { body: { from: before } } });
+        if (route.type !== 'work') throw new Error(`Route ${route.type} is not for the coordinator`);
+        await pr.stub.receive(key(crypto.randomUUID()), { ...route, work: { ...route.work, sender: login } });
+        await runDurableObjectAlarm(pr.stub);
+        await runDurableObjectAlarm(pr.stub);
+      };
+      await tick('pull_request_review', again(), again(['again']), 'mallory');
+      expect(github.reviews.get(REVIEW_ID)).toBe(again());
+
+      await pr.send('issue_comment', pr.comment('@manki review'));
+      await runInDurableObject(pr.stub, async (_instance, ctx) => {
+        ctx.storage.sql.exec(`UPDATE work SET check_at = ? WHERE kind = 'review'`, Date.now() + MINUTE);
+      });
+      await tick('pull_request_review', again(), again(['again']), 'alice');
+      expect(github.reviews.get(REVIEW_ID)).toBe(settled('alice'));
+      advanceClock(MINUTE);
+      await runDurableObjectAlarm(pr.stub);
+      await pr.stub.runCompleted(key('d-command'), 9000, 'success');
+
+      // With no review queued, the tick asks for a review of Manki's review, whose run settles the box.
+      await tick('pull_request_review', again(), again(['again']), 'alice');
+      expect(github.dispatches.map((dispatch) => dispatch.inputs).at(-1)).toMatchObject({ event: 'pull_request_review', action: 'edited', review_id: String(REVIEW_ID) });
+      expect(await state()).toMatchObject({ active: [{ kind: 'review', event: 'pull_request_review.edited', modes: ['again'] }] });
+      expect(github.reviews.get(REVIEW_ID)).toBe(again(['again']));
+      await pr.stub.runCompleted(key('d-review'), 9001, 'success');
+
+      const dismiss = note('dismiss', 'Dismiss this finding');
+      await tick('pull_request_review_comment', dismiss(), dismiss(['dismiss']), 'mallory');
+      expect(github.reviewComments.get(COMMENT_ID)?.body).toBe(dismiss());
+      await tick('pull_request_review_comment', dismiss(), dismiss(['dismiss']), 'alice');
+      expect(github.dispatches.map((dispatch) => dispatch.inputs).at(-1)).toMatchObject({ event: 'pull_request_review_comment', action: 'edited', comment_id: String(COMMENT_ID) });
+      expect(github.reviewComments.get(COMMENT_ID)?.body).toBe(dismiss(['dismiss']));
+      expect((await workRows(pr.stub)).map((row) => [row.kind, row.status])).toEqual([
+        ['settings', 'skipped'], ['review', 'done'], ['settings', 'done'], ['settings', 'done'], ['review', 'done'], ['thread', 'skipped'], ['thread', 'running'],
+      ]);
     });
 
     it('ignores a Pause change older than the last one applied, such as a late redelivery, and still applies its other boxes', async () => {

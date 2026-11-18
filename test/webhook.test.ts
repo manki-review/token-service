@@ -248,6 +248,35 @@ describe('/webhook', () => {
     expect(await workRows(coordinator(REPOSITORY_ID, 75))).toEqual([]);
   });
 
+  it('looks up the editor of a box tick in another message of Manki\'s before it is queued, and queues a redelivery once', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const [writer, reader] = [newLogin(), newLogin()];
+    const editor = { login: writer, __typename: 'User' };
+    const graphql = vi.fn(async () => Response.json({ data: { node: { editor, userContentEdits: { nodes: [] } } } }));
+    const requests = stubGitHub({ permissions: { [writer]: 'write', [reader]: 'read' }, api: { 'POST /graphql': graphql } });
+    const box = (kind: string, label: string) => `Comment \`/manki check\`.\n\n<!-- manki-issue-box -->\n- [ ] ${label} <!-- manki-box:${kind} -->`;
+    const check = box('check', 'Check approval');
+    const tick = (login: string, number: number) => issueCommentEvent(check.replace('[ ]', '[x]'), {
+      number, action: 'edited', author: MANKI_AUTHOR, sender: { login, type: 'User' }, previousBody: check,
+    });
+    const delivery = crypto.randomUUID();
+    for (const _replay of [1, 2]) expect((await postWebhook({ event: 'issue_comment', payload: tick(writer, 76), delivery })).status).toBe(202);
+    expect((await postWebhook({ event: 'issue_comment', payload: tick(reader, 77) })).status).toBe(202);
+    expect(permissionReads(requests)).toEqual([writer, reader]);
+    expect(await workRows(coordinator(REPOSITORY_ID, 76))).toMatchObject([{ lane: 'state', kind: 'comment', sender: writer, writer: 1, trusted: 1 }]);
+    expect(await workRows(coordinator(REPOSITORY_ID, 77))).toMatchObject([{ kind: 'comment', sender: reader, writer: 0 }]);
+    // Review again in Manki's review names its editor first, as an issue box tick does.
+    const again = box('again', 'Review again');
+    const payload = {
+      ...reviewEvent('edited', { user: MANKI_AUTHOR, node_id: 'PRR_again', body: again.replace('[ ]', '[x]') }, { number: 78 }),
+      sender: MANKI_AUTHOR,
+      changes: { body: { from: again } },
+    };
+    expect((await postWebhook({ event: 'pull_request_review', payload })).status).toBe(202);
+    expect(graphql).toHaveBeenCalledTimes(1);
+    expect(await workRows(coordinator(REPOSITORY_ID, 78))).toMatchObject([{ lane: 'settings', kind: 'settings', event: 'pull_request_review.edited', sender: writer, writer: 1 }]);
+  });
+
   it('looks up no owner, reuses an answer and its token, and reads a failed lookup as no write access', async () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const login = newLogin();

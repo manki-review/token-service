@@ -5,7 +5,8 @@ import { githubApi, githubGraphql, hasWriteAccess, isRateLimited, isRefusal, typ
 import { log } from './log';
 import {
   autoReviewIsOn, type BaseConfig, BOT_LOGIN, boxLabels, type BoxChange, cancelledProgress, HELP_REPLY, isMankiGraphqlLogin, isRunningProgress, MANKI_COMMENT_MARKER,
-  MANKI_LOGINS, matchSkipRule, parseConfig, renderSettingsBlock, REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes, type SettingsBox, settingsHead, skipRulesOf, withSettingsStatus,
+  MANKI_LOGINS, matchSkipRule, type MessageTick, parseConfig, renderSettingsBlock, REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes, settleMessageBoxes,
+  type SettingsBox, settingsHead, skipRulesOf, withSettingsStatus,
 } from './manki';
 import { type OptIn, readOptIn, type Repository } from './opt-in';
 import type { Permissions } from './permissions';
@@ -129,7 +130,7 @@ export interface WorkRow extends Record<string, string | number | null> {
   writer: number;
   /** For a review, the JSON list of the modes the settings boxes asked for. Null for none. */
   modes: string | null;
-  /** For a settings edit, the JSON of its `SettingsEdit`. */
+  /** For a settings edit or a tick of a message box, the JSON of its `SettingsEdit`. */
   boxes: string | null;
   /** How often the item was queued again after its run never started or its workflow file was gone. */
   requeues: number;
@@ -265,13 +266,20 @@ export type ReportResult = { accepted: false; reason: string } | { accepted: tru
 
 const iso = (at: number) => new Date(at).toISOString();
 
-/** A settings edit as stored: the boxes it changed and the comment's edit time in milliseconds. */
+/**
+ * A settings edit as stored: the boxes it changed and the comment's edit time in milliseconds. An edit of another message
+ * of Manki's also names the message boxes it ticked.
+ */
 interface SettingsEdit {
   at: number;
   changes: BoxChange[];
+  ticks?: MessageTick[];
 }
 
 const editOf = (row: WorkRow): SettingsEdit => JSON.parse(row.boxes ?? '{"at":0,"changes":[]}') as SettingsEdit;
+
+/** Returns the issue comment `item` came from, or null for none, such as for a review or a review comment. */
+const issueCommentOf = (item: WorkRow): number | null => (item.event.startsWith('issue_comment.') ? item.object_id : null);
 
 const modesOf = (row: WorkRow): ReviewMode[] => (row.modes === null ? [] : JSON.parse(row.modes) as ReviewMode[]);
 
@@ -759,7 +767,9 @@ export class PrCoordinator extends DurableObject<Env> {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?) RETURNING id`,
       work.lane, work.kind, work.event, work.headSha, work.objectId, work.sender, delivery, now, Number(work.trusted), Number(work.writer),
       work.modes?.length ? JSON.stringify(work.modes) : null,
-      work.boxes ? JSON.stringify({ at: work.editedAt ?? 0, changes: work.boxes } satisfies SettingsEdit) : null,
+      work.boxes || work.ticks
+        ? JSON.stringify({ at: work.editedAt ?? 0, changes: work.boxes ?? [], ...(work.ticks && { ticks: work.ticks }) } satisfies SettingsEdit)
+        : null,
     ).one().id;
     return `work ${id}`;
   }
@@ -777,11 +787,11 @@ export class PrCoordinator extends DurableObject<Env> {
    * item, only a thread reply goes ahead of an older item, and nothing starts while an item is under way.
    */
   private enqueue(work: Work, delivery: string, now: number, after = 0): string {
-    if (work.event === 'issue_comment.edited' && work.objectId !== null && work.kind !== 'settings') {
+    if (work.event === 'issue_comment.edited' && work.objectId !== null && work.kind !== 'settings' && !work.ticks) {
       // The run reads the comment as it is then, so one queued item covers every edit of the comment. A settings edit
-      // carries its own box changes, so each one is applied.
+      // and a box tick carry their own boxes, so each one is applied or put back.
       const [same] = this.sql.exec<{ id: number }>(
-        `SELECT id FROM work WHERE status = 'queued' AND lane = ? AND kind = ? AND object_id = ? AND trusted = ? AND event LIKE 'issue_comment.%'`,
+        `SELECT id FROM work WHERE status = 'queued' AND lane = ? AND kind = ? AND object_id = ? AND trusted = ? AND event LIKE 'issue_comment.%' AND boxes IS NULL`,
         work.lane, work.kind, work.objectId, Number(work.trusted),
       ).toArray();
       if (same) {
@@ -1132,7 +1142,7 @@ export class PrCoordinator extends DurableObject<Env> {
         return;
       }
       if (!(await this.senderMayAsk(item))) {
-        if (item.kind === 'settings') await this.revertBoxes(item);
+        if (item.boxes !== null) await this.revertBoxes(item);
         if (this.isDispatching(item.id)) this.finish(item.id, 'skipped', 'commenter has no write access');
         return;
       }
@@ -1416,9 +1426,11 @@ export class PrCoordinator extends DurableObject<Env> {
    * minute before it edits the comment. A comment that is not Manki's settings comment is left alone.
    */
   private async showStarting(item: WorkRow, target: Target): Promise<void> {
+    const ticked = issueCommentOf(item);
+    if (ticked === null) return;
     const token = await this.token({ issues: 'write', pull_requests: 'write' });
-    if (token === null || item.object_id === null) return;
-    const path = `/repos/${target.owner}/${target.repo}/issues/comments/${item.object_id}`;
+    if (token === null) return;
+    const path = `/repos/${target.owner}/${target.repo}/issues/comments/${ticked}`;
     const read = await this.api(token, path);
     if (!read.ok) throw new Error(`reading the settings comment failed with ${read.status}`);
     const { body, user } = await read.json() as IssueCommentRead;
@@ -1509,8 +1521,8 @@ export class PrCoordinator extends DurableObject<Env> {
   /**
    * Handles a tick of a review box. While a review runs, Deeper review replaces it with a deeper one on the current
    * commit, and Review again replaces it only when the PR's head moved since it started. On the same head Review again
-   * leaves it running and says so in the status line. Without a running review, or when its head is unknown, the box
-   * asks for one review as before.
+   * leaves it running and says so in the status line, and a box in another message of Manki's is put back. Without a
+   * running review, or when its head is unknown, the box asks for one review as before.
    */
   private async reviewBox(item: WorkRow, mode: ReviewMode, at: number): Promise<string> {
     const running = mode === 'draft' ? undefined : this.runningReview(at);
@@ -1524,23 +1536,26 @@ export class PrCoordinator extends DurableObject<Env> {
       const pr = await this.api(token, `${repo}/pulls/${target.number}`);
       if (!pr.ok) throw new Error(`reading the pull request failed with ${pr.status}`);
       const head = ((await pr.json()) as PullRequestRead).head.sha;
-      const progress = await this.runningProgress(token, item.object_id, running, target);
+      const tickedId = issueCommentOf(item);
+      const progress = await this.runningProgress(token, tickedId, running, target);
       const reviewing = running.run_head ?? (progress && settingsHead(progress.body));
       if (!reviewing) return this.requestReview(item, mode);
       if (head.startsWith(reviewing)) {
         // The box may be ticked on another settings comment than the running review's, which then gets unticked too.
-        const ticked = item.object_id !== null && item.object_id !== progress?.id ? await this.readComment(token, repo, item.object_id) : null;
+        const message = editOf(item).ticks !== undefined;
+        const ticked = tickedId !== null && tickedId !== progress?.id && !message ? await this.readComment(token, repo, tickedId) : null;
         for (const comment of [progress, ticked]) {
           if (!comment) continue;
           const body = withSettingsStatus(comment.body, `already reviewing \`${head.slice(0, 7)}\``, ['again'], head);
           const edited = await this.api(token, `${repo}/issues/comments/${comment.id}`, { method: 'PATCH', body: { body } });
           if (!edited.ok) throw new Error(`showing the running review failed with ${edited.status}`);
         }
+        if (message) await this.settleTicks(item);
         return `already reviewing ${head.slice(0, 7)}`;
       }
     }
     const replaced = await this.cancelReview(item, at, mode === 'deeper' ? 'a deeper review' : 'a review of the new commits');
-    return `${replaced}, ${this.requestReview(item, mode)}`;
+    return `${replaced}, ${await this.requestReview(item, mode)}`;
   }
 
   /** Returns comment `id` of `repo` and whether one of Manki's logins wrote it, or null when it is gone. */
@@ -1561,9 +1576,10 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /**
    * Asks for one review with `mode`. The mode joins a review a writer already queued, and a queued push review becomes
-   * the box's review, so a pause, a skip rule or a draft cannot drop it. Otherwise a review is queued.
+   * the box's review, so a pause, a skip rule or a draft cannot drop it. Otherwise a review is queued. A box ticked in
+   * another message of Manki's that joins the review of another message gets no run of its own, so it is settled here.
    */
-  private requestReview(item: WorkRow, mode: ReviewMode): string {
+  private async requestReview(item: WorkRow, mode: ReviewMode): Promise<string> {
     const review = this.queued('state', ['review']).filter((row) => row.writer).at(-1);
     if (!review) {
       const work: Work = {
@@ -1580,6 +1596,7 @@ export class PrCoordinator extends DurableObject<Env> {
       );
     } else {
       this.sql.exec('UPDATE work SET modes = ? WHERE id = ?', modes, review.id);
+      if (review.event !== item.event || review.object_id !== item.object_id) await this.settleTicks(item, item.sender);
     }
     return `${mode} review in work ${review.id}`;
   }
@@ -1601,7 +1618,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const ended = this.row(running.id);
     if (ended?.status === 'skipped' && ended.conclusion === 'cancelled') {
       const headline = replacement ? `Review replaced by ${replacement} requested by \`@${item.sender}\`.` : `Review cancelled by \`@${item.sender}\`.`;
-      await this.reportStopped(running, target, item.object_id, 'Review cancelled', headline);
+      await this.reportStopped(running, target, issueCommentOf(item), 'Review cancelled', headline);
     }
     return `${replacement ? 'replacing' : 'cancel of'} work ${running.id} requested`;
   }
@@ -1703,21 +1720,52 @@ export class PrCoordinator extends DurableObject<Env> {
     return null;
   }
 
-  /** Puts back the boxes someone without write access changed: Pause as it applies, and every other box unticked. */
+  /**
+   * Puts back the boxes someone without write access changed: Pause as it applies, and every other box unticked. The
+   * message boxes of another message of Manki's are unticked.
+   */
   private async revertBoxes(item: WorkRow): Promise<void> {
+    const { changes, ticks } = editOf(item);
+    const { paused } = this.reported().settings;
+    await this.editTicked(item, (body) => (ticks
+      ? settleMessageBoxes(body, ticks)
+      : setBoxes(body, changes.map(({ box }) => ({ box, ticked: box === 'pause' && paused })))));
+  }
+
+  /**
+   * Settles the Review again box `item` ticked in another message of Manki's, since no run comes for that message: it
+   * names `editor` as who asked, as Manki does once the review starts, or without `editor` it is unticked. A failure is
+   * logged, since the review goes on either way.
+   */
+  private async settleTicks(item: WorkRow, editor?: string): Promise<void> {
+    const again = (editOf(item).ticks ?? []).filter(({ box }) => box === 'again');
+    if (again.length === 0) return;
+    await this.editTicked(item, (body) => settleMessageBoxes(body, again, editor)).catch((error: unknown) => {
+      log('coordinator_box_settle_failed', { ...this.logFields(), work_id: item.id, error: error instanceof Error ? error.message : String(error) });
+    });
+  }
+
+  /**
+   * Rewrites with `change` the comment, review or review comment whose edit `item` is, when that changes it. A message
+   * that is gone is left alone. Throws on any other failure.
+   */
+  private async editTicked(item: WorkRow, change: (body: string) => string): Promise<void> {
     const target = await this.verifiedTarget();
     if (!target) throw new Error('the repository could not be read');
     const token = await this.token({ issues: 'write', pull_requests: 'write' });
     if (token === null || item.object_id === null) return;
-    const path = `/repos/${target.owner}/${target.repo}/issues/comments/${item.object_id}`;
+    const repo = `/repos/${target.owner}/${target.repo}`;
+    const [path, method] = item.event.startsWith('pull_request_review.') ? [`${repo}/pulls/${target.number}/reviews/${item.object_id}`, 'PUT']
+      : item.event.startsWith('pull_request_review_comment.') ? [`${repo}/pulls/comments/${item.object_id}`, 'PATCH']
+        : [`${repo}/issues/comments/${item.object_id}`, 'PATCH'];
     const read = await this.api(token, path);
-    if (!read.ok) throw new Error(`reading the settings comment failed with ${read.status}`);
-    const { body } = await read.json() as { body?: string };
-    const { paused } = this.reported().settings;
-    const reverted = setBoxes(body ?? '', editOf(item).changes.map(({ box }) => ({ box, ticked: box === 'pause' && paused })));
-    if (reverted === body) return;
-    const response = await this.api(token, path, { method: 'PATCH', body: { body: reverted } });
-    if (!response.ok) throw new Error(`reverting the settings comment failed with ${response.status}`);
+    if (read.status === 404) return;
+    if (!read.ok) throw new Error(`reading the ticked message failed with ${read.status}`);
+    const body = ((await read.json()) as { body?: string | null }).body ?? '';
+    const changed = change(body);
+    if (changed === body) return;
+    const response = await this.api(token, path, { method, body: { body: changed } });
+    if (!response.ok) throw new Error(`editing the ticked message failed with ${response.status}`);
   }
 
   /** Answers a help command with Manki's command table and a thumbs-up on the command, with no run. */
@@ -1908,9 +1956,10 @@ export class PrCoordinator extends DurableObject<Env> {
   private async reportYielded(item: WorkRow, head: string, reviewed: number, target: Target): Promise<void> {
     try {
       const told = `${head}:${reviewed}`;
-      const shown = await this.showStatus(head, target, `not reviewed, #${reviewed} has the same head commit`, modesOf(item), item.object_id);
+      const ticked = issueCommentOf(item);
+      const shown = await this.showStatus(head, target, `not reviewed, #${reviewed} has the same head commit`, modesOf(item), ticked);
       // A comment that asked and is not a settings comment is a review command.
-      const command = item.object_id !== null && !shown.includes(item.object_id);
+      const command = ticked !== null && !shown.includes(ticked);
       if (command || (shown.length === 0 && this.getMeta<string>('yielded') !== told)) {
         const note = `Manki reviews one pull request per commit. #${reviewed} has the same head commit \`${head.slice(0, 7)}\` and the lower number, so Manki reviews #${reviewed} and not this pull request. `
           + `The \`Manki\` check shown here is the one of #${reviewed}. To have this pull request reviewed, close #${reviewed} and comment \`/manki review\` here, or push a commit that only this pull request has.`;

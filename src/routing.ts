@@ -8,10 +8,12 @@ import {
   isReviewRequest,
   MANKI_COMMENT_MARKER,
   MANKI_LOGINS,
+  type MessageTick,
   parseCommandType,
   type ReviewMode,
   SETTINGS_MARKER,
   tickedIssueBoxes,
+  tickedMessageBoxes,
 } from './manki';
 
 /** A comment event older than this when it arrives, such as a late redelivery, is dropped. */
@@ -101,6 +103,11 @@ export interface Work {
   modes?: ReviewMode[];
   /** For a settings edit, the boxes it ticked or unticked. */
   boxes?: BoxChange[];
+  /**
+   * For an edit of Manki's comment, review or review comment, the boxes it ticked outside the settings block. They are
+   * put back when the editor lacks write access.
+   */
+  ticks?: MessageTick[];
   /** For a settings edit, when the comment was edited, so a late delivery cannot undo a newer edit. */
   editedAt?: number;
   /**
@@ -339,19 +346,37 @@ function routeReview(target: Target, payload: WebhookPayload): Route {
 }
 
 /**
- * Routes an edit of Manki's review that ticks a finding's issue box. The sender is left to the editor lookup, and the
- * editor must have write access. Manki's own rewrite of its review ticks no box, so it is dropped here.
+ * Routes an edit of Manki's review that ticks a finding's issue box or a message box. The sender is left to the editor
+ * lookup, and the editor must have write access. Manki's own rewrite of its review ticks no box, so it is dropped here.
  */
 function routeReviewBoxTick(target: Target, payload: WebhookPayload): Route {
-  const before = payload.changes?.body?.from;
-  if (before === undefined || tickedIssueBoxes(before, payload.review?.body ?? '').length === 0) return ignore('no issue box ticked');
+  const tick = boxTick(payload, 'pull_request_review', payload.review?.id ?? null, payload.review?.body ?? '', 'thread');
+  if (!tick) return ignore('no box ticked');
   if (isForkHead(payload)) return ignore('head is on a fork');
   const nodeId = payload.review?.node_id;
   if (!nodeId) return ignore('review lacks its node id');
-  return { type: 'work', target, work: {
-    ...work('state', 'thread', payload, 'pull_request_review', payload.review?.id ?? null),
-    sender: '', acknowledge: false, writer: false, checkWriter: true, editorOf: nodeId,
-  } };
+  return { type: 'work', target, work: { ...tick, sender: '', editorOf: nodeId } };
+}
+
+/**
+ * Returns the work of an edit of Manki's comment, review or review comment that ticks a message box, or a finding's
+ * issue box in a review or review comment (`thread`). Null when the edit ticks none. A Review again tick asks for a
+ * review as the settings box does, so it goes to the settings lane. Any other tick is dispatched as the edited object,
+ * on the lane of its command. The editor's write access is looked up before the work counts.
+ */
+function boxTick(payload: WebhookPayload, event: string, objectId: number | null, body: string, kind: 'thread' | 'comment'): Work | null {
+  const before = payload.changes?.body?.from;
+  if (before === undefined) return null;
+  const ticks = tickedMessageBoxes(before, body);
+  if (ticks.length === 0 && (kind === 'comment' || tickedIssueBoxes(before, body).length === 0)) return null;
+  const again = ticks.some(({ box }) => box === 'again');
+  const lane: Lane = kind === 'comment' && ticks.every(({ box }) => box === 'forget') ? 'chat' : 'state';
+  return {
+    ...(again ? work('settings', 'settings', payload, event, objectId) : work(lane, kind, payload, event, objectId)),
+    acknowledge: false, writer: false, checkWriter: true,
+    ...(ticks.length > 0 && { ticks }),
+    ...(again && { boxes: [{ box: 'again', ticked: true }], editedAt: Date.parse(payload.comment?.updated_at ?? '') || 0 }),
+  };
 }
 
 /**
@@ -368,13 +393,9 @@ function routeReviewThread(target: Target, payload: WebhookPayload): Route {
 function routeReviewComment(target: Target, payload: WebhookPayload): Route {
   const { action, comment } = payload;
   const body = comment?.body ?? '';
-  // A tick of a finding's issue box in Manki's comment. The editor is looked up, so a writer's tick is trusted work.
   if (action === 'edited' && MANKI_LOGINS.includes(comment?.user?.login ?? '')) {
-    const before = payload.changes?.body?.from;
-    if (before === undefined || tickedIssueBoxes(before, body).length === 0) return ignore('no issue box ticked');
-    return { type: 'work', target, work: {
-      ...work('state', 'thread', payload, 'pull_request_review_comment', comment?.id ?? null), acknowledge: false, writer: false, checkWriter: true,
-    } };
+    const tick = boxTick(payload, 'pull_request_review_comment', comment?.id ?? null, body, 'thread');
+    return tick ? { type: 'work', target, work: tick } : ignore('no box ticked');
   }
   if (action !== 'created') return ignore(`pull_request_review_comment action ${action}`);
   if (comment?.user?.type === 'Bot' || body.includes(MANKI_COMMENT_MARKER)) return ignore('comment is from a bot');
@@ -394,8 +415,13 @@ function routeIssueComment(target: Target, payload: WebhookPayload): Route {
   const objectId = comment?.id ?? null;
   const onPullRequest = Boolean(payload.issue?.pull_request);
 
+  const mankis = onPullRequest && action === 'edited' && MANKI_LOGINS.includes(comment?.user?.login ?? '');
+  // A box below a next step in any other comment of Manki's. Manki's text can name a command, so the box goes first.
+  const tick = mankis && !body.includes(SETTINGS_MARKER) ? boxTick(payload, 'issue_comment', objectId, body, 'comment') : null;
+  if (tick) return { type: 'work', target, work: tick };
+
   // Only the box ticks matter. Editing Manki's comment takes write access, which the coordinator checks for the editor.
-  if (onPullRequest && action === 'edited' && MANKI_LOGINS.includes(comment?.user?.login ?? '') && body.includes(SETTINGS_MARKER)) {
+  if (mankis && body.includes(SETTINGS_MARKER)) {
     const before = payload.changes?.body?.from;
     const boxes = before === undefined ? [] : changedBoxes(before, body);
     if (boxes.length === 0) return ignore('no settings box changed');
