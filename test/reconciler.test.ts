@@ -737,6 +737,76 @@ describe('Reconciler catch-up', () => {
     expect(logged(log, 'reconciler_caught_up')).toHaveLength(2);
   });
 
+  it('waits for the time a review that limits stopped names, then catches the head up once', async () => {
+    const { stub, repo } = setup();
+    const target = repo();
+    await stub.recordOptIn(target, true);
+    const github = fakeGitHub();
+    github.pulls.set(target.repo, [pull(1, SHA_1, { repo: target.repo })]);
+    const lifts = new Date(Date.now() + 120 * MINUTE).toISOString();
+    const incomplete = (after: string) => `Review incomplete.\n${RECORD}\n\n${reviewedLine(SHA_1)}\n\n<!-- manki-bot -->\n<!-- manki-no-verdict -->\n<!-- manki-retry-after: ${after} -->`;
+    github.reviews.set(`${target.repo}#1`, [{ author: 'manki-review', oid: SHA_1, body: incomplete(lifts) }]);
+
+    await stub.reconcile();
+    expect(logged(log, 'reconciler_caught_up')).toEqual([]);
+    expect(logged(log, 'reconciler_catch_up_waits')).toMatchObject([{ pr: 1, head_sha: SHA_1, retry_after: lifts }]);
+    // The passes before then ask neither the coordinator nor GitHub about the head again.
+    const calls = github.graphqlCalls;
+    advanceClock(119 * MINUTE);
+    await stub.reconcile();
+    expect([github.graphqlCalls, logged(log, 'reconciler_caught_up')]).toEqual([calls, []]);
+
+    advanceClock(2 * MINUTE);
+    await stub.reconcile();
+    expect(logged(log, 'reconciler_caught_up')).toMatchObject([{ pr: 1, head_sha: SHA_1, accepted: true }]);
+    // The retry ends without a verdict too, and the head is not caught up again that day.
+    await runDurableObjectAlarm(coordinator(target.repositoryId, 1));
+    advanceClock(60 * MINUTE);
+    await stub.reconcile();
+    expect(logged(log, 'reconciler_caught_up')).toHaveLength(1);
+  });
+
+  it.each([
+    ['a time that has passed', (now: number) => `\n<!-- manki-retry-after: ${new Date(now - MINUTE).toISOString()} -->`],
+    ['a time that does not parse', () => '\n<!-- manki-retry-after: tomorrow -->'],
+    ['a time above the record, which quotes it', (now: number) => `\n<!-- manki-retry-after: ${new Date(now + 60 * MINUTE).toISOString()} -->`, true],
+  ])('catches up at once a head whose review names %s', async (_case, marker, quoted = false) => {
+    const { stub, repo } = setup();
+    const target = repo();
+    await stub.recordOptIn(target, true);
+    const github = fakeGitHub();
+    github.pulls.set(target.repo, [pull(1, SHA_1, { repo: target.repo })]);
+    const line = marker(Date.now());
+    const body = quoted
+      ? `Review incomplete.${line}\n${RECORD}\n\n${reviewedLine(SHA_1)}\n\n<!-- manki-no-verdict -->`
+      : `Review incomplete.\n${RECORD}\n\n${reviewedLine(SHA_1)}\n\n<!-- manki-no-verdict -->${line}`;
+    github.reviews.set(`${target.repo}#1`, [{ author: 'manki-review', oid: SHA_1, body }]);
+    await stub.reconcile();
+    expect(logged(log, 'reconciler_caught_up')).toMatchObject([{ pr: 1, head_sha: SHA_1, accepted: true }]);
+  });
+
+  it('reads the time only from Manki\'s newest review of the head, and waits at most a day', async () => {
+    const { stub, repo } = setup();
+    const target = repo();
+    await stub.recordOptIn(target, true);
+    const github = fakeGitHub();
+    github.pulls.set(target.repo, [pull(1, SHA_1, { repo: target.repo }), pull(2, SHA_1, { repo: target.repo })]);
+    const incomplete = (marker = '') => `Review incomplete.\n${RECORD}\n\n${reviewedLine(SHA_1)}\n\n<!-- manki-no-verdict -->${marker}`;
+    const far = new Date(Date.now() + 3 * CATCH_UP_WINDOW_MS).toISOString();
+    github.reviews.set(`${target.repo}#1`, [
+      { author: 'manki-review', oid: SHA_1, body: incomplete(`\n<!-- manki-retry-after: ${far} -->`) },
+      { author: 'manki-review', oid: SHA_1, body: incomplete() },
+    ]);
+    github.reviews.set(`${target.repo}#2`, [{ author: 'manki-review', oid: SHA_1, body: incomplete(`\n<!-- manki-retry-after: ${far} -->`) }]);
+
+    await stub.reconcile();
+    expect(logged(log, 'reconciler_caught_up')).toMatchObject([{ pr: 1, accepted: true }]);
+    expect(logged(log, 'reconciler_catch_up_waits')).toMatchObject([{ pr: 2, retry_after: far }]);
+    const waiting = await runInDurableObject(stub, (_instance, state) =>
+      state.storage.sql.exec<{ checked_at: number }>('SELECT checked_at FROM checked_heads WHERE number = 2').one().checked_at);
+    expect(waiting).toBe(Date.now());
+  });
+
   it('with dispatch on, ends a caught-up review whose run never finishes and catches the head up a day later', async () => {
     setDispatchEnabled(true);
     const { stub, repo } = setup();

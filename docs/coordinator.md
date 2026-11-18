@@ -41,6 +41,10 @@ A lane stays busy until the `workflow_run` webhook reports the run's end. A poll
 
 A token mint that fails with a 5xx, a 429, a rate limit or a network error is retried with the same backoff as a failed start. A failed start is retried after 2, 4, 8 and then every 16 minutes. An item with no dispatch attempt waits for it in the queue, so a newer push merges into it instead of queueing behind it. Only a 403 that is no rate limit (by its headers or its message), a 404 or a 422 counts as a refusal. Failed dispatches retry after 15 seconds, 1 minute and 5 minutes, and a retry first looks for a run the earlier attempt started.
 
+## The automatic retry of a review
+
+A review that ends incomplete or fails leaves its head without a Manki review, so the cron's catch-up queues one more review of it (see [the reconciler](reconciler.md)), at most once a day per head. When limits stopped the review and Manki named the time they lift, the catch-up waits until then. The catch-up stores its item under the delivery id `catch-up-` followed by the first 12 characters of the head, and the dispatch sends it as `delivery_id`. Manki reads that id to tell the run is the retry: its progress comment and its review say "Started automatically, since no review of this commit had finished.", and the incomplete review of a push says beforehand that the retry follows. A push that arrives before the retry starts takes the item over with its own delivery id, so that run reads as a push review.
+
 ## Trust
 
 A comment or review counts as trusted when its author's `author_association` is `OWNER`, `MEMBER`, `COLLABORATOR` or `CONTRIBUTOR`, or its sender opened the PR, as Manki's own check decides it. An outsider's review never replaces the trigger of a trusted review state check, and a review whose sender is not known as a writer never replaces a writer's. A writer's review or thread change takes over a trigger not known as a writer's, so the check never runs under the name of a sender the lookup would refuse. An untrusted review request queues on its own and never merges with a push review.

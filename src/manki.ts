@@ -78,6 +78,20 @@ export function reviewedCommit(body: string): string | undefined {
   return undefined;
 }
 
+/** Opens the marker of a Manki review without a verdict that limits stopped. It holds the time at which they lift. */
+const RETRY_AFTER_OPENER = '<!-- manki-retry-after: ';
+/** The time in the marker, as JavaScript's `toISOString` writes it. */
+const RETRY_AFTER_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+/**
+ * Returns when the limits that stopped the Manki review `body` lift, in milliseconds since the epoch, or `undefined` when
+ * Manki itself named no such time. Manki's `postReview` writes the marker on a review without a verdict.
+ */
+export function retryAfter(body: string): number | undefined {
+  const time = ownLines(body).map((line) => markerText(line, RETRY_AFTER_OPENER)).filter((text) => text !== undefined).at(-1);
+  return time && RETRY_AFTER_TIME.test(time) ? Date.parse(time) : undefined;
+}
+
 /** The answer to a help command, as Manki's `handleHelp` posts it. */
 export const HELP_REPLY = [
   '| Command | What it does |',
