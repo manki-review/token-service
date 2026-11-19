@@ -39,6 +39,7 @@ const FAILED_WRITES = new Set([
   'coordinator_waiting_check_failed',
   'coordinator_reaction_failed',
   'coordinator_reaction_error',
+  'coordinator_refusal_reply_failed',
 ]);
 
 /** The messages the window query reads, besides timed out items and any line with a 5xx status or error. */

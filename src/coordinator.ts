@@ -128,6 +128,8 @@ export interface WorkRow extends Record<string, string | number | null> {
   trusted: number;
   /** 1 when the payload shows the sender has write access. A comment item with 0 has its sender looked up before it starts. */
   writer: number;
+  /** Mirrors `Work.acknowledge`: 1 when the item comes from a Manki command its sender wrote. */
+  own_command: number;
   /** For a review, the JSON list of the modes the settings boxes asked for. Null for none. */
   modes: string | null;
   /** For a settings edit or a tick of a message box, the JSON of its `SettingsEdit`. */
@@ -362,6 +364,7 @@ export const MIGRATIONS = [
    ALTER TABLE work ADD COLUMN check_head TEXT;
    ALTER TABLE work ADD COLUMN check_ref TEXT;
    ALTER TABLE work ADD COLUMN check_own INTEGER NOT NULL DEFAULT 0;`,
+  `ALTER TABLE work ADD COLUMN own_command INTEGER NOT NULL DEFAULT 0;`,
 ];
 
 const ACTIVE = `status IN ('dispatching', 'running')`;
@@ -625,7 +628,9 @@ export class PrCoordinator extends DurableObject<Env> {
       }
       // The cron leaves the head of a bot's push alone, whatever becomes of the item.
       if (route.work.kind === 'bot_push') this.setMeta('bot_head', route.work.headSha);
-      if ((route.work.acknowledge || route.work.repliesTo !== undefined) && route.work.writer && route.work.objectId !== null) {
+      // A help gets a thumbs-up with its answer instead.
+      const acknowledged = route.work.acknowledge && route.work.kind !== 'help';
+      if ((acknowledged || route.work.repliesTo !== undefined) && route.work.writer && route.work.objectId !== null) {
         const reaction: PendingReaction = {
           comments: route.work.event.startsWith('pull_request_review_comment.') ? 'pulls' : 'issues',
           commentId: route.work.objectId,
@@ -766,9 +771,10 @@ export class PrCoordinator extends DurableObject<Env> {
 
   private insert(work: Work, delivery: string, now: number): string {
     const id = this.sql.exec<{ id: number }>(
-      `INSERT INTO work (lane, kind, event, head_sha, object_id, sender, delivery, enqueued_at, status, trusted, writer, modes, boxes)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?) RETURNING id`,
+      `INSERT INTO work (lane, kind, event, head_sha, object_id, sender, delivery, enqueued_at, status, trusted, writer, own_command, modes, boxes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?) RETURNING id`,
       work.lane, work.kind, work.event, work.headSha, work.objectId, work.sender, delivery, now, Number(work.trusted), Number(work.writer),
+      Number(work.acknowledge),
       work.modes?.length ? JSON.stringify(work.modes) : null,
       work.boxes || work.ticks
         ? JSON.stringify({ at: work.editedAt ?? 0, changes: work.boxes ?? [], ...(work.ticks && { ticks: work.ticks }) } satisfies SettingsEdit)
@@ -799,8 +805,8 @@ export class PrCoordinator extends DurableObject<Env> {
       ).toArray();
       if (same) {
         this.sql.exec(
-          'UPDATE work SET event = ?, sender = ?, delivery = ?, writer = ? WHERE id = ?',
-          work.event, work.sender, delivery, Number(work.writer), same.id,
+          'UPDATE work SET event = ?, sender = ?, delivery = ?, writer = ?, own_command = ? WHERE id = ?',
+          work.event, work.sender, delivery, Number(work.writer), Number(work.acknowledge), same.id,
         );
         return `merged into work ${same.id}`;
       }
@@ -826,8 +832,8 @@ export class PrCoordinator extends DurableObject<Env> {
       } else if (queuedPush) {
         // A review request takes over the queued push review and keeps its place.
         this.sql.exec(
-          'UPDATE work SET event = ?, head_sha = COALESCE(?, head_sha), object_id = ?, sender = ?, delivery = ? WHERE id = ?',
-          work.event, work.headSha, work.objectId, work.sender, delivery, review.id,
+          'UPDATE work SET event = ?, head_sha = COALESCE(?, head_sha), object_id = ?, sender = ?, delivery = ?, own_command = ? WHERE id = ?',
+          work.event, work.headSha, work.objectId, work.sender, delivery, Number(work.acknowledge), review.id,
         );
       } else if (work.event === REVIEW_COMMAND_EVENT) {
         // Manki reads the head when the run starts, so a queued review command answers every later one. The item names the
@@ -835,7 +841,10 @@ export class PrCoordinator extends DurableObject<Env> {
         // with a dispatch attempt keeps its delivery id, which `findRun` looks for in the run title.
         const command = reviews.filter((row) => row.event === REVIEW_COMMAND_EVENT && row.attempts === 0).at(-1);
         if (!command) return `queued ${this.insert(work, delivery, now)}`;
-        this.sql.exec('UPDATE work SET object_id = ?, sender = ?, delivery = ? WHERE id = ?', work.objectId, work.sender, delivery, command.id);
+        this.sql.exec(
+          'UPDATE work SET object_id = ?, sender = ?, delivery = ?, own_command = ? WHERE id = ?',
+          work.objectId, work.sender, delivery, Number(work.acknowledge), command.id,
+        );
         return `merged into work ${command.id}`;
       } else {
         // Each tick, and each review request made by an edit, is answered on its own, so one never hides another.
@@ -857,9 +866,9 @@ export class PrCoordinator extends DurableObject<Env> {
         const review = work.event.startsWith('pull_request_review.');
         if ((review && (work.trusted || !check.trusted) && (work.writer || !check.writer)) || (work.writer && !check.writer)) {
           this.sql.exec(
-            `UPDATE work SET event = ?, head_sha = ?, object_id = ?, sender = ?, delivery = ?, trusted = MAX(trusted, ?), writer = MAX(writer, ?)
-             WHERE id = ?`,
-            work.event, work.headSha, work.objectId, work.sender, delivery, Number(work.trusted), Number(work.writer), check.id,
+            `UPDATE work SET event = ?, head_sha = ?, object_id = ?, sender = ?, delivery = ?, trusted = MAX(trusted, ?), writer = MAX(writer, ?),
+             own_command = ? WHERE id = ?`,
+            work.event, work.headSha, work.objectId, work.sender, delivery, Number(work.trusted), Number(work.writer), Number(work.acknowledge), check.id,
           );
         } else if (work.trusted && !check.trusted) {
           this.sql.exec('UPDATE work SET trusted = 1 WHERE id = ?', check.id);
@@ -1146,6 +1155,7 @@ export class PrCoordinator extends DurableObject<Env> {
       }
       if (!(await this.senderMayAsk(item))) {
         if (item.boxes !== null) await this.revertBoxes(item);
+        else await this.answerRefusal(item);
         if (this.isDispatching(item.id)) this.finish(item.id, 'skipped', 'commenter has no write access');
         return;
       }
@@ -1769,6 +1779,32 @@ export class PrCoordinator extends DurableObject<Env> {
     if (changed === body) return;
     const response = await this.api(token, path, { method, body: { body: changed } });
     if (!response.ok) throw new Error(`editing the ticked message failed with ${response.status}`);
+  }
+
+  /**
+   * Tells the sender of a Manki command refused for lack of write access why nothing happens, once per sender on the
+   * PR. Only a command in a comment the sender wrote is answered, so a plain thread reply or an edit of someone else's
+   * comment gets no reply. A failure is only logged, since the command is refused either way.
+   */
+  private async answerRefusal(item: WorkRow): Promise<void> {
+    const anchor = item.event.startsWith('issue_comment.') ? 'issuecomment-' : item.event.startsWith('pull_request_review_comment.') ? 'discussion_r' : null;
+    const sender = item.sender.toLowerCase();
+    const told = this.getMeta<string[]>('refused') ?? [];
+    if (!item.own_command || anchor === null || item.object_id === null || sender === '' || told.includes(sender)) return;
+    try {
+      const target = await this.verifiedTarget();
+      if (!target) return;
+      const token = await this.token({ issues: 'write', pull_requests: 'write' });
+      if (token === null || !this.isDispatching(item.id)) return;
+      const url = `https://github.com/${target.owner}/${target.repo}/issues/${target.number}#${anchor}${item.object_id}`;
+      const reply = `@${item.sender} Manki takes commands only from people with write access to this repository, so it did not act on [your comment](${url}). Someone with write access can post the command instead.`;
+      // No answer marker: a writer's later edit of the refused comment must still run it.
+      const response = await this.api(token, `/repos/${target.owner}/${target.repo}/issues/${target.number}/comments`, { method: 'POST', body: { body: reply } });
+      if (!response.ok) throw new Error(`posting the reply failed with ${response.status}`);
+      this.setMeta('refused', [...(this.getMeta<string[]>('refused') ?? []), sender]);
+    } catch (error) {
+      log('coordinator_refusal_reply_failed', { ...this.logFields(), work_id: item.id, sender: item.sender, error: String(error) });
+    }
   }
 
   /** Answers a help command with Manki's command table and a thumbs-up on the command, with no run. */
