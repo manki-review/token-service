@@ -86,15 +86,15 @@ const NO_VERDICT_MARKER = '<!-- manki-no-verdict -->';
 
 /**
  * Whether the account `sender`, with user id `senderId`, is on the allow list of the repository. It is asked each time,
- * so a removal counts at once. A failure reads as no.
+ * so a removal counts at once. Returns null when the list cannot be read, which a caller reads as no.
  */
-export async function isAllowedSender(env: Env, repositoryId: number, sender: string, senderId: number | null | undefined): Promise<boolean> {
+export async function isAllowedSender(env: Env, repositoryId: number, sender: string, senderId: number | null | undefined): Promise<boolean | null> {
   if (senderId === null || senderId === undefined || sender === '') return false;
   try {
     return await env.RECONCILER.getByName(RECONCILER_NAME).isAllowedAccount(repositoryId, senderId, sender);
   } catch (error) {
     log('allow_list_check_failed', { repository_id: repositoryId, sender, error: String(error) });
-    return false;
+    return null;
   }
 }
 

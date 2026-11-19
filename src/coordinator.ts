@@ -1491,7 +1491,7 @@ export class PrCoordinator extends DurableObject<Env> {
     if (writer) return true;
     // The allow list is asked each time, so a removal counts at once.
     this.calls++;
-    return isAllowedSender(this.env, this.target().repositoryId, item.sender, item.sender_id);
+    return await isAllowedSender(this.env, this.target().repositoryId, item.sender, item.sender_id) === true;
   }
 
   /**

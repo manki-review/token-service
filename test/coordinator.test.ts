@@ -2473,7 +2473,9 @@ describe('PrCoordinator dispatch', () => {
     expect(await lastNote()).toBe('allowed otto');
     expect(github.issueComments.get(REFUSAL)).toContain('- [x] Allow @otto');
 
-    // The allowed account's command counts as a writer's: it gets the eyes reaction and its run.
+    // The allowed account's command counts as a writer's: it gets the eyes reaction and its run. The webhook handler
+    // reuses its earlier "not allowed" answer for 5 minutes, so only a comment after that gets the reaction.
+    advanceClock(5 * MINUTE + 1);
     await comment('otto', '/manki explain');
     expect(github.dispatches.map((dispatch) => dispatch.inputs.comment_id)).toEqual(['7002']);
     expect(github.reactions).toEqual(['issues/7002']);

@@ -15,6 +15,8 @@ const DELIVERY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 const WRITER_CACHE_MS = 5 * 60_000;
 const MAX_CACHED_WRITERS = 10_000;
 const writers = new Map<string, { writer: boolean; until: number }>();
+/** Until when the allow list said no to an account, by repository and user id. */
+const notAllowed = new Map<string, number>();
 /** The read-only tokens of the lookups, by installation and repository. Kept in memory only, never logged. */
 const lookupTokens = new Map<string, { token: string; expiresAt: number }>();
 /** A token is minted again this long before it expires, so a lookup never uses one that runs out midway. */
@@ -56,6 +58,21 @@ async function isWriter(env: Env, target: Target, login: string): Promise<boolea
   }
 }
 
+/**
+ * Whether the sender of `work` is on the allow list of the target's repository. A no is reused for `WRITER_CACHE_MS`
+ * within one isolate, and a yes or a failed read never is. So a cached no can delay an allow but never a removal.
+ */
+async function isAllowed(env: Env, target: Target, work: Work): Promise<boolean> {
+  const key = `${target.repositoryId}:${work.senderId}`;
+  if ((notAllowed.get(key) ?? 0) > Date.now()) return false;
+  const allowed = await isAllowedSender(env, target.repositoryId, work.sender, work.senderId);
+  if (allowed === false && work.senderId !== undefined) {
+    if (notAllowed.size >= MAX_CACHED_WRITERS) notAllowed.clear();
+    notAllowed.set(key, Date.now() + WRITER_CACHE_MS);
+  }
+  return allowed === true;
+}
+
 interface Editor {
   login: string;
   __typename: string;
@@ -94,7 +111,7 @@ async function editedWork(env: Env, target: Target, work: Work, receivedAt: numb
  */
 async function checkedWork(env: Env, target: Target, work: Work): Promise<Work> {
   if (!work.checkWriter) return work;
-  const writer = work.sender !== '' && (await isWriter(env, target, work.sender) || await isAllowedSender(env, target.repositoryId, work.sender, work.senderId));
+  const writer = work.sender !== '' && (await isWriter(env, target, work.sender) || await isAllowed(env, target, work));
   return { ...work, writer, trusted: work.trusted || writer, checkWriter: false };
 }
 
