@@ -26,6 +26,7 @@ describe('findings', () => {
       // A waiting check GitHub forbids to end stays queued, and one that is gone leaves nothing.
       event(24.5, { msg: 'coordinator_waiting_check_refused', work_id: 8, check_id: 500, status: 403 }),
       event(24.6, { msg: 'coordinator_waiting_check_refused', work_id: 9, check_id: 501, status: 404 }),
+      event(24.2, { msg: 'coordinator_refusal_reply_failed', work_id: 10, error: 'Error: posting the reply failed with 403' }),
     ];
     expect(findings(signals, [], NOW, PUBLIC)).toEqual([
       {
@@ -38,13 +39,14 @@ describe('findings', () => {
         moreRequestIds: 0,
       },
       {
-        title: 'Failed note and comment writes (3)',
+        title: 'Failed note and comment writes (4)',
         lines: [
           '08:35:00 `coordinator_conflict_note_failed` manki-review/manki#1289: Error: posting the conflict note failed with 403',
           '08:35:30 `coordinator_waiting_check_refused` manki-review/manki#1289 work 8: status 403',
+          '08:35:48 `coordinator_refusal_reply_failed` manki-review/manki#1289 work 10: Error: posting the reply failed with 403',
           '08:36:00 `coordinator_reaction_failed` manki-review/manki#1289: status 403',
         ],
-        requestIds: ['req-2', 'req-9', 'req-3'],
+        requestIds: ['req-2', 'req-9', 'req-11', 'req-3'],
         moreRequestIds: 0,
       },
       {
