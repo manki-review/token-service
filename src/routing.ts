@@ -79,8 +79,8 @@ export interface Work {
    */
   trusted: boolean;
   /**
-   * Whether the work comes from a Manki command its sender wrote. A writer's command gets the eyes reaction as soon as
-   * it is queued.
+   * Whether the work comes from a Manki command its sender wrote. A writer's command other than help gets the eyes
+   * reaction as soon as it is queued. A command refused for lack of write access gets one reply that says why.
    */
   acknowledge: boolean;
   /**
@@ -462,7 +462,7 @@ function routeIssueComment(target: Target, payload: WebhookPayload): Route {
 
 /** A help command on a pull request. It gets a thumbs-up reaction with the answer, never the eyes reaction. */
 function helpRoute(target: Target, payload: WebhookPayload, event: string): Route {
-  return { type: 'work', target, work: { ...work('help', 'help', payload, event, payload.comment?.id ?? null), acknowledge: false } };
+  return { type: 'work', target, work: work('help', 'help', payload, event, payload.comment?.id ?? null) };
 }
 
 /**

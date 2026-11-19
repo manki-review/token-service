@@ -2101,6 +2101,7 @@ describe('PrCoordinator dispatch', () => {
     expect(HELP_REPLY).not.toMatch(/@manki(?![\w-])/);
     expect(github.comments).toEqual([`${HELP_REPLY}\n<!-- manki-answered:1001 -->`, HELP_REPLY]);
     expect(github.thumbsUp).toEqual(['issues/1001', 'pulls/1001']);
+    expect(github.reactions).toEqual(['issues/1001']);
     // The eyes reaction on the explain minted the token the replies reuse, which holds nothing else.
     expect(github.mints.filter((mint) => mint.permissions.issues)).toEqual([{ permissions: { issues: 'write', pull_requests: 'write' }, repository_ids: [REPOSITORY_ID] }]);
     expect((await workRows(pr.stub)).map((row) => [row.lane, row.status, row.note])).toEqual([
@@ -2366,14 +2367,26 @@ describe('PrCoordinator dispatch', () => {
       sender: { login: 'mallory', type: 'User' },
       changes: { body: { from: finding } },
     });
+    // A command in a review thread is refused the same way.
+    const erin = { login: 'erin', type: 'User' };
+    const threadCommand = (body: string) => ({
+      ...reviewCommentEvent(body, { user: erin, author_association: 'NONE' }, 'created', { number: pr.number }), sender: erin,
+    });
+    await run('pull_request_review_comment', threadCommand('@manki explain'));
+    await run('pull_request_review_comment', threadCommand('@manki dismiss'));
     expect(github.dispatches).toEqual([]);
-    expect(github.comments).toEqual([]);
+    // Each sender of a command is told once why it does nothing, with a link to the comment. A plain thread reply and an
+    // edit of someone else's comment get no reply.
+    const reply = (login: string, anchor: string) => `@${login} Manki takes commands only from people with write access to this repository, so it did not act on [your comment](https://github.com/${OWNER}/${REPO}/issues/${pr.number}#${anchor}${COMMENT_ID}). Someone with write access can post the command instead.`;
+    expect(github.comments).toEqual([`${reply('alice', 'issuecomment-')}\n<!-- manki-answered:${COMMENT_ID} -->`, reply('erin', 'discussion_r')]);
     expect((await workRows(pr.stub)).map((row) => [row.kind, row.status, row.note])).toEqual([
       ['comment', 'skipped', 'commenter has no write access'],
       ['help', 'skipped', 'commenter has no write access'],
       ['thread', 'skipped', 'commenter has no write access'],
       ['comment', 'skipped', 'commenter has no write access'],
       ['review_state', 'skipped', 'commenter has no write access'],
+      ['thread', 'skipped', 'commenter has no write access'],
+      ['thread', 'skipped', 'commenter has no write access'],
       ['thread', 'skipped', 'commenter has no write access'],
     ]);
 
@@ -2392,7 +2405,7 @@ describe('PrCoordinator dispatch', () => {
       ['issue_comment', 'created'], ['issue_comment', 'created'], ['pull_request_review_comment', 'edited'],
     ]);
     // Each login is looked up once and reused for a few minutes.
-    expect(github.permissionReads).toEqual(['alice', 'mallory', 'bob']);
+    expect(github.permissionReads).toEqual(['alice', 'mallory', 'erin', 'bob']);
     expect(github.mints).toContainEqual({ permissions: { metadata: 'read' }, repository_ids: [REPOSITORY_ID] });
   });
 

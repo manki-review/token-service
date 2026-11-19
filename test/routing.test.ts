@@ -289,7 +289,6 @@ describe('routeDelivery', () => {
     ['a thread reply without a mention', 'pull_request_review_comment', reviewCommentEvent('Fixed', { in_reply_to_id: 7 }), false, 7],
     ['a command in a thread reply', 'pull_request_review_comment', reviewCommentEvent('@manki dismiss', { in_reply_to_id: 7 }), true],
     ['a mention in a review comment by an outsider', 'pull_request_review_comment', reviewCommentEvent('@manki is this safe?', { author_association: 'NONE' }), false],
-    ['a help, which gets a thumbs-up with its answer instead', 'issue_comment', issueCommentEvent('@manki help'), false],
     ['a push', 'pull_request', pullRequestEvent('synchronize'), false],
   ])('reacts to %s when it is queued or not', (_case, event, payload, acknowledge, repliesTo) => {
     const route = routeDelivery(event, payload);
