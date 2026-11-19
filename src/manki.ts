@@ -141,6 +141,19 @@ export function parseCommandType(body: string): CommandType {
   return match ? (match[1] as CommandType) : 'generic';
 }
 
+/** A command that changes or lists the accounts a maintainer allowed to use Manki. The Worker answers it with no run. */
+export type AccessCommand = { command: 'allow' | 'disallow'; login: string | null } | { command: 'allowed' };
+
+// The Worker's own commands, which Manki does not know. A GitHub login holds letters, digits and single hyphens.
+const ACCESS_PATTERN = /(?:@manki-review|@manki|\/manki)\s+(allowed|allow|disallow)(?![\w-])(?:[ \t]+@?([a-z\d](?:[a-z\d-]{0,38}))(?![\w-]))?/;
+
+/** Returns the access command of `body`, or null when it holds none. A command quoted in inline code or a code block is text. */
+export function parseAccessCommand(body: string): AccessCommand | null {
+  const match = body.replace(/```[\s\S]*?(?:```|$)|`[^`\n]*`/g, ' ').toLowerCase().match(ACCESS_PATTERN);
+  if (!match) return null;
+  return match[1] === 'allowed' ? { command: 'allowed' } : { command: match[1] as 'allow' | 'disallow', login: match[2] ?? null };
+}
+
 /** The skip rules of a base branch's `.manki.yml`. */
 export interface SkipRules {
   skip_labels: string[];
@@ -337,10 +350,18 @@ export function setBoxes(body: string, changes: BoxChange[]): string {
 /** Starts the line above each box Manki puts into a message for the next step it names, as Manki's `BOX_ANCHOR`. */
 const MESSAGE_BOX_ANCHOR = '<!-- manki-issue-box -->';
 
-/** The boxes Manki puts into a message other than the settings block, as its `MessageBox`. */
-export type MessageBox = 'again' | 'check' | 'forget' | 'dismiss';
+/**
+ * The boxes Manki puts into a message other than the settings block, as its `MessageBox`, and the Worker's `allow` box
+ * in its reply to a refused command, whose id is the user id of the account it allows.
+ */
+export type MessageBox = 'again' | 'check' | 'forget' | 'dismiss' | 'allow';
 
-const MESSAGE_BOXES: readonly string[] = ['again', 'check', 'forget', 'dismiss'] satisfies MessageBox[];
+const MESSAGE_BOXES: readonly string[] = ['again', 'check', 'forget', 'dismiss', 'allow'] satisfies MessageBox[];
+
+/** Returns the box that allows the account `login`, with user id `id`, to use Manki in the repository. */
+export function allowBox(id: number, login: string): string {
+  return `${MESSAGE_BOX_ANCHOR}\n- [ ] Allow @${login} to use Manki in this repository <!-- manki-box:allow:${id} -->`;
+}
 
 /** A message box ticked in an edit, with the id of what it acts on, such as a learning, when it has one. */
 export interface MessageTick {

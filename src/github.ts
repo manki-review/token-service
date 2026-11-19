@@ -133,14 +133,44 @@ export async function githubApi(token: string, path: string, init: { method?: st
 }
 
 /**
- * Whether `login` has write access to `owner/repo`, as Manki's `hasWriteAccess` decides it. GitHub reports `maintain`
- * as `write` here. A 404 means no access, and any other failure throws.
+ * Returns what `login` may do on `owner/repo`: the base `permission`, which reports `maintain` as `write`, and the
+ * `role_name`. Both are missing for a 404, which means no access. Any other failure throws.
  */
-export async function hasWriteAccess(token: string, owner: string, repo: string, login: string): Promise<boolean> {
+async function repositoryAccess(token: string, owner: string, repo: string, login: string): Promise<{ permission?: string; role_name?: string }> {
   const response = await githubApi(token, `/repos/${owner}/${repo}/collaborators/${encodeURIComponent(login)}/permission`);
   if (!response.ok && response.status !== 404) throw new Error(`reading the permission of ${login} failed with ${response.status}`);
-  const { permission } = response.ok ? await response.json() as { permission?: string } : {};
+  return response.ok ? await response.json() as { permission?: string; role_name?: string } : {};
+}
+
+/** Whether `login` has write access to `owner/repo`, as Manki's `hasWriteAccess` decides it. */
+export async function hasWriteAccess(token: string, owner: string, repo: string, login: string): Promise<boolean> {
+  const { permission } = await repositoryAccess(token, owner, repo, login);
   return permission === 'admin' || permission === 'write';
+}
+
+/** Whether `login` holds the `maintain` or `admin` role on `owner/repo`. A custom role never counts. */
+export async function canMaintain(token: string, owner: string, repo: string, login: string): Promise<boolean> {
+  const { role_name: role } = await repositoryAccess(token, owner, repo, login);
+  return role === 'maintain' || role === 'admin';
+}
+
+/** A person's GitHub account. */
+export interface Account {
+  id: number;
+  login: string;
+}
+
+/**
+ * Returns the account with the user id or the login `who` names, or null when GitHub knows none or it is no person's
+ * account, such as a bot or an organization. Any other failure throws.
+ */
+export async function readAccount(token: string, who: { id: number } | { login: string }): Promise<Account | null> {
+  const path = 'id' in who ? `/user/${who.id}` : `/users/${encodeURIComponent(who.login)}`;
+  const response = await githubApi(token, path);
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`reading the account failed with ${response.status}`);
+  const { id, login, type } = await response.json() as { id?: unknown; login?: unknown; type?: unknown };
+  return type === 'User' && typeof id === 'number' && Number.isSafeInteger(id) && typeof login === 'string' ? { id, login } : null;
 }
 
 /** Runs a GraphQL query and returns its `data`. Throws on an HTTP or GraphQL error. */

@@ -1,5 +1,6 @@
 import { parseRunTitle } from './dispatch';
 import {
+  type AccessCommand,
   BOT_LOGIN,
   type BoxChange,
   changedBoxes,
@@ -9,6 +10,7 @@ import {
   MANKI_COMMENT_MARKER,
   MANKI_LOGINS,
   type MessageTick,
+  parseAccessCommand,
   parseCommandType,
   type ReviewMode,
   SETTINGS_MARKER,
@@ -27,10 +29,10 @@ const WORKFLOW_PATH = /^\.github\/workflows\/[^/@]+\.ya?ml(@.+)?$/;
 
 /**
  * The state lane carries everything that reads or changes threads, verdicts or approval. The chat lane carries
- * answers that change no PR state, so a question does not wait behind a review. The help lane carries help commands
- * and the notice for a PR from a fork, which the Worker answers itself, so they wait behind no run. The settings lane
- * carries edits of Manki's settings boxes, which the Worker applies itself, so a Cancel tick never waits behind the run
- * it cancels.
+ * answers that change no PR state, so a question does not wait behind a review. The help lane carries help commands,
+ * the access commands and ticks, and the notice for a PR from a fork, which the Worker answers itself, so they wait
+ * behind no run. The settings lane carries edits of Manki's settings boxes, which the Worker applies itself, so a
+ * Cancel tick never waits behind the run it cancels.
  */
 export type Lane = 'state' | 'chat' | 'help' | 'settings';
 
@@ -48,8 +50,9 @@ export type Lane = 'state' | 'chat' | 'help' | 'settings';
  * - `bot_push`: a bot's push, which Manki does not review. The Worker reads the skip rules for it, with no run
  * - `fork_notice`: a PR from a fork that was opened or marked ready. The Worker tells it once that it gets no automatic
  *   review, with no run
+ * - `access`: a command or a box tick that changes or lists the repository's allow list, applied by the Worker, with no run
  */
-export type WorkKind = 'review' | 'merged' | 'review_state' | 'thread' | 'comment' | 'issue' | 'help' | 'settings' | 'bot_push' | 'fork_notice';
+export type WorkKind = 'review' | 'merged' | 'review_state' | 'thread' | 'comment' | 'issue' | 'help' | 'settings' | 'bot_push' | 'fork_notice' | 'access';
 
 /** The pull request or issue a delivery is about. Every field comes from the signed payload. */
 export interface Target {
@@ -73,6 +76,8 @@ export interface Work {
   /** The comment or review id, when the event is about one. */
   objectId: number | null;
   sender: string;
+  /** The user id of `sender`, when the payload names it. The allow list knows an account by this id. */
+  senderId?: number;
   /**
    * Whether a repository user caused the work. Only a comment or a review can come from someone else, and only a
    * trusted comment may merge with a push review.
@@ -103,6 +108,8 @@ export interface Work {
   modes?: ReviewMode[];
   /** For a settings edit, the boxes it ticked or unticked. */
   boxes?: BoxChange[];
+  /** For an access command, what it asks. */
+  access?: AccessCommand;
   /**
    * For an edit of Manki's comment, review or review comment, the boxes it ticked outside the settings block. They are
    * put back when the editor lacks write access.
@@ -127,6 +134,7 @@ export type Route =
 
 interface User {
   login?: string;
+  id?: number;
   type?: string;
 }
 
@@ -249,6 +257,7 @@ function work(lane: Lane, kind: WorkKind, payload: WebhookPayload, event: string
     headSha: payload.pull_request?.head?.sha ?? null,
     objectId,
     sender: payload.sender?.login ?? '',
+    ...(Number.isSafeInteger(payload.sender?.id) && { senderId: payload.sender?.id }),
     trusted: isTrusted(payload),
     acknowledge: isOwnCommand(payload),
     ...(byEvent ? { writer: true, checkWriter: false } : authorWriter(payload)),
@@ -356,7 +365,9 @@ function routeReviewBoxTick(target: Target, payload: WebhookPayload, now: number
   if (isForkHead(payload)) return ignore('head is on a fork');
   const nodeId = payload.review?.node_id;
   if (!nodeId) return ignore('review lacks its node id');
-  return { type: 'work', target, work: { ...tick, sender: '', editorOf: nodeId } };
+  // GitHub names the review's author as the sender, so neither its login nor its id is the editor's.
+  const { senderId: _author, ...edit } = tick;
+  return { type: 'work', target, work: { ...edit, sender: '', editorOf: nodeId } };
 }
 
 /**
@@ -374,6 +385,9 @@ function boxTick(
   if (before === undefined) return null;
   const ticks = tickedMessageBoxes(before, body);
   if (ticks.length === 0 && (kind === 'comment' || tickedIssueBoxes(before, body).length === 0)) return null;
+  // The Worker applies an allow tick itself, and the editor needs the maintain role, which it checks then.
+  const allows = ticks.filter(({ box }) => box === 'allow');
+  if (allows.length > 0) return { ...work('help', 'access', payload, event, objectId), acknowledge: false, writer: false, checkWriter: true, ticks: allows };
   const again = ticks.some(({ box }) => box === 'again');
   const lane: Lane = kind === 'comment' && ticks.every(({ box }) => box === 'forget') ? 'chat' : 'state';
   return {
@@ -406,6 +420,8 @@ function routeReviewComment(target: Target, payload: WebhookPayload): Route {
   if (comment?.user?.type === 'Bot' || body.includes(MANKI_COMMENT_MARKER)) return ignore('comment is from a bot');
   if (!comment?.in_reply_to_id && !hasBotMention(body)) return ignore('comment is neither a reply nor a mention');
   if (parseCommandType(body) === 'help') return helpRoute(target, payload, 'pull_request_review_comment');
+  const access = parseAccessCommand(body);
+  if (access) return accessRoute(target, payload, 'pull_request_review_comment', access);
   // Every thread command ends with Manki's auto-approve check, so none may run beside a review.
   const thread = work('state', 'thread', payload, 'pull_request_review_comment', comment?.id ?? null);
   // A reply with a mention is a command, which `acknowledge` covers.
@@ -447,6 +463,13 @@ function routeIssueComment(target: Target, payload: WebhookPayload): Route {
       : ignore('review request on an issue');
   }
 
+  // Ahead of a review request, since an account such as `@review-bot` reads as one.
+  const access = parseAccessCommand(body);
+  if (access) {
+    const before = action === 'edited' ? parseAccessCommand(payload.changes?.body?.from ?? '') : null;
+    if (JSON.stringify(before) === JSON.stringify(access)) return ignore('access command was already asked');
+    return accessRoute(target, payload, 'issue_comment', access);
+  }
   if (isReviewRequest(body)) {
     return { type: 'work', target, work: work('state', 'review', payload, 'issue_comment', objectId) };
   }
@@ -463,6 +486,11 @@ function routeIssueComment(target: Target, payload: WebhookPayload): Route {
 /** A help command on a pull request. It gets a thumbs-up reaction with the answer, never the eyes reaction. */
 function helpRoute(target: Target, payload: WebhookPayload, event: string): Route {
   return { type: 'work', target, work: work('help', 'help', payload, event, payload.comment?.id ?? null) };
+}
+
+/** An access command on a pull request, which the Worker answers with no run. */
+function accessRoute(target: Target, payload: WebhookPayload, event: string, access: AccessCommand): Route {
+  return { type: 'work', target, work: { ...work('help', 'access', payload, event, payload.comment?.id ?? null), access } };
 }
 
 /**

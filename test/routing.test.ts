@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { allowBox } from '../src/manki';
 import { routeDelivery, type Route, type WebhookPayload } from '../src/routing';
 import { INSTALLATION_ID, OWNER, OWNER_ID, REPO } from './helpers';
 import {
@@ -32,6 +33,8 @@ const CHECK = message('check', 'Check approval', 'Comment `/manki check`.');
 const FORGET = message('forget:abc123', 'Forget this learning', 'Saved a learning. `/manki forget abc123` removes it.');
 const DISMISS = `${FINDING_COMMENT}\n<!-- manki-issue-box -->\n- [ ] Dismiss this finding <!-- manki-box:dismiss -->`;
 const TICKED_DISMISS = DISMISS.replace('[ ] Dismiss', '[x] Dismiss');
+/** The Worker's reply to a refused command, with the box that allows its sender. */
+const ALLOW = `@bob Manki takes commands only from people with write access.\n\n${allowBox(31, 'bob')}`;
 
 /** An edit of Manki's review body from `before` to `after`. GitHub names the review's author, Manki, as the sender. */
 function reviewEdit(after: string, before?: string, review: Record<string, unknown> = {}): WebhookPayload {
@@ -130,6 +133,7 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['a forget in a thread', 'pull_request_review_comment', reviewCommentEvent('@manki forget tabs'), 'state:thread'],
   ['a help in a thread', 'pull_request_review_comment', reviewCommentEvent('/manki help'), 'help:help'],
   ['a check in a thread', 'pull_request_review_comment', reviewCommentEvent('@manki check'), 'state:thread'],
+  ['an allow in a thread', 'pull_request_review_comment', reviewCommentEvent('/manki allow @bob', { in_reply_to_id: 1 }), 'help:access'],
   ['a new thread without a mention', 'pull_request_review_comment', reviewCommentEvent('nit: rename this'), 'ignore'],
   ['a review comment by a bot', 'pull_request_review_comment', reviewCommentEvent('@manki hi', { user: ACTIONS_AUTHOR }), 'ignore'],
   ['a Manki finding comment', 'pull_request_review_comment', reviewCommentEvent('<!-- manki-finding --> @manki', { user: { login: 'alice', type: 'User' } }), 'ignore'],
@@ -158,6 +162,13 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['a help that asks for a review', 'issue_comment', issueCommentEvent('@manki help me review this'), 'state:review'],
   ['an edit that adds a help', 'issue_comment', issueCommentEvent('@manki help', { action: 'edited', previousBody: 'hmm' }), 'help:help'],
   ['an edit that keeps a help', 'issue_comment', issueCommentEvent('@manki help, thanks', { action: 'edited', previousBody: '@manki help' }), 'ignore'],
+  ['an allow', 'issue_comment', issueCommentEvent('/manki allow @bob'), 'help:access'],
+  ['an allow of an account whose login reads as a review request', 'issue_comment', issueCommentEvent('/manki allow @review-bot'), 'help:access'],
+  ['a disallow', 'issue_comment', issueCommentEvent('@manki disallow bob'), 'help:access'],
+  ['a list of the allowed accounts', 'issue_comment', issueCommentEvent('/Manki allowed'), 'help:access'],
+  ['an allow quoted in code', 'issue_comment', issueCommentEvent('@manki what does `/manki allow @bob` do?'), 'chat:comment'],
+  ['an edit that keeps an allow', 'issue_comment', issueCommentEvent('/manki allow @bob, thanks', { action: 'edited', previousBody: '/manki allow @bob' }), 'ignore'],
+  ['an edit that allows another account', 'issue_comment', issueCommentEvent('/manki allow @carol', { action: 'edited', previousBody: '/manki allow @bob' }), 'help:access'],
   ['a remember', 'issue_comment', issueCommentEvent('@manki remember we use tabs'), 'chat:comment'],
   ['a forget', 'issue_comment', issueCommentEvent('@manki-review forget tabs'), 'chat:comment'],
   ['a check quoted in code', 'issue_comment', issueCommentEvent('@manki what does `@manki check` do?'), 'chat:comment'],
@@ -179,6 +190,9 @@ const cases: Array<[string, string, WebhookPayload, string]> = [
   ['a ticked Review again box in Manki\'s comment', 'issue_comment', issueCommentEvent(ticked(AGAIN), { action: 'edited', author: MANKI_AUTHOR, previousBody: AGAIN }), 'settings:settings'],
   ['a ticked Check approval box in Manki\'s comment', 'issue_comment', issueCommentEvent(ticked(CHECK), { action: 'edited', author: MANKI_AUTHOR, previousBody: CHECK }), 'state:comment'],
   ['a ticked Forget box in Manki\'s comment', 'issue_comment', issueCommentEvent(ticked(FORGET), { action: 'edited', author: MANKI_AUTHOR, previousBody: FORGET }), 'chat:comment'],
+  ['a ticked Allow box in the refusal reply', 'issue_comment', issueCommentEvent(ticked(ALLOW), { action: 'edited', author: MANKI_AUTHOR, previousBody: ALLOW }), 'help:access'],
+  ['an unticked Allow box in the refusal reply', 'issue_comment', issueCommentEvent(ALLOW, { action: 'edited', author: MANKI_AUTHOR, previousBody: ticked(ALLOW) }), 'ignore'],
+  ['a ticked Allow box on a copy of the refusal reply by someone else', 'issue_comment', issueCommentEvent(ticked(ALLOW), { action: 'edited', previousBody: ALLOW }), 'ignore'],
   ['a message box edit without the earlier body', 'issue_comment', issueCommentEvent(ticked(message('again', 'Review again', 'Done.')), { action: 'edited', author: MANKI_AUTHOR }), 'ignore'],
   ['an unticked message box in Manki\'s comment', 'issue_comment', issueCommentEvent(message('again', 'Review again', 'Done.'), { action: 'edited', author: MANKI_AUTHOR, previousBody: ticked(message('again', 'Review again', 'Done.')) }), 'ignore'],
   ['a ticked box on a copy of Manki\'s comment by someone else', 'issue_comment', issueCommentEvent(ticked(message('again', 'Review again', 'Done.')), { action: 'edited', previousBody: message('again', 'Review again', 'Done.') }), 'ignore'],
@@ -316,6 +330,7 @@ describe('routeDelivery', () => {
     ['a tick in Manki\'s finding', 'pull_request_review_comment', findingEdit(TICKED_FINDING, FINDING_COMMENT), false, true],
     ['a tick of a message box in Manki\'s comment', 'issue_comment', issueCommentEvent(ticked(CHECK), { action: 'edited', author: MANKI_AUTHOR, association: 'OWNER', previousBody: CHECK }), false, true],
     ['a tick of Review again in Manki\'s comment', 'issue_comment', issueCommentEvent(ticked(AGAIN), { action: 'edited', author: MANKI_AUTHOR, previousBody: AGAIN }), false, true],
+    ['a tick of the Allow box in the refusal reply', 'issue_comment', issueCommentEvent(ticked(ALLOW), { action: 'edited', author: MANKI_AUTHOR, association: 'OWNER', previousBody: ALLOW }), false, true],
   ])('marks %s as a writer or not, and whether to look the sender up', (_case, event, payload, writer, checkWriter) => {
     const route = routeDelivery(event, payload);
     expect(route.type === 'work' && { writer: route.work.writer, checkWriter: route.work.checkWriter }).toEqual({ writer, checkWriter });
@@ -326,6 +341,28 @@ describe('routeDelivery', () => {
     expect(route.type === 'work' && route.work).toMatchObject({
       event: 'pull_request_review.edited', objectId: REVIEW_ID, sender: '', editorOf: 'PRR_1', writer: false, checkWriter: true, acknowledge: false,
     });
+  });
+
+  it('carries what an access command asks and the sender\'s user id, which the allow list knows an account by', () => {
+    const bob = { login: 'bob', id: 31, type: 'User' };
+    const command = (body: string) => {
+      const route = routeDelivery('issue_comment', issueCommentEvent(body, { sender: bob, author: bob }));
+      return route.type === 'work' && [route.work.access, route.work.senderId, route.work.acknowledge];
+    };
+    expect(command('/manki allow @Alice-B')).toEqual([{ command: 'allow', login: 'alice-b' }, 31, true]);
+    expect(command('@manki-review disallow carol please')).toEqual([{ command: 'disallow', login: 'carol' }, 31, true]);
+    expect(command('/manki allow')).toEqual([{ command: 'allow', login: null }, 31, true]);
+    expect(command('/manki allowed @bob')).toEqual([{ command: 'allowed' }, 31, true]);
+    // A login holds no underscore, so the command names no account.
+    expect(command('/manki allow @a_b')).toEqual([{ command: 'allow', login: null }, 31, true]);
+    // An allow tick carries only the allow boxes, and the editor is looked up before it counts.
+    const tick = routeDelivery('issue_comment', issueCommentEvent(ticked(ALLOW), { action: 'edited', author: MANKI_AUTHOR, sender: bob, previousBody: ALLOW }));
+    expect(tick.type === 'work' && tick.work).toMatchObject({
+      lane: 'help', kind: 'access', objectId: COMMENT_ID, sender: 'bob', senderId: 31, writer: false, checkWriter: true, acknowledge: false, ticks: [{ box: 'allow', id: '31' }],
+    });
+    // The sender of a review edit is Manki, whose id is never the editor's.
+    const review = routeDelivery('pull_request_review', { ...reviewEdit(TICKED_FINDING, FINDING_COMMENT), sender: { ...MANKI_AUTHOR, id: 5 } });
+    expect(review.type === 'work' && review.work.senderId).toBeUndefined();
   });
 
   it('names the boxes a settings edit ticked or unticked, and counts the editor as no writer until looked up', () => {

@@ -28,7 +28,7 @@ and keeps the state of every pull request, so the runs themselves hold almost no
 | | Responsibility | In one sentence | Reference |
 |---|---|---|---|
 | 1 | **Review scheduling** | Verifies the App's webhooks, queues work per pull request, merges repeated pushes into one review and starts the Manki workflow with `workflow_dispatch`. | [coordinator](docs/coordinator.md) |
-| 2 | **Decisions without a run** | Answers `/manki help`, checks write access, and applies skip rules, drafts, pauses, base conflicts and one review per head commit, all without spending a runner. | [coordinator](docs/coordinator.md#decisions-without-a-run) |
+| 2 | **Decisions without a run** | Answers `/manki help` and the allow list commands, checks write access, and applies skip rules, drafts, pauses, base conflicts and one review per head commit, all without spending a runner. | [coordinator](docs/coordinator.md#decisions-without-a-run) |
 | 3 | **Waiting check** | Puts a queued `Manki` check on the commit the moment a review is dispatched, and makes sure every check it created ends. | [waiting check](docs/waiting-check.md) |
 | 4 | **Settings boxes** | Applies the ticks in Manki's progress comment: Pause, Review again, Deeper review, Cancel and Review this draft. Routes the ticks of the boxes Manki puts below a next step in its other messages. | [settings boxes](docs/settings-boxes.md) |
 | 5 | **Tokens** | Gives the run a coordinator dispatched a GitHub App token for its own repository only, with the fewest permissions and no push. | [tokens](docs/tokens.md) |
@@ -76,7 +76,7 @@ Three [Durable Objects](https://developers.cloudflare.com/durable-objects/) hold
 |---|---|---|
 | `PrCoordinator` | Pull request or issue (`<repository id>:<number>`) | Seen deliveries, the work queue of each lane, active runs, PR state and settings |
 | `InstallationLimiter` | App installation | The hourly count of stored deliveries from people without write access |
-| `Reconciler` | Whole Worker (singleton) | The opt-in registry and the webhook redelivery scan position |
+| `Reconciler` | Whole Worker (singleton) | The opt-in registry, each repository's allow list and the webhook redelivery scan position |
 
 ## Life of a review
 
@@ -119,6 +119,7 @@ Every endpoint except `/webhook` takes the run's [GitHub OIDC token](https://doc
 | `POST /state` | Manki run | Reads the PR's queue, active runs, last review, approval, pause and settings | [PR state](docs/state.md) |
 | `POST /state/report` | The PR's active run | Records the reviewed commit, an approval or a pause | [PR state](docs/state.md) |
 | `POST /resolve` | Manki run | Resolves or reopens one of Manki's threads | [thread resolution](docs/resolve.md) |
+| `POST /access` | Manki run | Says whether an account is on the repository's allow list | [allow list](docs/coordinator.md#allow-list) |
 | `POST /memory/read` | Run of a public repository | Reads the repository's and the global memory files | [memory](docs/memory.md) |
 | `POST /memory/write` | Run of a public repository | Replaces one memory file, guarded by its blob sha | [memory](docs/memory.md) |
 | `POST /memory/append` | Run of a public repository | Appends lines to the fix-rate metrics | [memory](docs/memory.md) |
@@ -163,7 +164,7 @@ npm run deploy     # deploy by hand, outside the workflow
 | `src/limiter.ts` | `InstallationLimiter` |
 | `src/reconciler.ts` | `Reconciler`: redelivery and catch-up |
 | `src/oidc.ts`, `src/run-check.ts`, `src/app-jwt.ts`, `src/github.ts`, `src/permissions.ts` | OIDC checks, the dispatched-run check and token minting |
-| `src/state.ts`, `src/resolve.ts`, `src/memory.ts` | `/state`, `/resolve` and `/memory` |
+| `src/state.ts`, `src/resolve.ts`, `src/memory.ts`, `src/access.ts` | `/state`, `/resolve`, `/memory` and `/access` |
 | `scripts/log-watch/` | The hourly log watch |
 
 </details>

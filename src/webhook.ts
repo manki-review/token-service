@@ -4,6 +4,7 @@ import { githubGraphql, hasWriteAccess, mintRepositoryToken } from './github';
 import { eventsPerHour } from './limiter';
 import { log } from './log';
 import { BOT_LOGIN } from './manki';
+import { isAllowedSender } from './reconciler';
 import { routeDelivery, type Route, type Target, type Work, type WebhookPayload } from './routing';
 import { sha256Hex, verifyWebhookSignature } from './signature';
 
@@ -58,6 +59,7 @@ async function isWriter(env: Env, target: Target, login: string): Promise<boolea
 interface Editor {
   login: string;
   __typename: string;
+  databaseId?: number | null;
 }
 
 /**
@@ -73,20 +75,26 @@ async function editedWork(env: Env, target: Target, work: Work, receivedAt: numb
   }>(
     await lookupToken(env, target),
     // GitHub lists the edits newest first.
-    'query($id: ID!) { node(id: $id) { ... on PullRequestReview { editor { login __typename } userContentEdits(first: 100) { nodes { editedAt editor { login __typename } } } } } }',
+    `query($id: ID!) { node(id: $id) { ... on PullRequestReview {
+      editor { login __typename ... on User { databaseId } } userContentEdits(first: 100) { nodes { editedAt editor { login __typename ... on User { databaseId } } } }
+    } } }`,
     { id: work.editorOf },
   );
   const isLaterRewrite = (edit: { editedAt: string; editor: Editor | null } | null) => edit?.editor?.__typename === 'Bot'
     && `${edit.editor.login}[bot]` === BOT_LOGIN && Date.parse(edit.editedAt) > receivedAt;
   const newest = (node?.userContentEdits?.nodes ?? []).find((edit) => !isLaterRewrite(edit));
   const editor = newest === undefined ? node?.editor : newest?.editor;
-  return editor && editor.__typename !== 'Bot' ? { ...work, sender: editor.login } : null;
+  if (!editor || editor.__typename === 'Bot') return null;
+  return { ...work, sender: editor.login, ...(Number.isSafeInteger(editor.databaseId) && { senderId: editor.databaseId! }) };
 }
 
-/** Settles `writer` with a lookup when the payload cannot. A writer is a repository user, so the work is trusted too. */
+/**
+ * Settles `writer` with a lookup when the payload cannot. An account on the allow list counts as a writer. A writer is a
+ * repository user, so the work is trusted too.
+ */
 async function checkedWork(env: Env, target: Target, work: Work): Promise<Work> {
   if (!work.checkWriter) return work;
-  const writer = work.sender !== '' && await isWriter(env, target, work.sender);
+  const writer = work.sender !== '' && (await isWriter(env, target, work.sender) || await isAllowedSender(env, target.repositoryId, work.sender, work.senderId));
   return { ...work, writer, trusted: work.trusted || writer, checkWriter: false };
 }
 

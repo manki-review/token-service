@@ -1,3 +1,4 @@
+import { handleAccess } from './access';
 import { createAppJWT } from './app-jwt';
 import type { Env } from './env';
 import { createInstallationToken, logMintedToken, type TokenAudit } from './github';
@@ -45,6 +46,7 @@ export default {
       return handleState(request, env, url.pathname === '/state/report');
     }
     if (url.pathname === '/resolve') return handleResolve(request, env);
+    if (url.pathname === '/access') return handleAccess(request, env);
     const memory = url.pathname.match(/^\/memory\/(read|write|append)$/);
     if (memory) return handleMemory(request, env, memory[1] as MemoryOperation);
     if (url.pathname !== '/token') {

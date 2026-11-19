@@ -280,11 +280,16 @@ describe('PrCoordinator.receive', () => {
     // An edit that turns the comment into another kind of work, or that comes from someone else, queues on its own.
     expect(await pr.send('issue_comment', pr.comment('@manki review', 'edited'))).toEqual({ accepted: true, effect: 'queued work 2' });
     expect(await pr.send('issue_comment', pr.outsiderComment('@manki explain', 'edited'))).toEqual({ accepted: true, effect: 'queued work 3' });
+    // An edit of a queued access command keeps the command it names now.
+    const access = pullRequest();
+    await access.send('issue_comment', access.comment('/manki allow @bob'));
+    expect(await access.send('issue_comment', access.comment('/manki allow @carol', 'edited'))).toEqual({ accepted: true, effect: 'merged into work 1' });
     expect(await workRows(pr.stub)).toMatchObject([
       { id: 1, kind: 'comment', event: 'issue_comment.edited', delivery: 'd-edit-2', trusted: 1 },
       { id: 2, kind: 'review' },
       { id: 3, kind: 'comment', trusted: 0 },
     ]);
+    expect(await workRows(access.stub)).toMatchObject([{ id: 1, kind: 'access', access: '{"command":"allow","login":"carol"}' }]);
   });
 
   it('refuses a body it has seen under another delivery id', async () => {
@@ -754,9 +759,11 @@ function fakeGitHub(number: number) {
     thumbsUp: [] as string[],
     comments: [] as string[],
     commentStatus: 201,
-    /** Each login's permission on the repository. Anyone else reads as `read`. */
+    /** Each login's role on the repository, which GitHub reports as the permission `write` for `maintain`. Anyone else reads as `read`. */
     permissions: {} as Record<string, string>,
     permissionReads: [] as string[],
+    /** The accounts `GET /users/<login>` and `GET /user/<id>` find, by login. A missing `type` is a person's. */
+    accounts: {} as Record<string, { id: number; type?: string }>,
     /** Manki's comments by id, which a revert reads and edits, the author of any comment not Manki's, and the status of the GraphQL list. */
     issueComments: new Map<number, string>(),
     commentAuthors: new Map<number, string>(),
@@ -960,7 +967,14 @@ function fakeGitHub(number: number) {
     const permission = url.pathname.match(new RegExp(`^${repo}/collaborators/([^/]+)/permission$`));
     if (permission && request.method === 'GET') {
       state.permissionReads.push(permission[1]);
-      return Response.json({ permission: state.permissions[permission[1]] ?? 'read' });
+      const role = state.permissions[permission[1]] ?? 'read';
+      return Response.json({ permission: role === 'maintain' ? 'write' : role, role_name: role });
+    }
+    const account = url.pathname.match(/^\/(users|user)\/([^/]+)$/);
+    if (account && request.method === 'GET') {
+      const found = Object.entries(state.accounts).find(([login, { id }]) => (account[1] === 'user' ? String(id) === account[2] : login === account[2].toLowerCase()));
+      if (!found) return Response.json({ message: 'Not Found' }, { status: 404 });
+      return Response.json({ login: found[0], id: found[1].id, type: found[1].type ?? 'User' });
     }
     const run = url.pathname.match(new RegExp(`^${repo}/actions/runs/(\\d+)(/cancel)?$`));
     if (run && request.method === 'POST' && run[2]) {
@@ -2410,6 +2424,102 @@ describe('PrCoordinator dispatch', () => {
     // Each login is looked up once and reused for a few minutes.
     expect(github.permissionReads).toEqual(['alice', 'mallory', 'erin', 'bob']);
     expect(github.mints).toContainEqual({ permissions: { metadata: 'read' }, repository_ids: [REPOSITORY_ID] });
+  });
+
+  it('lets a maintainer allow an account by the box in the refusal or by command, which then counts as a writer until disallowed', async () => {
+    const pr = pullRequest();
+    const github = Object.assign(fakeGitHub(pr.number), {
+      permissions: { maya: 'maintain', wes: 'write' } as Record<string, string>,
+      accounts: { otto: { id: 31 }, pia: { id: 41 }, 'ci-app': { id: 51, type: 'Bot' } } as Record<string, { id: number; type?: string }>,
+    });
+    const user = (login: string, id = github.accounts[login]?.id) => ({ login, id, type: 'User' });
+    let commentId = 7000;
+    /** Delivers a new comment by `login` to `/webhook` and runs the alarm. Each comment has an id of its own. */
+    const comment = async (login: string, body: string, id?: number) => {
+      const payload = issueCommentEvent(body, { number: pr.number, association: 'NONE', sender: user(login, id), author: user(login, id) });
+      expect((await postWebhook({ event: 'issue_comment', payload: { ...payload, comment: { ...payload.comment!, id: ++commentId } } })).status).toBe(202);
+      await runDurableObjectAlarm(pr.stub);
+    };
+    const REFUSAL = 5005;
+    /** Delivers `login`'s tick of the box in the refusal reply and runs the alarm. */
+    const tick = async (login: string) => {
+      const before = github.issueComments.get(REFUSAL)!;
+      const after = before.replace('- [ ] Allow', '- [x] Allow');
+      github.issueComments.set(REFUSAL, after);
+      const payload = issueCommentEvent(after, { number: pr.number, action: 'edited', author: MANKI_AUTHOR, sender: user(login), previousBody: before });
+      expect((await postWebhook({ event: 'issue_comment', payload: { ...payload, comment: { ...payload.comment!, id: REFUSAL } } })).status).toBe(202);
+      await runDurableObjectAlarm(pr.stub);
+    };
+    const lastNote = async () => (await workRows(pr.stub)).at(-1)?.note;
+    const answer = (text: string) => `${text}\n<!-- manki-answered:${commentId} -->`;
+
+    // A refused command gets the box that allows its sender.
+    await comment('otto', '/manki explain');
+    const refusal = `@otto Manki takes commands only from people with write access to this repository, so it did not act on [your comment](https://github.com/${OWNER}/${REPO}/issues/${pr.number}#issuecomment-7001). Someone with write access can post the command instead. A maintainer can allow you to use Manki here with the box below.`;
+    // The refusal carries no answer marker, so a writer's later edit of the comment still runs it.
+    expect(github.comments).toEqual([`${refusal}\n\n<!-- manki-issue-box -->\n- [ ] Allow @otto to use Manki in this repository <!-- manki-box:allow:31 -->`]);
+    github.issueComments.set(REFUSAL, github.comments[0]);
+
+    // A tick by the account itself, or by a writer without the maintain role, is put back and allows nothing.
+    for (const login of ['otto', 'wes']) {
+      await tick(login);
+      expect(github.issueComments.get(REFUSAL)).toBe(github.comments[0]);
+    }
+    expect((await workRows(pr.stub)).slice(1).map((row) => [row.kind, row.status, row.note])).toEqual([
+      ['access', 'skipped', 'commenter has no write access'], ['access', 'skipped', 'ticker lacks the maintain role'],
+    ]);
+    // A maintainer's tick allows the account, and the box stays ticked.
+    await tick('maya');
+    expect(await lastNote()).toBe('allowed otto');
+    expect(github.issueComments.get(REFUSAL)).toContain('- [x] Allow @otto');
+
+    // The allowed account's command counts as a writer's: it gets the eyes reaction and its run.
+    await comment('otto', '/manki explain');
+    expect(github.dispatches.map((dispatch) => dispatch.inputs.comment_id)).toEqual(['7002']);
+    expect(github.reactions).toEqual(['issues/7002']);
+    await pr.stub.runCompleted(key('d-otto'), 9000, 'success');
+
+    // It may list the allowed accounts, but never change the list, since it holds no maintain role.
+    await comment('otto', '/manki allowed');
+    expect(github.comments.at(-1)).toBe(answer([
+      'These accounts may use Manki in this repository besides those with write access:', '',
+      '| Account | Allowed by | Allowed on |', '|---|---|---|', '| `@otto` | `@maya` | 2030-01-01 |',
+    ].join('\n')));
+    await comment('otto', '/manki allow @pia');
+    expect(github.comments.at(-1)).toBe(answer('Only people with the maintain or admin role can change who may use Manki in this repository, so this command changed nothing.'));
+    expect(await lastNote()).toBe('commenter lacks the maintain role');
+
+    // A maintainer allows an account by command, also before its first command, and only a person's account.
+    await comment('maya', '/manki allow @Pia');
+    expect(github.comments.at(-1)).toBe(answer('`@pia` can now use Manki in this repository. `/manki disallow @pia` takes that back.'));
+    await comment('maya', '/manki allow @pia again');
+    expect(github.comments.at(-1)).toBe(answer('`@pia` may already use Manki in this repository.'));
+    await comment('maya', '/manki allow @ci-app');
+    expect(github.comments.at(-1)).toBe(answer('`@ci-app` is no person\'s account on GitHub, so it cannot be allowed.'));
+    await comment('maya', '/manki allow');
+    expect(github.comments.at(-1)).toBe(answer('Name the account, as in `/manki allow @name`.'));
+
+    // A renamed account stays allowed by its id, and the list shows its new login.
+    await comment('pia-renamed', '/manki explain', 41);
+    expect(github.dispatches).toHaveLength(2);
+    await pr.stub.runCompleted(key('d-pia'), 9001, 'success');
+
+    // Only disallow removes an account. Its next command is refused, and it was told why once already.
+    await comment('maya', '/manki disallow @otto');
+    expect(github.comments.at(-1)).toBe(answer('`@otto` can no longer use Manki in this repository, unless it has write access.'));
+    await comment('maya', '/manki disallow @otto');
+    expect(github.comments.at(-1)).toBe(answer('`@otto` is not on the allow list of this repository.'));
+    const replies = github.comments.length;
+    await comment('otto', '/manki explain');
+    expect([github.dispatches.length, github.comments.length, await lastNote()]).toEqual([2, replies, 'commenter has no write access']);
+    await comment('maya', '/manki allowed');
+    expect(github.comments.at(-1)).toContain('\n| `@pia-renamed` | `@maya` | 2030-01-01 |\n');
+    expect(github.comments.at(-1)).not.toContain('otto');
+    expect(logged(log, 'allow_list_added').map((line) => [line.login, line.allowed_by])).toEqual([['otto', 'maya'], ['pia', 'maya']]);
+    // GitHub takes a comment on a pull request only with `pull_requests: write`, so every token that may post holds it.
+    const posting = github.mints.filter((mint) => mint.permissions.issues === 'write');
+    expect(posting.length).toBeGreaterThan(0);
+    expect(posting.filter((mint) => mint.permissions.pull_requests !== 'write')).toEqual([]);
   });
 
   describe('waiting check', () => {
