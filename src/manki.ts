@@ -102,6 +102,9 @@ export const HELP_REPLY = [
   '| `/manki dismiss [finding]` | Dismisses a finding |',
   '| `/manki remember <instruction>` | Stores an instruction for future reviews |',
   '| `/manki forget <text>` | Removes a learning or suppression |',
+  '| `/manki allow @<login>` | Lets an account without write access use Manki in this repository. Needs the `maintain` or `admin` role |',
+  '| `/manki disallow @<login>` | Takes that back. Needs the `maintain` or `admin` role |',
+  '| `/manki allowed` | Lists the accounts allowed to use Manki here, for anyone with write access or on that list |',
   '| `/manki help` | Shows this message |',
   '',
   '`@manki-review` works as the prefix too. A reply to a Manki review comment gets an answer in its thread.',
@@ -139,6 +142,19 @@ export function parseCommandType(body: string): CommandType {
   const lower = body.replace(/```[\s\S]*?(?:```|$)|`[^`\n]*`/g, ' ').toLowerCase();
   const match = lower.match(BOT_PREFIX_PATTERN);
   return match ? (match[1] as CommandType) : 'generic';
+}
+
+/** A command that changes or lists the accounts a maintainer allowed to use Manki. The Worker answers it with no run. */
+export type AccessCommand = { command: 'allow' | 'disallow'; login: string | null } | { command: 'allowed' };
+
+// The Worker's own commands, which Manki does not know. A GitHub login holds letters, digits and single hyphens.
+const ACCESS_PATTERN = /(?:@manki-review|@manki|\/manki)\s+(allowed|allow|disallow)(?![\w-])(?:[ \t]+@?([a-z\d](?:[a-z\d-]{0,38}))(?![\w-]))?/;
+
+/** Returns the access command of `body`, or null when it holds none. A command quoted in inline code or a code block is text. */
+export function parseAccessCommand(body: string): AccessCommand | null {
+  const match = body.replace(/```[\s\S]*?(?:```|$)|`[^`\n]*`/g, ' ').toLowerCase().match(ACCESS_PATTERN);
+  if (!match) return null;
+  return match[1] === 'allowed' ? { command: 'allowed' } : { command: match[1] as 'allow' | 'disallow', login: match[2] ?? null };
 }
 
 /** The skip rules of a base branch's `.manki.yml`. */
@@ -337,15 +353,31 @@ export function setBoxes(body: string, changes: BoxChange[]): string {
 /** Starts the line above each box Manki puts into a message for the next step it names, as Manki's `BOX_ANCHOR`. */
 const MESSAGE_BOX_ANCHOR = '<!-- manki-issue-box -->';
 
-/** The boxes Manki puts into a message other than the settings block, as its `MessageBox`. */
-export type MessageBox = 'again' | 'check' | 'forget' | 'dismiss';
+/**
+ * The boxes Manki puts into a message other than the settings block, as its `MessageBox`, and the Worker's `allow` box
+ * in its reply to a refused command, whose id is the user id of the account it allows.
+ */
+export type MessageBox = 'again' | 'check' | 'forget' | 'dismiss' | 'allow';
 
-const MESSAGE_BOXES: readonly string[] = ['again', 'check', 'forget', 'dismiss'] satisfies MessageBox[];
+const MESSAGE_BOXES: readonly string[] = ['again', 'check', 'forget', 'dismiss', 'allow'] satisfies MessageBox[];
+
+/** Marks the Worker's reply to a refused command, the only comment whose allow box counts. */
+export const REFUSAL_MARKER = '<!-- manki-refusal -->';
+
+/** The label of an allow box, which names the login it allows. */
+const ALLOW_LABEL = /^Allow @([A-Za-z\d](?:[A-Za-z\d-]{0,38})) to use Manki in this repository$/;
+
+/** Returns the box that allows the account `login`, with user id `id`, to use Manki in the repository. */
+export function allowBox(id: number, login: string): string {
+  return `${MESSAGE_BOX_ANCHOR}\n- [ ] Allow @${login} to use Manki in this repository <!-- manki-box:allow:${id} -->`;
+}
 
 /** A message box ticked in an edit, with the id of what it acts on, such as a learning, when it has one. */
 export interface MessageTick {
   box: MessageBox;
   id?: string;
+  /** For an allow box, the login its label names, which must be the one refused under its id. */
+  login?: string;
 }
 
 // Manki's `BOX_LINE` in `src/issue-box.ts`, with the tick and the label taken apart.
@@ -386,8 +418,9 @@ const tickKey = ({ box, id }: MessageTick) => (id === undefined ? box : `${box}:
 export function tickedMessageBoxes(before: string, after: string): MessageTick[] {
   const old = new Map(messageBoxes(before.split('\n')).map((box) => [tickKey(box), box.ticked]));
   const ticks = new Map<string, MessageTick>();
-  for (const { box, id, ticked } of messageBoxes(after.split('\n'))) {
-    const tick = { box, ...(id !== undefined && { id }) };
+  for (const { box, id, ticked, label } of messageBoxes(after.split('\n'))) {
+    const login = box === 'allow' ? ALLOW_LABEL.exec(label)?.[1] : undefined;
+    const tick = { box, ...(id !== undefined && { id }), ...(login !== undefined && { login }) };
     if (ticked && old.get(tickKey(tick)) === false) ticks.set(tickKey(tick), tick);
   }
   return [...ticks.values()];

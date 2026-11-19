@@ -1,7 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import { createAppJWT } from './app-jwt';
 import { allowedAccounts, type Env } from './env';
-import { githubApi, githubGraphql, isRateLimited, mintRepositoryToken } from './github';
+import { type Account, githubApi, githubGraphql, isRateLimited, mintRepositoryToken } from './github';
 import { log } from './log';
 import { BOT_LOGIN, hasOwnMarker, MANKI_COMMENT_MARKER, retryAfter, reviewedCommit } from './manki';
 import { STALE_COMMENT_MS, type Target } from './routing';
@@ -43,6 +43,14 @@ interface OptInRow extends Record<string, string | number | null> {
   takes_over_check: number;
 }
 
+/** An entry of a repository's allow list. `allowed_at` is in milliseconds. */
+export interface AllowedAccount extends Record<string, string | number> {
+  user_id: number;
+  login: string;
+  allowed_by: string;
+  allowed_at: number;
+}
+
 interface HookDelivery {
   id: number;
   guid: string;
@@ -75,6 +83,20 @@ interface ReviewsResponse {
 
 /** Marks a Manki review that reached no verdict, which Manki does not count as covering its head. */
 const NO_VERDICT_MARKER = '<!-- manki-no-verdict -->';
+
+/**
+ * Whether the account `sender`, with user id `senderId`, is on the allow list of the repository. It is asked each time,
+ * so a removal counts at once. Returns null when the list cannot be read, which a caller reads as no.
+ */
+export async function isAllowedSender(env: Env, repositoryId: number, sender: string, senderId: number | null | undefined): Promise<boolean | null> {
+  if (senderId === null || senderId === undefined || sender === '') return false;
+  try {
+    return await env.RECONCILER.getByName(RECONCILER_NAME).isAllowedAccount(repositoryId, senderId, sender);
+  } catch (error) {
+    log('allow_list_check_failed', { repository_id: repositoryId, sender, error: String(error) });
+    return null;
+  }
+}
 
 /** Counts the GitHub calls of one pass. */
 class Budget {
@@ -146,6 +168,63 @@ export class Reconciler extends DurableObject<Env> {
       checked_at INTEGER NOT NULL,
       PRIMARY KEY (repository_id, number, head_sha)
     )`);
+    // The accounts without write access a maintainer allowed to use Manki in one repository, by user id.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS allowed_accounts (
+      repository_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      login TEXT NOT NULL,
+      allowed_by TEXT NOT NULL,
+      allowed_at INTEGER NOT NULL,
+      PRIMARY KEY (repository_id, user_id)
+    )`);
+  }
+
+  /**
+   * Adds `account` to the allow list of the repository, as allowed by the login `by`. Returns false when it is on the
+   * list already, which keeps who allowed it and when, and only takes its current login.
+   */
+  async allowAccount(repositoryId: number, account: Account, by: string): Promise<boolean> {
+    if (await this.isAllowedAccount(repositoryId, account.id, account.login)) return false;
+    this.sql.exec(
+      'INSERT INTO allowed_accounts (repository_id, user_id, login, allowed_by, allowed_at) VALUES (?, ?, ?, ?, ?)',
+      repositoryId, account.id, account.login, by, Date.now(),
+    );
+    log('allow_list_added', { repository_id: repositoryId, user_id: account.id, login: account.login, allowed_by: by });
+    return true;
+  }
+
+  /**
+   * Removes from the allow list of the repository the account with user id `account.id` and any entry stored under the
+   * login `account.login`, which finds an account GitHub no longer knows. Returns the logins of the entries removed.
+   */
+  async disallowAccount(repositoryId: number, account: { id: number | null; login: string }): Promise<string[]> {
+    const removed = this.sql.exec<{ user_id: number; login: string }>(
+      'DELETE FROM allowed_accounts WHERE repository_id = ? AND (user_id = ? OR lower(login) = lower(?)) RETURNING user_id, login',
+      repositoryId, account.id ?? 0, account.login,
+    ).toArray();
+    for (const row of removed) log('allow_list_removed', { repository_id: repositoryId, user_id: row.user_id, login: row.login });
+    return removed.map((row) => row.login);
+  }
+
+  /** Returns the allow list of the repository, the oldest entry first. */
+  async allowList(repositoryId: number): Promise<AllowedAccount[]> {
+    return this.sql.exec<AllowedAccount>(
+      'SELECT user_id, login, allowed_by, allowed_at FROM allowed_accounts WHERE repository_id = ? ORDER BY allowed_at, user_id', repositoryId,
+    ).toArray();
+  }
+
+  /**
+   * Whether the account with user id `userId` is on the allow list of the repository. With `login`, an entry under an
+   * older login takes it, so the list shows a renamed account by its current login.
+   */
+  async isAllowedAccount(repositoryId: number, userId: number, login?: string): Promise<boolean> {
+    const row = this.sql.exec<{ login: string }>(
+      'SELECT login FROM allowed_accounts WHERE repository_id = ? AND user_id = ?', repositoryId, userId,
+    ).toArray()[0];
+    if (row && login && row.login !== login) {
+      this.sql.exec('UPDATE allowed_accounts SET login = ? WHERE repository_id = ? AND user_id = ?', login, repositoryId, userId);
+    }
+    return row !== undefined;
   }
 
   /**

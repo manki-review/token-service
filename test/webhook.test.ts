@@ -2,8 +2,10 @@ import { runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { verifyWebhookSignature } from '../src/signature';
 import worker from '../src/index';
+import type { Env } from '../src/env';
 import { DEFAULT_EVENTS_PER_HOUR, eventsPerHour, InstallationLimiter } from '../src/limiter';
-import { coordinator, DELIVERY_ID, freezeClock, INSTALLATION_ID, logged, OIDC_AUDIENCE, OWNER, OWNER_ID, postWebhook, REPO, signWebhook, stubGitHub, TEST_ENV, workRows } from './helpers';
+import { RECONCILER_NAME } from '../src/reconciler';
+import { coordinator, DELIVERY_ID, freezeClock, INSTALLATION_ID, logged, OIDC_AUDIENCE, OWNER, OWNER_ID, postWebhook, REPO, RUNTIME_ENV, signWebhook, stubGitHub, TEST_ENV, workRows } from './helpers';
 import { forkPullRequestEvent, HEAD_SHA, issueCommentEvent, MANKI_AUTHOR, PR_NUMBER, pullRequestEvent, REPOSITORY_ID, reviewEvent, reviewThreadEvent, workflowRunEvent } from './payloads';
 
 const encoder = new TextEncoder();
@@ -307,6 +309,42 @@ describe('/webhook', () => {
     advanceClock(56 * 60_000);
     await send(98, 'NONE', newLogin());
     expect(logged(log, 'token_minted')).toHaveLength(2);
+  });
+
+  it('reuses only a no of the allow list for the writer cache\'s 5 minutes, so an allow may wait but a removal never does', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const [outsider, ally] = [newLogin(), newLogin()];
+    const ids = { [outsider]: 920_000 + lookupPr, [ally]: 930_000 + lookupPr };
+    // PR numbers no other test file uses, since a coordinator's storage can outlive its test.
+    let number = 9_100;
+    stubGitHub({ permissions: { [outsider]: 'read', [ally]: 'read' } });
+    const registry = RUNTIME_ENV.RECONCILER.getByName(RECONCILER_NAME);
+    await registry.allowAccount(REPOSITORY_ID, { id: ids[ally], login: ally }, 'maya');
+    const asked: string[] = [];
+    const RECONCILER = { getByName: () => ({
+      isAllowedAccount: async (repositoryId: number, userId: number, login?: string) => {
+        asked.push(login ?? '');
+        return registry.isAllowedAccount(repositoryId, userId, login);
+      },
+    }) } as unknown as Env['RECONCILER'];
+    const send = async (login: string) => {
+      number++;
+      const user = { login, id: ids[login], type: 'User' };
+      const payload = issueCommentEvent('@manki explain', { number, association: 'NONE', author: user, sender: user });
+      expect((await postWebhook({ event: 'issue_comment', payload, env: { ...TEST_ENV, RECONCILER } })).status).toBe(202);
+      return (await workRows(coordinator(REPOSITORY_ID, number)))[0].writer;
+    };
+
+    // Two comments from one outsider make one request, and an allowed account is asked each time.
+    expect([await send(outsider), await send(outsider), await send(ally), await send(ally)]).toEqual([0, 0, 1, 1]);
+    expect(asked).toEqual([outsider, ally, ally]);
+    // A removal counts at the next comment, and an allow within the writer cache's 5 minutes.
+    await registry.disallowAccount(REPOSITORY_ID, { id: ids[ally], login: ally });
+    await registry.allowAccount(REPOSITORY_ID, { id: ids[outsider], login: outsider }, 'maya');
+    expect([await send(ally), await send(outsider)]).toEqual([0, 0]);
+    advanceClock(5 * 60_000 + 1);
+    expect(await send(outsider)).toBe(1);
+    expect(asked).toEqual([outsider, ally, ally, ally, outsider]);
   });
 
   it('ignores outsiders\' comments over the installation cap until the next hour, without touching their coordinators', async () => {

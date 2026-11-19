@@ -42,9 +42,13 @@ const FAILED_WRITES = new Set([
   'coordinator_refusal_reply_failed',
 ]);
 
+/** A failed read of a repository's allow list, which counts the account as not allowed. */
+const FAILED_ALLOW_LIST_READS = new Set(['allow_list_check_failed', 'access_failed']);
+
 /** The messages the window query reads, besides timed out items and any line with a 5xx status or error. */
 export const SIGNAL_MESSAGES = [
-  'coordinator_start_error', ...FAILED_WRITES, 'coordinator_waiting_check_refused', 'coordinator_requeued', 'coordinator_cancel_failed',
+  'coordinator_start_error', ...FAILED_WRITES, ...FAILED_ALLOW_LIST_READS, 'coordinator_waiting_check_refused', 'coordinator_requeued',
+  'coordinator_cancel_failed',
 ];
 
 /** The messages that queue, hold, start or end work, which the stuck work check reads over a longer span. */
@@ -134,6 +138,8 @@ export function findings(signals: LogEvent[], queue: LogEvent[], now: number, pu
   const forbidden = (source: Record<string, unknown>) => source.msg === 'coordinator_waiting_check_refused' && source.status === 403;
   const writes = signals.filter((event) => FAILED_WRITES.has(text(event.source.msg)) || forbidden(event.source))
     .map((event) => ({ event, detail: text(event.source.error ?? (event.source.status === undefined ? '' : `status ${text(event.source.status)}`)) }));
+  const allowListReads = signals.filter((event) => FAILED_ALLOW_LIST_READS.has(text(event.source.msg)))
+    .map((event) => ({ event, detail: text(event.source.error) }));
   const cancels = signals.filter((event) => event.source.msg === 'coordinator_requeued'
     || event.source.msg === 'coordinator_cancel_failed'
     || (event.source.msg === 'coordinator_finished' && event.source.status === 'timed_out'))
@@ -143,6 +149,7 @@ export function findings(signals: LogEvent[], queue: LogEvent[], now: number, pu
   return [
     finding('Start errors', starts, publicRepos),
     finding('Failed note and comment writes', writes, publicRepos),
+    finding('Failed allow list reads', allowListReads, publicRepos),
     finding('Runs the safety poll cancelled or queued again', cancels, publicRepos),
     finding('5xx statuses', serverErrors, publicRepos),
     finding('Work queued over 20 minutes without a dispatch', stuck(queue, now), publicRepos),

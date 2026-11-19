@@ -27,6 +27,9 @@ describe('findings', () => {
       event(24.5, { msg: 'coordinator_waiting_check_refused', work_id: 8, check_id: 500, status: 403 }),
       event(24.6, { msg: 'coordinator_waiting_check_refused', work_id: 9, check_id: 501, status: 404 }),
       event(24.2, { msg: 'coordinator_refusal_reply_failed', work_id: 10, error: 'Error: posting the reply failed with 403' }),
+      // A failed read of the allow list names a repository only by its id, or by name for the run's question.
+      event(15, { repo: undefined, pr: undefined, msg: 'allow_list_check_failed', repository_id: 7, sender: 'otto', error: 'Error: storage is gone' }),
+      event(14, { repo: undefined, pr: undefined, msg: 'access_failed', repository: 'manki-review/manki', user_id: 77, error: 'Error: storage is gone' }),
     ];
     expect(findings(signals, [], NOW, PUBLIC)).toEqual([
       {
@@ -47,6 +50,12 @@ describe('findings', () => {
           '08:36:00 `coordinator_reaction_failed` manki-review/manki#1289: status 403',
         ],
         requestIds: ['req-2', 'req-9', 'req-11', 'req-3'],
+        moreRequestIds: 0,
+      },
+      {
+        title: 'Failed allow list reads (2)',
+        lines: ['08:45:00 `allow_list_check_failed`', '08:46:00 `access_failed` manki-review/manki: Error: storage is gone'],
+        requestIds: ['req-12', 'req-13'],
         moreRequestIds: 0,
       },
       {
