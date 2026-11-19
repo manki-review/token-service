@@ -2490,10 +2490,18 @@ describe('PrCoordinator dispatch', () => {
     expect(await lastNote()).toBe('commenter lacks the maintain role');
 
     // A maintainer allows an account by command, also before its first command, and only a person's account.
+    // The reply is the same whether the list changed or not, so a retry after a failed post says what a clean run says.
+    const allowed = () => answer('`@pia` can use Manki in this repository. `/manki disallow @pia` takes that back.');
+    github.commentStatus = 502;
     await comment('maya', '/manki allow @Pia');
-    expect(github.comments.at(-1)).toBe(answer('`@pia` can now use Manki in this repository. `/manki disallow @pia` takes that back.'));
+    expect((await workRows(pr.stub)).at(-1)).toMatchObject({ status: 'queued', errors: 1 });
+    github.commentStatus = 201;
+    advanceClock(backoff(0));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.comments.slice(-2)).toEqual([allowed(), allowed()]);
+    expect(await lastNote()).toBe('pia was already allowed');
     await comment('maya', '/manki allow @pia again');
-    expect(github.comments.at(-1)).toBe(answer('`@pia` may already use Manki in this repository.'));
+    expect(github.comments.at(-1)).toBe(allowed());
     await comment('maya', '/manki allow @ci-app');
     expect(github.comments.at(-1)).toBe(answer('`@ci-app` is no person\'s account on GitHub, so it cannot be allowed.'));
     await comment('maya', '/manki allow');
@@ -2506,9 +2514,9 @@ describe('PrCoordinator dispatch', () => {
 
     // Only disallow removes an account. Its next command is refused, and it was told why once already.
     await comment('maya', '/manki disallow @otto');
-    expect(github.comments.at(-1)).toBe(answer('`@otto` can no longer use Manki in this repository, unless it has write access.'));
+    expect([github.comments.at(-1), await lastNote()]).toEqual([answer('`@otto` is not on the allow list of this repository.'), 'disallowed otto']);
     await comment('maya', '/manki disallow @otto');
-    expect(github.comments.at(-1)).toBe(answer('`@otto` is not on the allow list of this repository.'));
+    expect([github.comments.at(-1), await lastNote()]).toEqual([answer('`@otto` is not on the allow list of this repository.'), 'otto was not allowed']);
     const replies = github.comments.length;
     await comment('otto', '/manki explain');
     expect([github.dispatches.length, github.comments.length, await lastNote()]).toEqual([2, replies, 'commenter has no write access']);

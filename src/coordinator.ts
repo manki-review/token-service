@@ -1927,18 +1927,15 @@ export class PrCoordinator extends DurableObject<Env> {
       if (command.command === 'disallow') {
         const removed = await registry.disallowAccount(target.repositoryId, { id: account?.id ?? null, login: command.login });
         const login = account?.login ?? command.login;
-        reply = removed.length > 0
-          ? `\`@${login}\` can no longer use Manki in this repository, unless it has write access.`
-          : `\`@${login}\` is not on the allow list of this repository.`;
+        // One text whether the list changed or not, so a retry after a failed post says the same true thing.
+        reply = `\`@${login}\` is not on the allow list of this repository.`;
         note = removed.length > 0 ? `disallowed ${removed.join(', ')}` : `${login} was not allowed`;
       } else if (account === null) {
         reply = `\`@${command.login}\` is no person's account on GitHub, so it cannot be allowed.`;
         note = 'no person\'s account to allow';
       } else {
         const added = await registry.allowAccount(target.repositoryId, account, item.sender);
-        reply = added
-          ? `\`@${account.login}\` can now use Manki in this repository. \`/manki disallow @${account.login}\` takes that back.`
-          : `\`@${account.login}\` may already use Manki in this repository.`;
+        reply = `\`@${account.login}\` can use Manki in this repository. \`/manki disallow @${account.login}\` takes that back.`;
         note = added ? `allowed ${account.login}` : `${account.login} was already allowed`;
       }
     }
