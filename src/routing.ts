@@ -12,6 +12,7 @@ import {
   type MessageTick,
   parseAccessCommand,
   parseCommandType,
+  REFUSAL_MARKER,
   type ReviewMode,
   SETTINGS_MARKER,
   tickedIssueBoxes,
@@ -115,6 +116,8 @@ export interface Work {
    * put back when the editor lacks write access.
    */
   ticks?: MessageTick[];
+  /** For allow ticks, whether they are in the Worker's refusal reply, the only place an allow box counts. */
+  inRefusal?: boolean;
   /** For a settings edit, when the comment was edited, so a late delivery cannot undo a newer edit. */
   editedAt?: number;
   /**
@@ -385,9 +388,13 @@ function boxTick(
   if (before === undefined) return null;
   const ticks = tickedMessageBoxes(before, body);
   if (ticks.length === 0 && (kind === 'comment' || tickedIssueBoxes(before, body).length === 0)) return null;
-  // The Worker applies an allow tick itself, and the editor needs the maintain role, which it checks then.
+  // The Worker applies an allow tick itself, and the editor needs the maintain role, which it checks then. Only a box in
+  // the Worker's refusal reply counts, so a tick anywhere else is put back.
   const allows = ticks.filter(({ box }) => box === 'allow');
-  if (allows.length > 0) return { ...work('help', 'access', payload, event, objectId), acknowledge: false, writer: false, checkWriter: true, ticks: allows };
+  if (allows.length > 0) {
+    const inRefusal = kind === 'comment' && body.includes(REFUSAL_MARKER);
+    return { ...work('help', 'access', payload, event, objectId), acknowledge: false, writer: false, checkWriter: true, ticks: allows, inRefusal };
+  }
   const again = ticks.some(({ box }) => box === 'again');
   const lane: Lane = kind === 'comment' && ticks.every(({ box }) => box === 'forget') ? 'chat' : 'state';
   return {

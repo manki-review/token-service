@@ -6,7 +6,7 @@ import {
 } from './github';
 import { log } from './log';
 import {
-  type AccessCommand, allowBox, autoReviewIsOn, type BaseConfig, BOT_LOGIN, boxLabels, type BoxChange, cancelledProgress, HELP_REPLY, isMankiGraphqlLogin, isRunningProgress, MANKI_COMMENT_MARKER,
+  type AccessCommand, allowBox, REFUSAL_MARKER, autoReviewIsOn, type BaseConfig, BOT_LOGIN, boxLabels, type BoxChange, cancelledProgress, HELP_REPLY, isMankiGraphqlLogin, isRunningProgress, MANKI_COMMENT_MARKER,
   MANKI_LOGINS, matchSkipRule, type MessageTick, parseConfig, renderSettingsBlock, REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes, settleMessageBoxes,
   type SettingsBox, settingsHead, skipRulesOf, withSettingsStatus,
 } from './manki';
@@ -282,6 +282,7 @@ interface SettingsEdit {
   at: number;
   changes: BoxChange[];
   ticks?: MessageTick[];
+  inRefusal?: boolean;
 }
 
 const editOf = (row: WorkRow): SettingsEdit => JSON.parse(row.boxes ?? '{"at":0,"changes":[]}') as SettingsEdit;
@@ -785,7 +786,7 @@ export class PrCoordinator extends DurableObject<Env> {
       Number(work.acknowledge),
       work.modes?.length ? JSON.stringify(work.modes) : null,
       work.boxes || work.ticks
-        ? JSON.stringify({ at: work.editedAt ?? 0, changes: work.boxes ?? [], ...(work.ticks && { ticks: work.ticks }) } satisfies SettingsEdit)
+        ? JSON.stringify({ at: work.editedAt ?? 0, changes: work.boxes ?? [], ...(work.ticks && { ticks: work.ticks }), ...(work.inRefusal !== undefined && { inRefusal: work.inRefusal }) } satisfies SettingsEdit)
         : null,
       work.access ? JSON.stringify(work.access) : null,
     ).one().id;
@@ -1489,9 +1490,11 @@ export class PrCoordinator extends DurableObject<Env> {
       this.writers.set(item.sender, { writer, until: Date.now() + WRITER_CACHE_MS });
     }
     if (writer) return true;
-    // The allow list is asked each time, so a removal counts at once.
+    // The allow list is asked each time, so a removal counts at once. A failed read is tried again, as a failed lookup is.
     this.calls++;
-    return await isAllowedSender(this.env, this.target().repositoryId, item.sender, item.sender_id) === true;
+    const allowed = await isAllowedSender(this.env, this.target().repositoryId, item.sender, item.sender_id);
+    if (allowed === null) throw new Error('reading the allow list failed');
+    return allowed;
   }
 
   /**
@@ -1819,10 +1822,12 @@ export class PrCoordinator extends DurableObject<Env> {
       // The box needs the account's id, which a row from before the column existed lacks.
       const reply = item.sender_id === null
         ? refusal
-        : `${refusal} A maintainer can allow you to use Manki here with the box below.\n\n${allowBox(item.sender_id, item.sender)}`;
+        : `${refusal} A maintainer can allow you to use Manki here with the box below.\n\n${allowBox(item.sender_id, item.sender)}\n${REFUSAL_MARKER}`;
       // No answer marker: a writer's later edit of the refused comment must still run it.
       await this.postAnswer(item, target, token, reply, false);
       this.setMeta('refused', [...(this.getMeta<string[]>('refused') ?? []), sender]);
+      // An allow tick counts only for an account this PR refused.
+      if (item.sender_id !== null) this.setMeta('refused_ids', [...(this.getMeta<number[]>('refused_ids') ?? []), item.sender_id]);
     } catch (error) {
       log('coordinator_refusal_reply_failed', { ...this.logFields(), work_id: item.id, sender: item.sender, error: String(error) });
     }
@@ -1882,16 +1887,23 @@ export class PrCoordinator extends DurableObject<Env> {
     }
 
     if (command === null) {
-      const ids = (editOf(item).ticks ?? []).filter(({ box }) => box === 'allow').map(({ id }) => id ?? '');
+      const edit = editOf(item);
+      const ids = (edit.ticks ?? []).filter(({ box }) => box === 'allow').map(({ id }) => id ?? '');
+      const refused = new Set((this.getMeta<number[]>('refused_ids') ?? []).map(String));
+      const refusal = edit.inRefusal === true && ids.every((id) => refused.has(id));
+      if (!maintainer || !refusal) {
+        await this.revertBoxes(item);
+        return end('skipped', !maintainer ? 'ticker lacks the maintain role' : edit.inRefusal === true ? 'the box names no account this PR refused' : 'the box is not in a refusal reply');
+      }
       const accounts: Account[] = [];
-      for (const id of maintainer ? ids : []) {
+      for (const id of ids) {
         this.calls++;
         const account = /^[1-9][0-9]{0,15}$/.test(id) ? await readAccount(reader, { id: Number(id) }) : null;
         if (account) accounts.push(account);
       }
       if (accounts.length === 0 || accounts.length < ids.length) {
         await this.revertBoxes(item);
-        return end('skipped', maintainer ? 'the box names no person\'s account' : 'ticker lacks the maintain role');
+        return end('skipped', 'the box names no person\'s account');
       }
       for (const account of accounts) {
         this.calls++;

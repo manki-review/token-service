@@ -21,7 +21,8 @@ import {
   type Delivery,
   UNTRUSTED_DISPATCHES_PER_HOUR,
 } from '../src/coordinator';
-import { HELP_REPLY, withSettingsStatus } from '../src/manki';
+import { allowBox, HELP_REPLY, REFUSAL_MARKER, withSettingsStatus } from '../src/manki';
+import { Reconciler, RECONCILER_NAME } from '../src/reconciler';
 import { routeDelivery, type Target, type WebhookPayload } from '../src/routing';
 import {
   apiRequests,
@@ -2426,6 +2427,32 @@ describe('PrCoordinator dispatch', () => {
     expect(github.mints).toContainEqual({ permissions: { metadata: 'read' }, repository_ids: [REPOSITORY_ID] });
   });
 
+  it('tries a command again when the allow list cannot be read, and posts no refusal for it', async () => {
+    const pr = pullRequest();
+    const github = Object.assign(fakeGitHub(pr.number), { accounts: { olga: { id: 61 } } as Record<string, { id: number }> });
+    const user = { login: 'olga', id: 61, type: 'User' };
+    const payload = issueCommentEvent('/manki explain', { number: pr.number, association: 'NONE', sender: user, author: user });
+    const failing = vi.spyOn(Reconciler.prototype, 'isAllowedAccount').mockRejectedValue(new Error('storage is gone'));
+    try {
+      expect((await postWebhook({ event: 'issue_comment', payload })).status).toBe(202);
+      await runDurableObjectAlarm(pr.stub);
+    } finally {
+      failing.mockRestore();
+    }
+    expect(await workRows(pr.stub)).toMatchObject([{ kind: 'comment', status: 'queued', errors: 1 }]);
+    expect(github.comments).toEqual([]);
+    // The webhook handler and the coordinator each failed to read it.
+    expect(logged(log, 'allow_list_check_failed').map((line) => [line.sender, line.error])).toEqual(Array(2).fill(['olga', 'Error: storage is gone']));
+    // Once the list reads again, the command of an allowed account runs.
+    await RUNTIME_ENV.RECONCILER.getByName(RECONCILER_NAME).allowAccount(REPOSITORY_ID, { id: 61, login: 'olga' }, 'maya');
+    advanceClock(backoff(0));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches).toHaveLength(1);
+    expect(github.comments).toEqual([]);
+    // The list is shared by every test of the repository.
+    await RUNTIME_ENV.RECONCILER.getByName(RECONCILER_NAME).disallowAccount(REPOSITORY_ID, { id: 61, login: 'olga' });
+  });
+
   it('lets a maintainer allow an account by the box in the refusal or by command, which then counts as a writer until disallowed', async () => {
     const pr = pullRequest();
     const github = Object.assign(fakeGitHub(pr.number), {
@@ -2441,13 +2468,13 @@ describe('PrCoordinator dispatch', () => {
       await runDurableObjectAlarm(pr.stub);
     };
     const REFUSAL = 5005;
-    /** Delivers `login`'s tick of the box in the refusal reply and runs the alarm. */
-    const tick = async (login: string) => {
-      const before = github.issueComments.get(REFUSAL)!;
+    /** Delivers `login`'s tick of the allow box in Manki's comment `id`, the refusal reply by default, and runs the alarm. */
+    const tick = async (login: string, id = REFUSAL) => {
+      const before = github.issueComments.get(id)!;
       const after = before.replace('- [ ] Allow', '- [x] Allow');
-      github.issueComments.set(REFUSAL, after);
+      github.issueComments.set(id, after);
       const payload = issueCommentEvent(after, { number: pr.number, action: 'edited', author: MANKI_AUTHOR, sender: user(login), previousBody: before });
-      expect((await postWebhook({ event: 'issue_comment', payload: { ...payload, comment: { ...payload.comment!, id: REFUSAL } } })).status).toBe(202);
+      expect((await postWebhook({ event: 'issue_comment', payload: { ...payload, comment: { ...payload.comment!, id } } })).status).toBe(202);
       await runDurableObjectAlarm(pr.stub);
     };
     const lastNote = async () => (await workRows(pr.stub)).at(-1)?.note;
@@ -2457,15 +2484,29 @@ describe('PrCoordinator dispatch', () => {
     await comment('otto', '/manki explain');
     const refusal = `@otto Manki takes commands only from people with write access to this repository, so it did not act on [your comment](https://github.com/${OWNER}/${REPO}/issues/${pr.number}#issuecomment-7001). Someone with write access can post the command instead. A maintainer can allow you to use Manki here with the box below.`;
     // The refusal carries no answer marker, so a writer's later edit of the comment still runs it.
-    expect(github.comments).toEqual([`${refusal}\n\n<!-- manki-issue-box -->\n- [ ] Allow @otto to use Manki in this repository <!-- manki-box:allow:31 -->`]);
+    expect(github.comments).toEqual([`${refusal}\n\n<!-- manki-issue-box -->\n- [ ] Allow @otto to use Manki in this repository <!-- manki-box:allow:31 -->\n${REFUSAL_MARKER}`]);
     github.issueComments.set(REFUSAL, github.comments[0]);
+
+    // A maintainer's tick counts only in the refusal reply, and only for an account this PR refused. A box in another
+    // comment of Manki's, and one naming an account never refused here, are put back and allow nothing.
+    const [OTHER, UNREFUSED] = [5006, 5007];
+    github.issueComments.set(OTHER, allowBox(31, 'otto'));
+    github.issueComments.set(UNREFUSED, `${allowBox(41, 'pia')}\n${REFUSAL_MARKER}`);
+    for (const id of [OTHER, UNREFUSED]) {
+      const before = github.issueComments.get(id);
+      await tick('maya', id);
+      expect(github.issueComments.get(id)).toBe(before);
+    }
+    expect((await workRows(pr.stub)).slice(-2).map((row) => [row.status, row.note])).toEqual([
+      ['skipped', 'the box is not in a refusal reply'], ['skipped', 'the box names no account this PR refused'],
+    ]);
 
     // A tick by the account itself, or by a writer without the maintain role, is put back and allows nothing.
     for (const login of ['otto', 'wes']) {
       await tick(login);
       expect(github.issueComments.get(REFUSAL)).toBe(github.comments[0]);
     }
-    expect((await workRows(pr.stub)).slice(1).map((row) => [row.kind, row.status, row.note])).toEqual([
+    expect((await workRows(pr.stub)).slice(3).map((row) => [row.kind, row.status, row.note])).toEqual([
       ['access', 'skipped', 'commenter has no write access'], ['access', 'skipped', 'ticker lacks the maintain role'],
     ]);
     // A maintainer's tick allows the account, and the box stays ticked.

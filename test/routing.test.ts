@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { allowBox } from '../src/manki';
+import { allowBox, REFUSAL_MARKER } from '../src/manki';
 import { routeDelivery, type Route, type WebhookPayload } from '../src/routing';
 import { INSTALLATION_ID, OWNER, OWNER_ID, REPO } from './helpers';
 import {
@@ -34,7 +34,7 @@ const FORGET = message('forget:abc123', 'Forget this learning', 'Saved a learnin
 const DISMISS = `${FINDING_COMMENT}\n<!-- manki-issue-box -->\n- [ ] Dismiss this finding <!-- manki-box:dismiss -->`;
 const TICKED_DISMISS = DISMISS.replace('[ ] Dismiss', '[x] Dismiss');
 /** The Worker's reply to a refused command, with the box that allows its sender. */
-const ALLOW = `@bob Manki takes commands only from people with write access.\n\n${allowBox(31, 'bob')}`;
+const ALLOW = `@bob Manki takes commands only from people with write access.\n\n${allowBox(31, 'bob')}\n${REFUSAL_MARKER}`;
 
 /** An edit of Manki's review body from `before` to `after`. GitHub names the review's author, Manki, as the sender. */
 function reviewEdit(after: string, before?: string, review: Record<string, unknown> = {}): WebhookPayload {
@@ -359,10 +359,19 @@ describe('routeDelivery', () => {
     const tick = routeDelivery('issue_comment', issueCommentEvent(ticked(ALLOW), { action: 'edited', author: MANKI_AUTHOR, sender: bob, previousBody: ALLOW }));
     expect(tick.type === 'work' && tick.work).toMatchObject({
       lane: 'help', kind: 'access', objectId: COMMENT_ID, sender: 'bob', senderId: 31, writer: false, checkWriter: true, acknowledge: false, ticks: [{ box: 'allow', id: '31' }],
+      inRefusal: true,
     });
     // The sender of a review edit is Manki, whose id is never the editor's.
     const review = routeDelivery('pull_request_review', { ...reviewEdit(TICKED_FINDING, FINDING_COMMENT), sender: { ...MANKI_AUTHOR, id: 5 } });
     expect(review.type === 'work' && review.work.senderId).toBeUndefined();
+    // Only the refusal reply holds an allow box that counts. A tick anywhere else is marked so, and is put back.
+    const elsewhere = ALLOW.replace(`\n${REFUSAL_MARKER}`, '');
+    const allowTicks = (route: Route) => route.type === 'work' && [route.work.kind, route.work.ticks, route.work.inRefusal];
+    expect([
+      routeDelivery('issue_comment', issueCommentEvent(ticked(elsewhere), { action: 'edited', author: MANKI_AUTHOR, sender: bob, previousBody: elsewhere })),
+      routeDelivery('pull_request_review', reviewEdit(ticked(ALLOW), ALLOW)),
+      routeDelivery('pull_request_review_comment', findingEdit(ticked(ALLOW), ALLOW)),
+    ].map(allowTicks)).toEqual(Array(3).fill(['access', [{ box: 'allow', id: '31' }], false]));
   });
 
   it('names the boxes a settings edit ticked or unticked, and counts the editor as no writer until looked up', () => {

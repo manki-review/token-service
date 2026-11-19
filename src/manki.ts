@@ -361,6 +361,9 @@ export type MessageBox = 'again' | 'check' | 'forget' | 'dismiss' | 'allow';
 
 const MESSAGE_BOXES: readonly string[] = ['again', 'check', 'forget', 'dismiss', 'allow'] satisfies MessageBox[];
 
+/** Marks the Worker's reply to a refused command, the only comment whose allow box counts. */
+export const REFUSAL_MARKER = '<!-- manki-refusal -->';
+
 /** Returns the box that allows the account `login`, with user id `id`, to use Manki in the repository. */
 export function allowBox(id: number, login: string): string {
   return `${MESSAGE_BOX_ANCHOR}\n- [ ] Allow @${login} to use Manki in this repository <!-- manki-box:allow:${id} -->`;
