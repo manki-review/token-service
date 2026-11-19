@@ -2378,7 +2378,10 @@ describe('PrCoordinator dispatch', () => {
     // Each sender of a command is told once why it does nothing, with a link to the comment. A plain thread reply and an
     // edit of someone else's comment get no reply.
     const reply = (login: string, anchor: string) => `@${login} Manki takes commands only from people with write access to this repository, so it did not act on [your comment](https://github.com/${OWNER}/${REPO}/issues/${pr.number}#${anchor}${COMMENT_ID}). Someone with write access can post the command instead.`;
-    expect(github.comments).toEqual([`${reply('alice', 'issuecomment-')}\n<!-- manki-answered:${COMMENT_ID} -->`, reply('erin', 'discussion_r')]);
+    // GitHub needs `pull_requests: write` to comment on a PR, and no answer marker keeps a writer's later edit of the
+    // refused comment working.
+    expect(github.comments).toEqual([reply('alice', 'issuecomment-'), reply('erin', 'discussion_r')]);
+    expect(github.mints.filter((mint) => mint.permissions.issues === 'write').map((mint) => mint.permissions.pull_requests)).toEqual(['write']);
     expect((await workRows(pr.stub)).map((row) => [row.kind, row.status, row.note])).toEqual([
       ['comment', 'skipped', 'commenter has no write access'],
       ['help', 'skipped', 'commenter has no write access'],

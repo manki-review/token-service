@@ -1794,13 +1794,12 @@ export class PrCoordinator extends DurableObject<Env> {
     try {
       const target = await this.verifiedTarget();
       if (!target) return;
-      const token = await this.token({ issues: 'write' });
+      const token = await this.token({ issues: 'write', pull_requests: 'write' });
       if (token === null || !this.isDispatching(item.id)) return;
       const url = `https://github.com/${target.owner}/${target.repo}/issues/${target.number}#${anchor}${item.object_id}`;
       const reply = `@${item.sender} Manki takes commands only from people with write access to this repository, so it did not act on [your comment](${url}). Someone with write access can post the command instead.`;
-      // Manki marks the reply to a PR comment as its answer, as its `markAnswers` does.
-      const body = anchor === 'issuecomment-' ? `${reply}\n<!-- manki-answered:${item.object_id} -->` : reply;
-      const response = await this.api(token, `/repos/${target.owner}/${target.repo}/issues/${target.number}/comments`, { method: 'POST', body: { body } });
+      // No answer marker: a writer's later edit of the refused comment must still run it.
+      const response = await this.api(token, `/repos/${target.owner}/${target.repo}/issues/${target.number}/comments`, { method: 'POST', body: { body: reply } });
       if (!response.ok) throw new Error(`posting the reply failed with ${response.status}`);
       this.setMeta('refused', [...(this.getMeta<string[]>('refused') ?? []), sender]);
     } catch (error) {
