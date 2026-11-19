@@ -364,6 +364,9 @@ const MESSAGE_BOXES: readonly string[] = ['again', 'check', 'forget', 'dismiss',
 /** Marks the Worker's reply to a refused command, the only comment whose allow box counts. */
 export const REFUSAL_MARKER = '<!-- manki-refusal -->';
 
+/** The label of an allow box, which names the login it allows. */
+const ALLOW_LABEL = /^Allow @([A-Za-z\d](?:[A-Za-z\d-]{0,38})) to use Manki in this repository$/;
+
 /** Returns the box that allows the account `login`, with user id `id`, to use Manki in the repository. */
 export function allowBox(id: number, login: string): string {
   return `${MESSAGE_BOX_ANCHOR}\n- [ ] Allow @${login} to use Manki in this repository <!-- manki-box:allow:${id} -->`;
@@ -373,6 +376,8 @@ export function allowBox(id: number, login: string): string {
 export interface MessageTick {
   box: MessageBox;
   id?: string;
+  /** For an allow box, the login its label names, which must be the one refused under its id. */
+  login?: string;
 }
 
 // Manki's `BOX_LINE` in `src/issue-box.ts`, with the tick and the label taken apart.
@@ -413,8 +418,9 @@ const tickKey = ({ box, id }: MessageTick) => (id === undefined ? box : `${box}:
 export function tickedMessageBoxes(before: string, after: string): MessageTick[] {
   const old = new Map(messageBoxes(before.split('\n')).map((box) => [tickKey(box), box.ticked]));
   const ticks = new Map<string, MessageTick>();
-  for (const { box, id, ticked } of messageBoxes(after.split('\n'))) {
-    const tick = { box, ...(id !== undefined && { id }) };
+  for (const { box, id, ticked, label } of messageBoxes(after.split('\n'))) {
+    const login = box === 'allow' ? ALLOW_LABEL.exec(label)?.[1] : undefined;
+    const tick = { box, ...(id !== undefined && { id }), ...(login !== undefined && { login }) };
     if (ticked && old.get(tickKey(tick)) === false) ticks.set(tickKey(tick), tick);
   }
   return [...ticks.values()];

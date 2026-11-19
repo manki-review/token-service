@@ -358,7 +358,7 @@ describe('routeDelivery', () => {
     // An allow tick carries only the allow boxes, and the editor is looked up before it counts.
     const tick = routeDelivery('issue_comment', issueCommentEvent(ticked(ALLOW), { action: 'edited', author: MANKI_AUTHOR, sender: bob, previousBody: ALLOW }));
     expect(tick.type === 'work' && tick.work).toMatchObject({
-      lane: 'help', kind: 'access', objectId: COMMENT_ID, sender: 'bob', senderId: 31, writer: false, checkWriter: true, acknowledge: false, ticks: [{ box: 'allow', id: '31' }],
+      lane: 'help', kind: 'access', objectId: COMMENT_ID, sender: 'bob', senderId: 31, writer: false, checkWriter: true, acknowledge: false, ticks: [{ box: 'allow', id: '31', login: 'bob' }],
       inRefusal: true,
     });
     // The sender of a review edit is Manki, whose id is never the editor's.
@@ -371,7 +371,7 @@ describe('routeDelivery', () => {
       routeDelivery('issue_comment', issueCommentEvent(ticked(elsewhere), { action: 'edited', author: MANKI_AUTHOR, sender: bob, previousBody: elsewhere })),
       routeDelivery('pull_request_review', reviewEdit(ticked(ALLOW), ALLOW)),
       routeDelivery('pull_request_review_comment', findingEdit(ticked(ALLOW), ALLOW)),
-    ].map(allowTicks)).toEqual(Array(3).fill(['access', [{ box: 'allow', id: '31' }], false]));
+    ].map(allowTicks)).toEqual(Array(3).fill(['access', [{ box: 'allow', id: '31', login: 'bob' }], false]));
   });
 
   it('names the boxes a settings edit ticked or unticked, and counts the editor as no writer until looked up', () => {

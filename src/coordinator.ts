@@ -1827,7 +1827,9 @@ export class PrCoordinator extends DurableObject<Env> {
       await this.postAnswer(item, target, token, reply, false);
       this.setMeta('refused', [...(this.getMeta<string[]>('refused') ?? []), sender]);
       // An allow tick counts only for an account this PR refused.
-      if (item.sender_id !== null) this.setMeta('refused_ids', [...(this.getMeta<number[]>('refused_ids') ?? []), item.sender_id]);
+      if (item.sender_id !== null) {
+        this.setMeta('refused_accounts', [...(this.getMeta<Account[]>('refused_accounts') ?? []), { id: item.sender_id, login: item.sender }]);
+      }
     } catch (error) {
       log('coordinator_refusal_reply_failed', { ...this.logFields(), work_id: item.id, sender: item.sender, error: String(error) });
     }
@@ -1888,9 +1890,12 @@ export class PrCoordinator extends DurableObject<Env> {
 
     if (command === null) {
       const edit = editOf(item);
-      const ids = (edit.ticks ?? []).filter(({ box }) => box === 'allow').map(({ id }) => id ?? '');
-      const refused = new Set((this.getMeta<number[]>('refused_ids') ?? []).map(String));
-      const refusal = edit.inRefusal === true && ids.every((id) => refused.has(id));
+      const allows = (edit.ticks ?? []).filter(({ box }) => box === 'allow');
+      const ids = allows.map(({ id }) => id ?? '');
+      // The label must name the login refused under the box's id, so an edited box cannot allow another account.
+      const refused = new Map((this.getMeta<Account[]>('refused_accounts') ?? []).map(({ id, login }) => [String(id), login.toLowerCase()]));
+      const refusal = edit.inRefusal === true
+        && allows.every(({ id, login }) => id !== undefined && login !== undefined && refused.get(id) === login.toLowerCase());
       if (!maintainer || !refusal) {
         await this.revertBoxes(item);
         return end('skipped', !maintainer ? 'ticker lacks the maintain role' : edit.inRefusal === true ? 'the box names no account this PR refused' : 'the box is not in a refusal reply');

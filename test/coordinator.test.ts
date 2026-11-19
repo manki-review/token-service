@@ -2500,13 +2500,20 @@ describe('PrCoordinator dispatch', () => {
     expect((await workRows(pr.stub)).slice(-2).map((row) => [row.status, row.note])).toEqual([
       ['skipped', 'the box is not in a refusal reply'], ['skipped', 'the box names no account this PR refused'],
     ]);
+    // A box whose label names one refused account and whose id names another is put back too.
+    await comment('pia', '/manki explain');
+    const MISMATCH = 5008;
+    github.issueComments.set(MISMATCH, `${allowBox(41, 'Otto')}\n${REFUSAL_MARKER}`);
+    await tick('maya', MISMATCH);
+    expect(github.issueComments.get(MISMATCH)).toBe(`${allowBox(41, 'Otto')}\n${REFUSAL_MARKER}`);
+    expect(await lastNote()).toBe('the box names no account this PR refused');
 
     // A tick by the account itself, or by a writer without the maintain role, is put back and allows nothing.
     for (const login of ['otto', 'wes']) {
       await tick(login);
       expect(github.issueComments.get(REFUSAL)).toBe(github.comments[0]);
     }
-    expect((await workRows(pr.stub)).slice(3).map((row) => [row.kind, row.status, row.note])).toEqual([
+    expect((await workRows(pr.stub)).slice(5).map((row) => [row.kind, row.status, row.note])).toEqual([
       ['access', 'skipped', 'commenter has no write access'], ['access', 'skipped', 'ticker lacks the maintain role'],
     ]);
     // A maintainer's tick allows the account, and the box stays ticked.
@@ -2518,8 +2525,8 @@ describe('PrCoordinator dispatch', () => {
     // reuses its earlier "not allowed" answer for 5 minutes, so only a comment after that gets the reaction.
     advanceClock(5 * MINUTE + 1);
     await comment('otto', '/manki explain');
-    expect(github.dispatches.map((dispatch) => dispatch.inputs.comment_id)).toEqual(['7002']);
-    expect(github.reactions).toEqual(['issues/7002']);
+    expect(github.dispatches.map((dispatch) => dispatch.inputs.comment_id)).toEqual(['7003']);
+    expect(github.reactions).toEqual(['issues/7003']);
     await pr.stub.runCompleted(key('d-otto'), 9000, 'success');
 
     // It may list the allowed accounts, but never change the list, since it holds no maintain role.
