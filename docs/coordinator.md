@@ -121,7 +121,7 @@ Some decisions need no model, so the coordinator makes them without a run:
 
 ## Allow list
 
-A maintainer can let an account without write access use Manki in one repository, such as a machine account a team runs for its bots. An allowed account counts as having write access for every command, reply and box tick the Worker routes, also for a thread reply that settles a finding, and the Manki run asks the Worker the same through `/access`. It never counts as a maintainer, so it cannot change the list.
+A maintainer can let an account without write access use Manki in one repository, such as a machine account a team runs for its bots. An allowed account counts as having write access for every command, reply and box tick the Worker routes, also for a thread reply that settles a finding, and the Manki run asks the Worker the same through `/access`. So like any writer other than the PR author, it can also clear a blocking or security thread. It never counts as holding a role: every check that needs the `maintain` role reads GitHub's `role_name`, so an allowed account cannot change the list.
 
 The `Reconciler` keeps the list per repository, keyed by the account's user id, with its login, who allowed it and when. A renamed account stays allowed: a delivery from it names its id, and the list takes its new login. The list is read on every check and never cached, so a removal counts at once. A failed read counts as not allowed.
 
