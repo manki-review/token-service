@@ -2013,13 +2013,14 @@ export class PrCoordinator extends DurableObject<Env> {
   private async refreshReview(item: WorkRow, target: Target): Promise<{ waitingCheck: boolean } | null> {
     const { pr, token } = await this.readPull(target);
     if (!this.isDispatching(item.id)) return null;
-    if (pr.state !== 'open') {
+    const push = item.event.startsWith('pull_request.');
+    // A review someone asked for, by a command or a box, also runs on a closed or merged PR. Manki answers it there.
+    if (push && pr.state !== 'open') {
       this.finish(item.id, 'dropped', 'pull request closed');
       return null;
     }
     // A retry after a dispatch attempt may find that attempt's run, so only the first attempt can drop or skip.
     const first = item.attempts === 0;
-    const push = item.event.startsWith('pull_request.');
     const config = push && first ? await this.baseConfig(pr, target) : null;
     if (!this.isDispatching(item.id)) return null;
     // A draft is reviewed on request, such as by its settings box, unless the base config reviews drafts.

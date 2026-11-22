@@ -1699,6 +1699,15 @@ describe('PrCoordinator dispatch', () => {
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'dropped', note }]);
   });
 
+  it('reviews a closed or merged PR on a review command', async () => {
+    const pr = pullRequest();
+    const github = Object.assign(fakeGitHub(pr.number), { prState: 'closed' });
+    await pr.send('issue_comment', pr.comment('@manki review'));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches.map((dispatch) => dispatch.inputs)).toMatchObject([{ event: 'issue_comment', comment_id: String(COMMENT_ID) }]);
+    expect(await workRows(pr.stub)).toMatchObject([{ kind: 'review', status: 'running' }]);
+  });
+
   it('reviews a draft automatically when the base config sets `drafts: review`, and still answers comments on a draft', async () => {
     const pr = pullRequest();
     const github = Object.assign(fakeGitHub(pr.number), { draft: true, baseRef: 'develop' });
@@ -3669,6 +3678,14 @@ describe('PrCoordinator dispatch', () => {
         ['state', 'comment', 'running', 'dispatched'],
       ]);
       expect(github.permissionReads).toEqual(['mallory', 'alice']);
+    });
+
+    it('reviews a closed or merged PR on a writer\'s tick of a box in another message of Manki\'s', async () => {
+      const { pr, github, edit } = setup();
+      github.prState = 'closed';
+      await edit([], ['again'], 'alice', new Date().toISOString(), again);
+      expect(github.dispatches.map((dispatch) => dispatch.inputs)).toMatchObject([{ event: 'issue_comment', action: 'edited', comment_id: String(SETTINGS) }]);
+      expect((await workRows(pr.stub)).map((row) => [row.kind, row.status])).toEqual([['settings', 'done'], ['review', 'running']]);
     });
 
     it('settles a Review again tick in another message of Manki\'s that no run answers, and replaces a review of an old head', async () => {
