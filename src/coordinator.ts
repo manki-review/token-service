@@ -2032,7 +2032,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const reviewed = first ? await this.reviewedInstead(pr, target, token) : null;
     if (!this.isDispatching(item.id)) return null;
     if (reviewed !== null) {
-      await this.reportYielded(item, pr.head.sha, reviewed, target);
+      await this.reportYielded(item, pr.head.sha, reviewed, open, target);
       if (this.isDispatching(item.id)) this.finish(item.id, 'skipped', `#${reviewed} has the same head commit`);
       return null;
     }
@@ -2130,7 +2130,7 @@ export class PrCoordinator extends DurableObject<Env> {
    * gets the note each time, as a new comment below it. The PR gets no check, which would be the newest on the commit
    * that `reviewed` shares. A failure is logged and still skips the review.
    */
-  private async reportYielded(item: WorkRow, head: string, reviewed: number, target: Target): Promise<void> {
+  private async reportYielded(item: WorkRow, head: string, reviewed: number, open: boolean, target: Target): Promise<void> {
     try {
       const told = `${head}:${reviewed}`;
       const ticked = issueCommentOf(item);
@@ -2138,8 +2138,9 @@ export class PrCoordinator extends DurableObject<Env> {
       // A comment that asked and is not a settings comment is a review command.
       const command = ticked !== null && !shown.includes(ticked);
       if (command || (shown.length === 0 && this.getMeta<string>('yielded') !== told)) {
-        const note = `Manki reviews one pull request per commit. #${reviewed} has the same head commit \`${head.slice(0, 7)}\` and the lower number, so Manki reviews #${reviewed} and not this pull request. `
-          + `The \`Manki\` check shown here is the one of #${reviewed}. To have this pull request reviewed, close #${reviewed} and comment \`/manki review\` here, or push a commit that only this pull request has.`;
+        const why = open ? 'and the lower number' : 'and is open, while this pull request is closed';
+        const note = `Manki reviews one pull request per commit. #${reviewed} has the same head commit \`${head.slice(0, 7)}\` ${why}, so Manki reviews #${reviewed} and not this pull request. `
+          + `The \`Manki\` check shown here is the one of #${reviewed}. To have this pull request reviewed, close #${reviewed} and comment \`/manki review\` here${open ? ', or push a commit that only this pull request has' : ''}.`;
         await this.postNote(`${note}\n\n${CONFLICT_NOTE_MARKER}`, target, command);
       }
       this.setMeta('yielded', told);

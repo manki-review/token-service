@@ -1718,6 +1718,8 @@ describe('PrCoordinator dispatch', () => {
     await runDurableObjectAlarm(closed.stub);
     expect(held.dispatches).toEqual([]);
     expect(await workRows(closed.stub)).toMatchObject([{ kind: 'review', status: 'skipped', note: `#${open.number} has the same head commit` }]);
+    expect(held.comments).toEqual([`Manki reviews one pull request per commit. #${open.number} has the same head commit \`1111111\` and is open, while this pull request is closed, so Manki reviews #${open.number} and not this pull request. `
+      + `The \`Manki\` check shown here is the one of #${open.number}. To have this pull request reviewed, close #${open.number} and comment \`/manki review\` here.\n\n${CONFLICT_NOTE_MARKER}`]);
   });
 
   it('reviews a draft automatically when the base config sets `drafts: review`, and still answers comments on a draft', async () => {
