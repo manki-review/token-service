@@ -2115,7 +2115,10 @@ export class PrCoordinator extends DurableObject<Env> {
       const sharing = listed
         .filter((pull) => pull.state === 'open' && pull.head.sha === head && pull.head.repo?.id === target.repositoryId)
         .map((pull) => pull.number);
-      if (pr.state !== 'open') return sharing.length > 0 ? Math.min(...sharing) : null;
+      if (pr.state !== 'open') {
+        if (sharing.includes(target.number)) return unsure('the list names this closed pull request as open');
+        return sharing.length > 0 ? Math.min(...sharing) : null;
+      }
       if (!sharing.includes(target.number)) return unsure('the list does not name this pull request');
       const lowest = Math.min(...sharing);
       return lowest < target.number ? lowest : null;

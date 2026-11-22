@@ -1720,6 +1720,15 @@ describe('PrCoordinator dispatch', () => {
     expect(await workRows(closed.stub)).toMatchObject([{ kind: 'review', status: 'skipped', note: `#${open.number} has the same head commit` }]);
     expect(held.comments).toEqual([`Manki reviews one pull request per commit. #${open.number} has the same head commit \`1111111\` and is open, while this pull request is closed, so Manki reviews #${open.number} and not this pull request. `
       + `The \`Manki\` check shown here is the one of #${open.number}. To have this pull request reviewed, close #${open.number} and comment \`/manki review\` here.\n\n${CONFLICT_NOTE_MARKER}`]);
+
+    // A list that still shows the closed PR as open contradicts the read, so the review runs instead of holding for itself.
+    const lagging = pullRequest();
+    const listed = Object.assign(fakeGitHub(lagging.number), { prState: 'closed', listsOwnPull: false, otherPulls: [{ number: lagging.number }, { number: open.number }] });
+    log.mockClear();
+    await lagging.send('issue_comment', lagging.comment('@manki review'));
+    await runDurableObjectAlarm(lagging.stub);
+    expect(listed.dispatches).toHaveLength(1);
+    expect(logged(log, 'coordinator_head_pulls_unsure')).toEqual([expect.objectContaining({ reason: 'the list names this closed pull request as open' })]);
   });
 
   it('reviews a draft automatically when the base config sets `drafts: review`, and still answers comments on a draft', async () => {
