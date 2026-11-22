@@ -2013,13 +2013,15 @@ export class PrCoordinator extends DurableObject<Env> {
   private async refreshReview(item: WorkRow, target: Target): Promise<{ waitingCheck: boolean } | null> {
     const { pr, token } = await this.readPull(target);
     if (!this.isDispatching(item.id)) return null;
-    if (pr.state !== 'open') {
+    const push = item.event.startsWith('pull_request.');
+    const open = pr.state === 'open';
+    // A review someone asked for, by a command or a box, also runs on a closed or merged PR. Manki answers it there.
+    if (push && !open) {
       this.finish(item.id, 'dropped', 'pull request closed');
       return null;
     }
     // A retry after a dispatch attempt may find that attempt's run, so only the first attempt can drop or skip.
     const first = item.attempts === 0;
-    const push = item.event.startsWith('pull_request.');
     const config = push && first ? await this.baseConfig(pr, target) : null;
     if (!this.isDispatching(item.id)) return null;
     // A draft is reviewed on request, such as by its settings box, unless the base config reviews drafts.
@@ -2030,7 +2032,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const reviewed = first ? await this.reviewedInstead(pr, target, token) : null;
     if (!this.isDispatching(item.id)) return null;
     if (reviewed !== null) {
-      await this.reportYielded(item, pr.head.sha, reviewed, target);
+      await this.reportYielded(item, pr.head.sha, reviewed, open, target);
       if (this.isDispatching(item.id)) this.finish(item.id, 'skipped', `#${reviewed} has the same head commit`);
       return null;
     }
@@ -2068,7 +2070,8 @@ export class PrCoordinator extends DurableObject<Env> {
       }
     }
     // A review of a PR that conflicts with its base would only end in a held approval, so none starts until a rebase.
-    if (item.attempts === 0) {
+    // GitHub may not compute a closed PR's mergeability, and nobody rebases a closed PR, so it skips the conflict check.
+    if (item.attempts === 0 && open) {
       const conflict = pr.mergeable === false || pr.mergeable_state === 'dirty';
       if (!conflict && pr.mergeable === null && item.merge_checks < MERGEABILITY_RETRY_MS.length) {
         // GitHub computes mergeability once the PR is read, so the review waits briefly and reads it again.
@@ -2093,8 +2096,9 @@ export class PrCoordinator extends DurableObject<Env> {
    * Returns the open pull request that is reviewed instead of this one, or null when this one is reviewed. A commit has
    * one `Manki` status, so of the repository's open pull requests with the head `pr.head.sha` only the one with the
    * lowest number is reviewed. GitHub also lists a pull request that merely contains the commit, which does not count.
+   * Only open pull requests are kept, so a closed one is never among them and yields to the lowest open one with its head.
    * In doubt the review runs: when the list fails, is not a list of pull requests, may be cut off or does not name this
-   * pull request.
+   * open pull request.
    */
   private async reviewedInstead(pr: PullRequestRead, target: Target, token: string): Promise<number | null> {
     const head = pr.head.sha;
@@ -2111,6 +2115,10 @@ export class PrCoordinator extends DurableObject<Env> {
       const sharing = listed
         .filter((pull) => pull.state === 'open' && pull.head.sha === head && pull.head.repo?.id === target.repositoryId)
         .map((pull) => pull.number);
+      if (pr.state !== 'open') {
+        if (sharing.includes(target.number)) return unsure('the list names this closed pull request as open');
+        return sharing.length > 0 ? Math.min(...sharing) : null;
+      }
       if (!sharing.includes(target.number)) return unsure('the list does not name this pull request');
       const lowest = Math.min(...sharing);
       return lowest < target.number ? lowest : null;
@@ -2125,7 +2133,7 @@ export class PrCoordinator extends DurableObject<Env> {
    * gets the note each time, as a new comment below it. The PR gets no check, which would be the newest on the commit
    * that `reviewed` shares. A failure is logged and still skips the review.
    */
-  private async reportYielded(item: WorkRow, head: string, reviewed: number, target: Target): Promise<void> {
+  private async reportYielded(item: WorkRow, head: string, reviewed: number, open: boolean, target: Target): Promise<void> {
     try {
       const told = `${head}:${reviewed}`;
       const ticked = issueCommentOf(item);
@@ -2133,8 +2141,9 @@ export class PrCoordinator extends DurableObject<Env> {
       // A comment that asked and is not a settings comment is a review command.
       const command = ticked !== null && !shown.includes(ticked);
       if (command || (shown.length === 0 && this.getMeta<string>('yielded') !== told)) {
-        const note = `Manki reviews one pull request per commit. #${reviewed} has the same head commit \`${head.slice(0, 7)}\` and the lower number, so Manki reviews #${reviewed} and not this pull request. `
-          + `The \`Manki\` check shown here is the one of #${reviewed}. To have this pull request reviewed, close #${reviewed} and comment \`/manki review\` here, or push a commit that only this pull request has.`;
+        const why = open ? 'and the lower number' : 'and is open, while this pull request is closed';
+        const note = `Manki reviews one pull request per commit. #${reviewed} has the same head commit \`${head.slice(0, 7)}\` ${why}, so Manki reviews #${reviewed} and not this pull request. `
+          + `The \`Manki\` check shown here is the one of #${reviewed}. To have this pull request reviewed, close #${reviewed} and comment \`/manki review\` here${open ? ', or push a commit that only this pull request has' : ''}.`;
         await this.postNote(`${note}\n\n${CONFLICT_NOTE_MARKER}`, target, command);
       }
       this.setMeta('yielded', told);

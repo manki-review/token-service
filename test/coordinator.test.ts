@@ -1699,6 +1699,38 @@ describe('PrCoordinator dispatch', () => {
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'dropped', note }]);
   });
 
+  it('reviews a closed or merged PR on a review command, unless an open PR has its head', async () => {
+    const pr = pullRequest();
+    // The mergeability of a closed PR holds no review, and with no open PR on its head the head check holds none either.
+    const github = Object.assign(fakeGitHub(pr.number), { prState: 'closed', mergeable: [false] as Array<boolean | null>, mergeableState: 'dirty' });
+    log.mockClear();
+    await pr.send('issue_comment', pr.comment('@manki review'));
+    await runDurableObjectAlarm(pr.stub);
+    expect(github.dispatches.map((dispatch) => dispatch.inputs)).toMatchObject([{ event: 'issue_comment', comment_id: String(COMMENT_ID) }]);
+    expect(await workRows(pr.stub)).toMatchObject([{ kind: 'review', status: 'running' }]);
+    expect([github.pullLists, github.comments, logged(log, 'coordinator_head_pulls_unsure')]).toEqual([[SHA_1], [], []]);
+
+    // Any open PR with the same head is reviewed instead, also one with a higher number.
+    const closed = pullRequest();
+    const open = pullRequest();
+    const held = Object.assign(fakeGitHub(closed.number), { prState: 'closed', otherPulls: [{ number: open.number }] });
+    await closed.send('issue_comment', closed.comment('@manki review'));
+    await runDurableObjectAlarm(closed.stub);
+    expect(held.dispatches).toEqual([]);
+    expect(await workRows(closed.stub)).toMatchObject([{ kind: 'review', status: 'skipped', note: `#${open.number} has the same head commit` }]);
+    expect(held.comments).toEqual([`Manki reviews one pull request per commit. #${open.number} has the same head commit \`1111111\` and is open, while this pull request is closed, so Manki reviews #${open.number} and not this pull request. `
+      + `The \`Manki\` check shown here is the one of #${open.number}. To have this pull request reviewed, close #${open.number} and comment \`/manki review\` here.\n\n${CONFLICT_NOTE_MARKER}`]);
+
+    // A list that still shows the closed PR as open contradicts the read, so the review runs instead of holding for itself.
+    const lagging = pullRequest();
+    const listed = Object.assign(fakeGitHub(lagging.number), { prState: 'closed', listsOwnPull: false, otherPulls: [{ number: lagging.number }, { number: open.number }] });
+    log.mockClear();
+    await lagging.send('issue_comment', lagging.comment('@manki review'));
+    await runDurableObjectAlarm(lagging.stub);
+    expect(listed.dispatches).toHaveLength(1);
+    expect(logged(log, 'coordinator_head_pulls_unsure')).toEqual([expect.objectContaining({ reason: 'the list names this closed pull request as open' })]);
+  });
+
   it('reviews a draft automatically when the base config sets `drafts: review`, and still answers comments on a draft', async () => {
     const pr = pullRequest();
     const github = Object.assign(fakeGitHub(pr.number), { draft: true, baseRef: 'develop' });
@@ -3669,6 +3701,14 @@ describe('PrCoordinator dispatch', () => {
         ['state', 'comment', 'running', 'dispatched'],
       ]);
       expect(github.permissionReads).toEqual(['mallory', 'alice']);
+    });
+
+    it('reviews a closed or merged PR on a writer\'s tick of a box in another message of Manki\'s', async () => {
+      const { pr, github, edit } = setup();
+      github.prState = 'closed';
+      await edit([], ['again'], 'alice', new Date().toISOString(), again);
+      expect(github.dispatches.map((dispatch) => dispatch.inputs)).toMatchObject([{ event: 'issue_comment', action: 'edited', comment_id: String(SETTINGS) }]);
+      expect((await workRows(pr.stub)).map((row) => [row.kind, row.status])).toEqual([['settings', 'done'], ['review', 'running']]);
     });
 
     it('settles a Review again tick in another message of Manki\'s that no run answers, and replaces a review of an old head', async () => {
