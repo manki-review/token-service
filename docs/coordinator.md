@@ -77,7 +77,7 @@ Drafts get no automatic review. A push to a draft, or a draft opened, is still q
 
 ## Closed pull requests
 
-A review from a push, an opened or ready pull request or a catch-up is dropped when the PR is closed or merged before it starts. A review a person asks for, by a review command or a box such as Review again, still starts on a closed or merged PR, and Manki answers it there. Closing a PR drops every item queued before the close, also a requested review. Every other check before a review, such as the head and conflict checks, applies as on an open PR.
+A review from a push, an opened or ready pull request or a catch-up is dropped when the PR is closed or merged before it starts. A review a person asks for, by a review command or a box such as Review again, still starts on a closed or merged PR, and Manki answers it there. Closing a PR drops every item queued before the close, also a requested review. Such a review skips the [one review per head commit](#one-review-per-head-commit) and [conflict](#conflicts-with-the-base-branch) checks, since GitHub lists only open pull requests by head and may not compute a closed one's mergeability. Every other check before a review applies as on an open PR.
 
 ## One review per head commit
 

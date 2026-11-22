@@ -1701,11 +1701,13 @@ describe('PrCoordinator dispatch', () => {
 
   it('reviews a closed or merged PR on a review command', async () => {
     const pr = pullRequest();
-    const github = Object.assign(fakeGitHub(pr.number), { prState: 'closed' });
+    // Neither the mergeability nor the head check holds a review of a closed PR.
+    const github = Object.assign(fakeGitHub(pr.number), { prState: 'closed', mergeable: [false] as Array<boolean | null>, mergeableState: 'dirty' });
     await pr.send('issue_comment', pr.comment('@manki review'));
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches.map((dispatch) => dispatch.inputs)).toMatchObject([{ event: 'issue_comment', comment_id: String(COMMENT_ID) }]);
     expect(await workRows(pr.stub)).toMatchObject([{ kind: 'review', status: 'running' }]);
+    expect([github.pullLists, github.comments]).toEqual([[], []]);
   });
 
   it('reviews a draft automatically when the base config sets `drafts: review`, and still answers comments on a draft', async () => {

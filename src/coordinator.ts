@@ -2014,8 +2014,9 @@ export class PrCoordinator extends DurableObject<Env> {
     const { pr, token } = await this.readPull(target);
     if (!this.isDispatching(item.id)) return null;
     const push = item.event.startsWith('pull_request.');
+    const open = pr.state === 'open';
     // A review someone asked for, by a command or a box, also runs on a closed or merged PR. Manki answers it there.
-    if (push && pr.state !== 'open') {
+    if (push && !open) {
       this.finish(item.id, 'dropped', 'pull request closed');
       return null;
     }
@@ -2028,7 +2029,8 @@ export class PrCoordinator extends DurableObject<Env> {
       this.finish(item.id, 'dropped', 'pull request is a draft');
       return null;
     }
-    const reviewed = first ? await this.reviewedInstead(pr, target, token) : null;
+    // GitHub lists only open pull requests by head and may not compute a closed one's mergeability, so a closed PR skips both.
+    const reviewed = first && open ? await this.reviewedInstead(pr, target, token) : null;
     if (!this.isDispatching(item.id)) return null;
     if (reviewed !== null) {
       await this.reportYielded(item, pr.head.sha, reviewed, target);
@@ -2069,7 +2071,7 @@ export class PrCoordinator extends DurableObject<Env> {
       }
     }
     // A review of a PR that conflicts with its base would only end in a held approval, so none starts until a rebase.
-    if (item.attempts === 0) {
+    if (item.attempts === 0 && open) {
       const conflict = pr.mergeable === false || pr.mergeable_state === 'dirty';
       if (!conflict && pr.mergeable === null && item.merge_checks < MERGEABILITY_RETRY_MS.length) {
         // GitHub computes mergeability once the PR is read, so the review waits briefly and reads it again.
