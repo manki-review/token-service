@@ -2029,8 +2029,7 @@ export class PrCoordinator extends DurableObject<Env> {
       this.finish(item.id, 'dropped', 'pull request is a draft');
       return null;
     }
-    // GitHub lists only open pull requests by head and may not compute a closed one's mergeability, so a closed PR skips both.
-    const reviewed = first && open ? await this.reviewedInstead(pr, target, token) : null;
+    const reviewed = first ? await this.reviewedInstead(pr, target, token) : null;
     if (!this.isDispatching(item.id)) return null;
     if (reviewed !== null) {
       await this.reportYielded(item, pr.head.sha, reviewed, target);
@@ -2071,6 +2070,7 @@ export class PrCoordinator extends DurableObject<Env> {
       }
     }
     // A review of a PR that conflicts with its base would only end in a held approval, so none starts until a rebase.
+    // GitHub may not compute a closed PR's mergeability, and nobody rebases a closed PR, so it skips the conflict check.
     if (item.attempts === 0 && open) {
       const conflict = pr.mergeable === false || pr.mergeable_state === 'dirty';
       if (!conflict && pr.mergeable === null && item.merge_checks < MERGEABILITY_RETRY_MS.length) {
@@ -2096,8 +2096,9 @@ export class PrCoordinator extends DurableObject<Env> {
    * Returns the open pull request that is reviewed instead of this one, or null when this one is reviewed. A commit has
    * one `Manki` status, so of the repository's open pull requests with the head `pr.head.sha` only the one with the
    * lowest number is reviewed. GitHub also lists a pull request that merely contains the commit, which does not count.
+   * Only open pull requests are kept, so a closed one is never among them and yields to the lowest open one with its head.
    * In doubt the review runs: when the list fails, is not a list of pull requests, may be cut off or does not name this
-   * pull request.
+   * open pull request.
    */
   private async reviewedInstead(pr: PullRequestRead, target: Target, token: string): Promise<number | null> {
     const head = pr.head.sha;
@@ -2114,6 +2115,7 @@ export class PrCoordinator extends DurableObject<Env> {
       const sharing = listed
         .filter((pull) => pull.state === 'open' && pull.head.sha === head && pull.head.repo?.id === target.repositoryId)
         .map((pull) => pull.number);
+      if (pr.state !== 'open') return sharing.length > 0 ? Math.min(...sharing) : null;
       if (!sharing.includes(target.number)) return unsure('the list does not name this pull request');
       const lowest = Math.min(...sharing);
       return lowest < target.number ? lowest : null;

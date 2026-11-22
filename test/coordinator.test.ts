@@ -1699,15 +1699,25 @@ describe('PrCoordinator dispatch', () => {
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'dropped', note }]);
   });
 
-  it('reviews a closed or merged PR on a review command', async () => {
+  it('reviews a closed or merged PR on a review command, unless an open PR has its head', async () => {
     const pr = pullRequest();
-    // Neither the mergeability nor the head check holds a review of a closed PR.
+    // The mergeability of a closed PR holds no review, and with no open PR on its head the head check holds none either.
     const github = Object.assign(fakeGitHub(pr.number), { prState: 'closed', mergeable: [false] as Array<boolean | null>, mergeableState: 'dirty' });
+    log.mockClear();
     await pr.send('issue_comment', pr.comment('@manki review'));
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches.map((dispatch) => dispatch.inputs)).toMatchObject([{ event: 'issue_comment', comment_id: String(COMMENT_ID) }]);
     expect(await workRows(pr.stub)).toMatchObject([{ kind: 'review', status: 'running' }]);
-    expect([github.pullLists, github.comments]).toEqual([[], []]);
+    expect([github.pullLists, github.comments, logged(log, 'coordinator_head_pulls_unsure')]).toEqual([[SHA_1], [], []]);
+
+    // Any open PR with the same head is reviewed instead, also one with a higher number.
+    const closed = pullRequest();
+    const open = pullRequest();
+    const held = Object.assign(fakeGitHub(closed.number), { prState: 'closed', otherPulls: [{ number: open.number }] });
+    await closed.send('issue_comment', closed.comment('@manki review'));
+    await runDurableObjectAlarm(closed.stub);
+    expect(held.dispatches).toEqual([]);
+    expect(await workRows(closed.stub)).toMatchObject([{ kind: 'review', status: 'skipped', note: `#${open.number} has the same head commit` }]);
   });
 
   it('reviews a draft automatically when the base config sets `drafts: review`, and still answers comments on a draft', async () => {
