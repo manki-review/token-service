@@ -1544,6 +1544,17 @@ describe('PrCoordinator dispatch', () => {
       expect(github.dispatches).toHaveLength(1);
     });
 
+    it('gets the approval check on a head a run reported as reviewed, as a run that started late reviews the head it finds', async () => {
+      const pr = pullRequest();
+      fakeGitHub(pr.number);
+      await pr.send('pull_request', pr.push(SHA_1));
+      await runDurableObjectAlarm(pr.stub);
+      await pr.stub.report(9000, { reviewed: { commit: SHA_2 } });
+      await pr.stub.runCompleted(key('d-reviewed'), 9000, 'success');
+      expect(await pr.send('pull_request', ready(pr, SHA_2))).toEqual({ accepted: true, effect: 'queued work 2' });
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ ...CHECK, head_sha: SHA_2 });
+    });
+
     it('gets the approval check of a reviewed head during a pause and under a skip rule, as a resolved thread does', async () => {
       const paused = pullRequest();
       const github = fakeGitHub(paused.number);
@@ -2938,6 +2949,30 @@ describe('PrCoordinator dispatch', () => {
         { id: 501, head_sha: SHA_2, status: 'queued', output: { title: 'Waiting for a runner' } },
       ]);
       expect(await workRows(moved.pr.stub)).toMatchObject([{ status: 'running', check_id: 501, check_head: SHA_2 }]);
+    });
+
+    it('drops the queued push review of the head a late run reviewed instead, and keeps a requested one', async () => {
+      const { pr, github, end } = await dispatched();
+      // A push lands while the run waits for a runner, so the run reviews that head once it starts.
+      github.head = SHA_2;
+      await pr.send('pull_request', pr.push(SHA_2), 'd-push-2');
+      await runDurableObjectAlarm(pr.stub);
+      expect(await pr.stub.report(9000, { reviewed: { commit: SHA_2 } })).toEqual({ accepted: true, changed: ['reviewed'] });
+      expect(await workRows(pr.stub)).toMatchObject([{ status: 'running' }, { head_sha: SHA_2, status: 'dropped', note: 'an earlier run reviewed it' }]);
+      expect(await pr.stub.catchUpState(SHA_2)).toBe('handled');
+      expect(await pr.send('pull_request', pr.push(SHA_2))).toEqual({ accepted: true, effect: 'head already reviewed or under review' });
+      await end();
+      expect(github.dispatches).toHaveLength(1);
+      expect(github.waitingChecks).toMatchObject([{ head_sha: SHA_1, conclusion: 'cancelled', output: { title: 'Superseded by a newer commit' } }]);
+
+      // A review someone asked for still runs on that head.
+      const asked = await dispatched();
+      asked.github.head = SHA_2;
+      await asked.pr.send('issue_comment', asked.pr.comment('@manki review'), 'd-request');
+      await asked.pr.send('pull_request', asked.pr.push(SHA_2), 'd-push-2');
+      await asked.pr.stub.report(9000, { reviewed: { commit: SHA_2 } });
+      await asked.end();
+      expect(asked.github.dispatches.map(({ inputs }) => inputs.event)).toEqual(['pull_request', 'issue_comment']);
     });
 
     it('creates a waiting check only once a run of the repository said it takes one over, and none once a run does not', async () => {

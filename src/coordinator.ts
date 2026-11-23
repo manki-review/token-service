@@ -659,13 +659,15 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /**
    * Whether a review of `head` ran to success or matched a skip rule (`handled`), or is queued or running (`pending`).
-   * Null when neither, also when its run failed, was cancelled or was deleted, so such a head is reviewed again.
+   * A head a run reported as reviewed is handled too, since a run that starts late reviews the head it finds. Null when
+   * neither, also when its run failed, was cancelled or was deleted, so such a head is reviewed again.
    */
   private reviewState(head: string | null): 'handled' | 'pending' | null {
     const rows = this.sql.exec<{ status: WorkStatus; conclusion: string | null }>(
       `SELECT status, conclusion FROM work WHERE kind = 'review' AND head_sha = ?`, head,
     ).toArray();
     const skipped = ['skipped', 'cancelled', 'conflict'];
+    if (this.reportedReviewOf(head)) return 'handled';
     if (rows.some((row) => (row.status === 'done' && row.conclusion === 'success') || (row.status === 'skipped' && skipped.includes(row.conclusion ?? '')))) return 'handled';
     if (rows.some((row) => row.status === 'queued' || row.status === 'dispatching' || row.status === 'running')) return 'pending';
     return null;
@@ -684,7 +686,12 @@ export class PrCoordinator extends DurableObject<Env> {
     ).toArray();
     const pending = rows.filter((row) => row.status === 'queued' || row.status === 'dispatching' || row.status === 'running').at(-1);
     if (pending) return pending.id;
-    return rows.some((row) => row.status === 'done' && row.conclusion === 'success') ? 0 : null;
+    return this.reportedReviewOf(head) || rows.some((row) => row.status === 'done' && row.conclusion === 'success') ? 0 : null;
+  }
+
+  /** Whether the last review a run reported is of `head`. */
+  private reportedReviewOf(head: string | null): boolean {
+    return head !== null && this.reported().last_reviewed?.commit === head;
   }
 
   /** Returns the PR's running state. Writes nothing, so asking about a PR without state creates none. */
@@ -708,7 +715,8 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /**
    * Stores what run `runId` reports about the PR. Only a run this coordinator dispatched and still tracks as dispatching
-   * or running may report. A report that changes nothing writes nothing.
+   * or running may report. A report that changes nothing writes nothing. A reviewed commit drops the queued push review
+   * of that commit, which a run that started late reviewed in its place.
    */
   async report(runId: number, report: StateReport): Promise<ReportResult> {
     const active = this.hasState()
@@ -735,6 +743,15 @@ export class PrCoordinator extends DurableObject<Env> {
       changed.push('pause');
     }
     if (changed.length > 0) this.setMeta('pr_state', state);
+    if (reviewed) {
+      const dropped = this.sql.exec<{ id: number }>(
+        `SELECT id FROM work WHERE kind = 'review' AND status = 'queued' AND head_sha = ? AND event LIKE 'pull_request.%' AND modes IS NULL`,
+        reviewed.commit,
+      ).toArray();
+      for (const { id } of dropped) this.finish(id, 'dropped', 'an earlier run reviewed it');
+      // The alarm ends the waiting check of a dropped review.
+      if (dropped.length > 0) await this.ctx.storage.setAlarm(now);
+    }
     return { accepted: true, changed };
   }
 
