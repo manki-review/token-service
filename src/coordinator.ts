@@ -33,7 +33,7 @@ export const OPT_IN_TTL_MS = 5 * MINUTE;
 export const FINISHED_RETENTION_MS = 7 * DAY;
 /** How long an alarm may hold an item in `dispatching` before another pass takes it back. */
 const LEASE_MS = 5 * MINUTE;
-/** How long a queued review or review state check lets thread replies go first. */
+/** How long a queued review or review state check lets thread replies go first, counted from when it was first queued. */
 export const REPLY_FIRST_MS = 5 * MINUTE;
 const LANES: readonly Lane[] = ['state', 'chat', 'help', 'settings'];
 
@@ -144,8 +144,11 @@ export interface WorkRow extends Record<string, string | number | null> {
   requeues: number;
   /** The workflow file the last dispatch attempt named. Null before the first attempt. */
   workflow: string | null;
-  /** For a queued review or review state check, when a thread reply first went ahead of it. */
-  passed_at: number | null;
+  /**
+   * When the item was first queued. Unlike `enqueued_at`, a newer push that joins a queued review leaves it as it is.
+   * Null for an item an earlier build queued after this column was added, such as after a rollback.
+   */
+  queued_at: number | null;
   /** How often a review read the PR again because GitHub had not computed its mergeability. */
   merge_checks: number;
   /** The queued `Manki` check the Worker created for the review, and the commit it sits on. Null without one, and once it ended. */
@@ -374,6 +377,8 @@ export const MIGRATIONS = [
   `ALTER TABLE work ADD COLUMN own_command INTEGER NOT NULL DEFAULT 0;`,
   `ALTER TABLE work ADD COLUMN sender_id INTEGER;
    ALTER TABLE work ADD COLUMN access TEXT;`,
+  `ALTER TABLE work ADD COLUMN queued_at INTEGER;
+   UPDATE work SET queued_at = enqueued_at;`,
 ];
 
 const ACTIVE = `status IN ('dispatching', 'running')`;
@@ -414,6 +419,15 @@ function waitingCheckEnd(item: WorkRow, status: string, superseded: boolean): Ch
     };
   }
   return { conclusion: 'cancelled', title: 'Review not started', summary: `Manki did not start the review of ${sha}: ${item.note ?? 'it was dropped'}.` };
+}
+
+/** How a waiting check shown while its push review was queued ends once the base config turns automatic review off. */
+function autoReviewOff(head: string): CheckReport {
+  return {
+    conclusion: 'cancelled',
+    title: 'Automatic review off',
+    summary: `The base branch's \`.manki.yml\` turns automatic review off, so Manki does not review \`${head.slice(0, 7)}\` for this push. ${TICK_AGAIN} to review it.`,
+  };
 }
 
 /** The wait before the next try after `errors` failures in a row: 2, 4, 8, then at most 16 minutes. */
@@ -659,13 +673,15 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /**
    * Whether a review of `head` ran to success or matched a skip rule (`handled`), or is queued or running (`pending`).
-   * Null when neither, also when its run failed, was cancelled or was deleted, so such a head is reviewed again.
+   * A head a run reported as reviewed is handled too, since a run that starts late reviews the head it finds. Null when
+   * neither, also when its run failed, was cancelled or was deleted, so such a head is reviewed again.
    */
   private reviewState(head: string | null): 'handled' | 'pending' | null {
     const rows = this.sql.exec<{ status: WorkStatus; conclusion: string | null }>(
       `SELECT status, conclusion FROM work WHERE kind = 'review' AND head_sha = ?`, head,
     ).toArray();
     const skipped = ['skipped', 'cancelled', 'conflict'];
+    if (this.reportedReviewOf(head)) return 'handled';
     if (rows.some((row) => (row.status === 'done' && row.conclusion === 'success') || (row.status === 'skipped' && skipped.includes(row.conclusion ?? '')))) return 'handled';
     if (rows.some((row) => row.status === 'queued' || row.status === 'dispatching' || row.status === 'running')) return 'pending';
     return null;
@@ -684,7 +700,12 @@ export class PrCoordinator extends DurableObject<Env> {
     ).toArray();
     const pending = rows.filter((row) => row.status === 'queued' || row.status === 'dispatching' || row.status === 'running').at(-1);
     if (pending) return pending.id;
-    return rows.some((row) => row.status === 'done' && row.conclusion === 'success') ? 0 : null;
+    return this.reportedReviewOf(head) || rows.some((row) => row.status === 'done' && row.conclusion === 'success') ? 0 : null;
+  }
+
+  /** Whether the last review a run reported is of `head`. */
+  private reportedReviewOf(head: string | null): boolean {
+    return head !== null && this.reported().last_reviewed?.commit === head;
   }
 
   /** Returns the PR's running state. Writes nothing, so asking about a PR without state creates none. */
@@ -708,7 +729,9 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /**
    * Stores what run `runId` reports about the PR. Only a run this coordinator dispatched and still tracks as dispatching
-   * or running may report. A report that changes nothing writes nothing.
+   * or running may report. A report that changes nothing writes nothing. A reviewed commit drops the queued push review
+   * of that commit, which a run that started late reviewed in its place. A review of a PR marked ready stays, since its
+   * run decides the approval of a reviewed head.
    */
   async report(runId: number, report: StateReport): Promise<ReportResult> {
     const active = this.hasState()
@@ -735,6 +758,15 @@ export class PrCoordinator extends DurableObject<Env> {
       changed.push('pause');
     }
     if (changed.length > 0) this.setMeta('pr_state', state);
+    if (reviewed) {
+      const dropped = this.sql.exec<{ id: number }>(
+        `SELECT id FROM work WHERE kind = 'review' AND status = 'queued' AND head_sha = ? AND event LIKE 'pull_request.%' AND event != ? AND modes IS NULL`,
+        reviewed.commit, READY_EVENT,
+      ).toArray();
+      for (const { id } of dropped) this.finish(id, 'dropped', 'an earlier run reviewed it');
+      // The alarm ends the waiting check of a dropped review.
+      if (dropped.length > 0) await this.ctx.storage.setAlarm(now);
+    }
     return { accepted: true, changed };
   }
 
@@ -783,9 +815,9 @@ export class PrCoordinator extends DurableObject<Env> {
 
   private insert(work: Work, delivery: string, now: number): string {
     const id = this.sql.exec<{ id: number }>(
-      `INSERT INTO work (lane, kind, event, head_sha, object_id, sender, sender_id, delivery, enqueued_at, status, trusted, writer, own_command, modes, boxes, access)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?) RETURNING id`,
-      work.lane, work.kind, work.event, work.headSha, work.objectId, work.sender, work.senderId ?? null, delivery, now, Number(work.trusted), Number(work.writer),
+      `INSERT INTO work (lane, kind, event, head_sha, object_id, sender, sender_id, delivery, enqueued_at, queued_at, status, trusted, writer, own_command, modes, boxes, access)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?) RETURNING id`,
+      work.lane, work.kind, work.event, work.headSha, work.objectId, work.sender, work.senderId ?? null, delivery, now, now, Number(work.trusted), Number(work.writer),
       Number(work.acknowledge),
       work.modes?.length ? JSON.stringify(work.modes) : null,
       work.boxes || work.ticks
@@ -1032,9 +1064,32 @@ export class PrCoordinator extends DurableObject<Env> {
       }
     }
     // A review that ended in this pass has its waiting check ended at once.
-    if (this.checksToEnd().length === 0) return;
-    if (this.fits(STEP_COST)) await this.endWaitingChecks();
-    else this.waitingLane ??= LANES.indexOf('state');
+    if (this.checksToEnd().length > 0) {
+      if (this.fits(STEP_COST)) await this.endWaitingChecks();
+      else this.waitingLane ??= LANES.indexOf('state');
+    }
+    if (this.fits(STEP_COST)) await this.showQueued();
+  }
+
+  /**
+   * Shows the waiting check of the newest push review that is still queued, such as behind a run, on the head it will
+   * review. Only what is known without reading the PR holds it back: a pause, or a repository without dispatches. The
+   * review's start ends the check when it does not run. A failure is logged and tried again on the next alarm.
+   */
+  private async showQueued(): Promise<void> {
+    const [item] = this.sql.exec<WorkRow>(
+      `SELECT * FROM work WHERE lane = 'state' AND status = 'queued' AND kind = 'review' AND writer = 1 AND event LIKE 'pull_request.%'
+         AND head_sha IS NOT NULL AND check_head IS NOT head_sha ORDER BY id DESC LIMIT 1`,
+    ).toArray();
+    const { pause, settings } = this.reported();
+    if (!item || pause !== null || settings.paused || this.env.DISPATCH_ENABLED !== 'true') return;
+    try {
+      if (!(await this.optIn()).optedIn) return;
+      const target = await this.verifiedTarget();
+      if (target && this.row(item.id)?.status === 'queued') await this.showWaiting(item, target, true, item.head_sha);
+    } catch (error) {
+      log('coordinator_waiting_check_failed', { ...this.logFields(), work_id: item.id, error: error instanceof Error ? error.message : String(error) });
+    }
   }
 
   /** Whether `cost` more calls fit in what the lanes of this alarm may still make. */
@@ -1062,12 +1117,6 @@ export class PrCoordinator extends DurableObject<Env> {
     // A queued item's `check_at` holds it until the dispatch cap allows another run.
     if (!next || (next.check_at ?? 0) > now) return true;
     if (!this.fits(LIGHT_KINDS.has(next.kind) ? LIGHT_COST : STEP_COST)) return false;
-    if (next.kind === 'thread') {
-      this.sql.exec(
-        `UPDATE work SET passed_at = ? WHERE lane = ? AND status = 'queued' AND kind IN ('review', 'review_state') AND id < ? AND passed_at IS NULL`,
-        now, lane, next.id,
-      );
-    }
     await this.start(next);
     return true;
   }
@@ -1076,16 +1125,22 @@ export class PrCoordinator extends DurableObject<Env> {
    * Returns the item a lane starts next: the oldest queued one, except that a queued thread reply goes before a review
    * and before a review state check. The review then sees each thread as the reply leaves it, instead of requesting
    * changes the reply withdraws a minute later. The check reads the PR when it runs, so it loses nothing, and a person
-   * waits for the reply. Once replies have gone ahead of a review or a check for `REPLY_FIRST_MS`, it goes first again,
-   * so a stream of replies cannot hold it back. Time spent waiting behind a run does not count. A review that holds a
-   * waiting check lets no reply go first. The reply's approval would create a newer `Manki` check on that head, and a
-   * required check reads the check created last, so the review's verdict in the waiting check would not count.
+   * waits for the reply. Once a review or a check has been queued for `REPLY_FIRST_MS`, it goes first again, also when
+   * it spent that time behind a run, so a stream of replies cannot hold it back. A review that holds a waiting check
+   * lets no reply go first. The reply's approval would create a newer `Manki` check on that head, and a required check
+   * reads the check created last, so the review's verdict in the waiting check would not count.
    */
   private nextQueued(lane: Lane): WorkRow | undefined {
     const next = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'queued' ORDER BY id LIMIT 1`, lane).toArray()[0];
     const yields = (next?.kind === 'review' && next.check_ref === null) || next?.kind === 'review_state';
-    if (!next || !yields || (next.passed_at !== null && Date.now() - next.passed_at >= REPLY_FIRST_MS)) return next;
-    return this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'queued' AND kind = 'thread' ORDER BY id LIMIT 1`, lane).toArray()[0] ?? next;
+    if (!next || !yields || Date.now() - (next.queued_at ?? 0) >= REPLY_FIRST_MS) return next;
+    // A reply may go before an older item only while no review that holds a waiting check is queued before the reply.
+    return this.sql.exec<WorkRow>(
+      `SELECT * FROM work WHERE lane = ? AND status = 'queued' AND kind = 'thread' AND id < COALESCE(
+         (SELECT MIN(id) FROM work WHERE lane = ? AND status = 'queued' AND kind = 'review' AND check_ref IS NOT NULL), id + 1)
+       ORDER BY id LIMIT 1`,
+      lane, lane,
+    ).toArray()[0] ?? next;
   }
 
   private row(id: number): WorkRow | undefined {
@@ -1334,14 +1389,13 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Creates the queued `Manki` check that shows a review of `item.run_head` is ordered, while its run waits for a
-   * runner. A check the review left behind on an earlier head ends first. A check is created only when all of this is
-   * certain: `create` allows it, `WAITING_CHECK_ENABLED` is on, the registry holds that the repository's runs take a
-   * waiting check over, and the head has no `Manki` check, since GitHub would read the new check ahead of the verdict
-   * the head shows. Throws on a failure.
+   * Creates the queued `Manki` check that shows a review of `head` is ordered, while the review waits in the queue or
+   * its run waits for a runner. A check the review left behind on an earlier head ends first. A check is created only
+   * when all of this is certain: `create` allows it, `WAITING_CHECK_ENABLED` is on, the registry holds that the
+   * repository's runs take a waiting check over, and the head has no `Manki` check, since GitHub would read the new
+   * check ahead of the verdict the head shows. Throws on a failure.
    */
-  private async showWaiting(item: WorkRow, target: Target, create: boolean): Promise<void> {
-    const head = item.run_head;
+  private async showWaiting(item: WorkRow, target: Target, create: boolean, head = item.run_head): Promise<void> {
     // A check whose create reply was lost is looked for when its run asks for a token and when the review ends. Until then the review gets no other.
     const lost = item.check_ref !== null && item.check_id === null;
     if (head === null || item.check_head === head || lost) return;
@@ -1352,10 +1406,10 @@ export class PrCoordinator extends DurableObject<Env> {
     const repo = `/repos/${target.owner}/${target.repo}`;
     if (item.check_id !== null) await this.endWaitingCheck(item, target, token, true);
     if (!wanted() || await this.hasMankiCheck(head, target, token)) return;
-    const output = {
-      title: 'Waiting for a runner',
-      summary: `Manki started the review run for \`${head.slice(0, 7)}\`. It begins when GitHub Actions gives the run a runner.`,
-    };
+    const sha = `\`${head.slice(0, 7)}\``;
+    const output = item.status === 'queued'
+      ? { title: 'Queued', summary: `Manki reviews ${sha} once the Manki runs before it on this pull request end and GitHub Actions gives its run a runner.` }
+      : { title: 'Waiting for a runner', summary: `Manki started the review run for ${sha}. It begins when GitHub Actions gives the run a runner.` };
     this.sql.exec('UPDATE work SET check_id = NULL, check_head = ?, check_ref = ?, check_own = 0 WHERE id = ?', head, item.delivery, item.id);
     const created = await this.api(token, `${repo}/check-runs`, {
       method: 'POST',
@@ -1405,13 +1459,13 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Completes the waiting check of `item` unless its run completed it, and forgets it. Without `superseded`, the PR is
-   * read to see whether its head left the check's commit. A check GitHub refuses to show or change is forgotten too.
-   * A check without a stored id, whose create reply was lost, is found by its `external_id` among the `Manki` checks
-   * of its commit, and forgotten when the review ended and GitHub lists none. Throws on any other failure, which keeps
-   * the check for the next try.
+   * Completes the waiting check of `item` unless its run completed it, with `report` when given, and forgets it.
+   * Without `superseded`, the PR is read to see whether its head left the check's commit. A check GitHub refuses to show
+   * or change is forgotten too. A check without a stored id, whose create reply was lost, is found by its `external_id`
+   * among the `Manki` checks of its commit, and forgotten when the review ended and GitHub lists none. Throws on any
+   * other failure, which keeps the check for the next try.
    */
-  private async endWaitingCheck(item: WorkRow, target: Target, token: string, superseded?: boolean): Promise<void> {
+  private async endWaitingCheck(item: WorkRow, target: Target, token: string, superseded?: boolean, report?: CheckReport): Promise<void> {
     const repo = `/repos/${target.owner}/${target.repo}`;
     const call = async (path: string, init?: { method: string; body: unknown }, as = token): Promise<Response | null> => {
       const response = await this.api(as, path, init);
@@ -1440,7 +1494,7 @@ export class PrCoordinator extends DurableObject<Env> {
       const reader = superseded === undefined && !item.check_own ? await this.token({ pull_requests: 'read' }) : null;
       const pr = reader === null ? null : await call(`${repo}/pulls/${target.number}`, undefined, reader);
       const left = superseded ?? (pr !== null && ((await pr.json()) as PullRequestRead).head.sha !== item.check_head);
-      const { conclusion, ...output } = waitingCheckEnd(this.row(item.id) ?? item, status, left);
+      const { conclusion, ...output } = report ?? waitingCheckEnd(this.row(item.id) ?? item, status, left);
       await call(`${repo}/check-runs/${id}`, { method: 'PATCH', body: { status: 'completed', conclusion, output } });
     }
     this.forgetCheck(item.id);
@@ -2043,6 +2097,13 @@ export class PrCoordinator extends DurableObject<Env> {
     if (push) {
       // With `auto_review` off the run of a push reviews nothing, so only a config read as leaving it on allows the check.
       waitingCheck = first && autoReviewIsOn(config);
+      // A config that could not be read leaves the check to the run, which decides whether it reviews.
+      if (first && config !== null && !waitingCheck && item.check_ref !== null && item.check_head === pr.head.sha) {
+        const checks = await this.token({ checks: 'write' });
+        if (checks === null) this.forgetCheck(item.id);
+        else await this.endWaitingCheck(item, target, checks, false, autoReviewOff(pr.head.sha));
+        if (!this.isDispatching(item.id)) return null;
+      }
       const rule = first ? this.skipRule(config, pr, item.head_sha, item.sender, target) : null;
       if (rule !== null) {
         await this.reportSkipped(pr.head.sha, rule, target);
