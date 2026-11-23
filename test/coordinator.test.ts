@@ -2704,6 +2704,8 @@ describe('PrCoordinator dispatch', () => {
 
     it('shows the waiting check of a push review queued behind a run, lets no reply go first and hands the check to its run', async () => {
       const { pr, github, ask, end } = await dispatched();
+      // A review state check queued first does not let a reply past the review behind it.
+      await pr.send('pull_request_review', pr.review());
       github.head = SHA_2;
       await pr.send('pull_request', pr.push(SHA_2), 'd-push-2');
       await runDurableObjectAlarm(pr.stub);
@@ -2714,9 +2716,10 @@ describe('PrCoordinator dispatch', () => {
       expect(github.waitingChecks).toEqual([WAITING, queued]);
       await pr.send('pull_request_review_comment', pr.reply('Fixed'));
       await end();
-      expect(github.dispatches.map(({ inputs }) => inputs.event)).toEqual(['pull_request', 'pull_request']);
+      await end('success', 9001);
+      expect(github.dispatches.map(({ inputs }) => inputs.event)).toEqual(['pull_request', 'pull_request_review', 'pull_request']);
       expect(github.waitingChecks).toMatchObject([{ status: 'completed', output: { title: 'Superseded by a newer commit' } }, queued]);
-      expect(await ask({ takes_over_check: true }, 9001)).toMatchObject({ check_run: { id: 501, head_sha: SHA_2 } });
+      expect(await ask({ takes_over_check: true }, 9002)).toMatchObject({ check_run: { id: 501, head_sha: SHA_2 } });
 
       // A pause holds the push review back, so it shows no check.
       const paused = await dispatched();
@@ -3007,6 +3010,14 @@ describe('PrCoordinator dispatch', () => {
       await asked.pr.stub.report(9000, { reviewed: { commit: SHA_2 } });
       await asked.end();
       expect(asked.github.dispatches.map(({ inputs }) => inputs.event)).toEqual(['pull_request', 'issue_comment']);
+
+      // So does the review of a PR marked ready, whose run decides the approval of the reviewed head.
+      const ready = await dispatched();
+      ready.github.head = SHA_2;
+      await ready.pr.send('pull_request', ready.pr.push(SHA_2, 'ready_for_review'), 'd-ready');
+      await ready.pr.stub.report(9000, { reviewed: { commit: SHA_2 } });
+      await ready.end();
+      expect(ready.github.dispatches.map(({ inputs }) => `${inputs.event}.${inputs.action}`)).toEqual(['pull_request.synchronize', 'pull_request.ready_for_review']);
     });
 
     it('creates a waiting check only once a run of the repository said it takes one over, and none once a run does not', async () => {
@@ -3133,6 +3144,14 @@ describe('PrCoordinator dispatch', () => {
         output: { title: 'Automatic review off', summary: expect.stringContaining('turns automatic review off, so Manki does not review `2222222` for this push.') },
       });
       expect(await workRows(queued.pr.stub)).toMatchObject([{ status: 'done' }, { status: 'running', check_ref: null }]);
+      // A config that cannot be read says nothing about `auto_review`, so the run gets the check.
+      const unread = await dispatched(true, { config: 'auto_review: true' });
+      await unread.pr.send('pull_request', unread.pr.push(SHA_2), 'd-push-2');
+      await runDurableObjectAlarm(unread.pr.stub);
+      Object.assign(unread.github, { configStatus: 200, config: 'x'.repeat(64 * 1024 + 1), head: SHA_2 });
+      await unread.end();
+      expect(unread.github.waitingChecks.at(-1)).toMatchObject({ head_sha: SHA_2, status: 'queued' });
+      expect(await unread.ask({ takes_over_check: true }, 9001)).toMatchObject({ check_run: { head_sha: SHA_2 } });
       // A review someone asked for runs whatever `auto_review` says.
       const asked = pullRequest();
       const askedGitHub = Object.assign(fakeGitHub(asked.number), { config: 'auto_review: false' });

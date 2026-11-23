@@ -144,8 +144,11 @@ export interface WorkRow extends Record<string, string | number | null> {
   requeues: number;
   /** The workflow file the last dispatch attempt named. Null before the first attempt. */
   workflow: string | null;
-  /** When the item was first queued. Unlike `enqueued_at`, a newer push that joins a queued review leaves it as it is. */
-  queued_at: number;
+  /**
+   * When the item was first queued. Unlike `enqueued_at`, a newer push that joins a queued review leaves it as it is.
+   * Null for an item an earlier build queued after this column was added, such as after a rollback.
+   */
+  queued_at: number | null;
   /** How often a review read the PR again because GitHub had not computed its mergeability. */
   merge_checks: number;
   /** The queued `Manki` check the Worker created for the review, and the commit it sits on. Null without one, and once it ended. */
@@ -374,7 +377,7 @@ export const MIGRATIONS = [
   `ALTER TABLE work ADD COLUMN own_command INTEGER NOT NULL DEFAULT 0;`,
   `ALTER TABLE work ADD COLUMN sender_id INTEGER;
    ALTER TABLE work ADD COLUMN access TEXT;`,
-  `ALTER TABLE work RENAME COLUMN passed_at TO queued_at;
+  `ALTER TABLE work ADD COLUMN queued_at INTEGER;
    UPDATE work SET queued_at = enqueued_at;`,
 ];
 
@@ -727,7 +730,8 @@ export class PrCoordinator extends DurableObject<Env> {
   /**
    * Stores what run `runId` reports about the PR. Only a run this coordinator dispatched and still tracks as dispatching
    * or running may report. A report that changes nothing writes nothing. A reviewed commit drops the queued push review
-   * of that commit, which a run that started late reviewed in its place.
+   * of that commit, which a run that started late reviewed in its place. A review of a PR marked ready stays, since its
+   * run decides the approval of a reviewed head.
    */
   async report(runId: number, report: StateReport): Promise<ReportResult> {
     const active = this.hasState()
@@ -756,8 +760,8 @@ export class PrCoordinator extends DurableObject<Env> {
     if (changed.length > 0) this.setMeta('pr_state', state);
     if (reviewed) {
       const dropped = this.sql.exec<{ id: number }>(
-        `SELECT id FROM work WHERE kind = 'review' AND status = 'queued' AND head_sha = ? AND event LIKE 'pull_request.%' AND modes IS NULL`,
-        reviewed.commit,
+        `SELECT id FROM work WHERE kind = 'review' AND status = 'queued' AND head_sha = ? AND event LIKE 'pull_request.%' AND event != ? AND modes IS NULL`,
+        reviewed.commit, READY_EVENT,
       ).toArray();
       for (const { id } of dropped) this.finish(id, 'dropped', 'an earlier run reviewed it');
       // The alarm ends the waiting check of a dropped review.
@@ -1129,8 +1133,14 @@ export class PrCoordinator extends DurableObject<Env> {
   private nextQueued(lane: Lane): WorkRow | undefined {
     const next = this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'queued' ORDER BY id LIMIT 1`, lane).toArray()[0];
     const yields = (next?.kind === 'review' && next.check_ref === null) || next?.kind === 'review_state';
-    if (!next || !yields || Date.now() - next.queued_at >= REPLY_FIRST_MS) return next;
-    return this.sql.exec<WorkRow>(`SELECT * FROM work WHERE lane = ? AND status = 'queued' AND kind = 'thread' ORDER BY id LIMIT 1`, lane).toArray()[0] ?? next;
+    if (!next || !yields || Date.now() - (next.queued_at ?? 0) >= REPLY_FIRST_MS) return next;
+    // A reply may go before an older item only while no review that holds a waiting check is queued before the reply.
+    return this.sql.exec<WorkRow>(
+      `SELECT * FROM work WHERE lane = ? AND status = 'queued' AND kind = 'thread' AND id < COALESCE(
+         (SELECT MIN(id) FROM work WHERE lane = ? AND status = 'queued' AND kind = 'review' AND check_ref IS NOT NULL), id + 1)
+       ORDER BY id LIMIT 1`,
+      lane, lane,
+    ).toArray()[0] ?? next;
   }
 
   private row(id: number): WorkRow | undefined {
@@ -2087,7 +2097,8 @@ export class PrCoordinator extends DurableObject<Env> {
     if (push) {
       // With `auto_review` off the run of a push reviews nothing, so only a config read as leaving it on allows the check.
       waitingCheck = first && autoReviewIsOn(config);
-      if (first && !waitingCheck && item.check_ref !== null && item.check_head === pr.head.sha) {
+      // A config that could not be read leaves the check to the run, which decides whether it reviews.
+      if (first && config !== null && !waitingCheck && item.check_ref !== null && item.check_head === pr.head.sha) {
         const checks = await this.token({ checks: 'write' });
         if (checks === null) this.forgetCheck(item.id);
         else await this.endWaitingCheck(item, target, checks, false, autoReviewOff(pr.head.sha));
