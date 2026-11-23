@@ -2261,7 +2261,8 @@ export class PrCoordinator extends DurableObject<Env> {
 
   /**
    * Reads `.manki.yml` from the PR's base branch, so a PR cannot change what applies to itself. A base branch without the
-   * file takes the default branch's, as Manki does, and `fromDefault` says so. With neither file the config is empty. A
+   * file, or with a directory, submodule or unfollowed symlink at its path, takes the default branch's, as Manki does,
+   * and `fromDefault` says so. With neither file the config is empty. A
    * file that cannot be read, is oversized or does not parse gives null, and is never replaced by the default branch's.
    * Neither sets anything, as in Manki.
    */
@@ -2272,8 +2273,11 @@ export class PrCoordinator extends DurableObject<Env> {
       const response = await this.api(token, `/repos/${target.owner}/${target.repo}/contents/.manki.yml?ref=${encodeURIComponent(ref)}`);
       if (response.status === 404) return undefined;
       if (!response.ok) throw new Error(`reading .manki.yml failed with ${response.status}`);
-      const file = await response.json() as { type?: string; size?: number; encoding?: string; content?: string };
-      if (file.type !== 'file' || file.encoding !== 'base64' || file.content === undefined || (file.size ?? 0) > MAX_CONFIG_BYTES) return null;
+      const file = await response.json() as { type?: string; size?: number; encoding?: string; content?: string } | unknown[];
+      // As in Manki's `readConfigFile`: a directory, a symlink GitHub does not follow or a submodule is no file.
+      if (Array.isArray(file)) return undefined;
+      if (file.encoding !== 'base64' || file.content === undefined) return file.type === 'file' ? null : undefined;
+      if ((file.size ?? 0) > MAX_CONFIG_BYTES) return null;
       return parseConfig(new TextDecoder().decode(Uint8Array.from(atob(file.content.replace(/\s/g, '')), (c) => c.charCodeAt(0))));
     };
     const own = await read(pr.base.ref);

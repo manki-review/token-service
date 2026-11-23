@@ -715,6 +715,8 @@ function fakeGitHub(number: number) {
     config: null as string | null,
     /** The `.manki.yml` of a branch that differs from `config`, by ref. */
     configAt: {} as Record<string, string | null>,
+    /** The raw answer for `.manki.yml` by ref, such as a directory's listing, in place of a file. */
+    configReplyAt: {} as Record<string, unknown>,
     configStatus: 200,
     /** The refs `.manki.yml` was read at, and the completed check runs created. */
     configReads: [] as string[],
@@ -862,6 +864,7 @@ function fakeGitHub(number: number) {
       state.configReads.push(url.searchParams.get('ref') ?? '');
       if (state.configStatus !== 200) return Response.json({ message: 'no' }, { status: state.configStatus });
       const ref = url.searchParams.get('ref') ?? '';
+      if (Object.hasOwn(state.configReplyAt, ref)) return Response.json(state.configReplyAt[ref]);
       const config = Object.hasOwn(state.configAt, ref) ? state.configAt[ref] : state.config;
       if (config === null) return Response.json({ message: 'Not Found' }, { status: 404 });
       const content = btoa(String.fromCharCode(...new TextEncoder().encode(config)));
@@ -2004,6 +2007,12 @@ describe('PrCoordinator dispatch', () => {
     ['an author who also pushed', { config: 'skip_authors: [renovate-bot]', author: 'Renovate-Bot', sender: 'renovate-bot' }, 'author Renovate-Bot'],
     ['a branch glob', { config: 'skip_branches: ["release/**"]', headRef: 'release/1.2/fix' }, 'branch release/1.2/fix'],
     ['a label on the default branch when the base branch has no config', { configAt: { main: 'skip_labels: [dependencies]' }, labels: ['dependencies'] }, 'label "dependencies"'],
+    ['a label on the default branch when the base branch has a directory at the config path', {
+      configReplyAt: { develop: [{ type: 'file', name: 'a.yml' }] }, configAt: { main: 'skip_labels: [dependencies]' }, labels: ['dependencies'],
+    }, 'label "dependencies"'],
+    ['a label on the default branch when the base branch has a symlink GitHub does not follow', {
+      configReplyAt: { develop: { type: 'symlink', target: 'missing.yml', size: 11 } }, configAt: { main: 'skip_labels: [dependencies]' }, labels: ['dependencies'],
+    }, 'label "dependencies"'],
   ])('skips a push review matching %s with a skipped check and no run', async (_case, change, rule) => {
     const pr = pullRequest();
     const { sender, ...pull } = { sender: 'octocat', ...change };
@@ -2036,6 +2045,9 @@ describe('PrCoordinator dispatch', () => {
     ['a config that does not parse', { config: 'skip_branches: [feature' }],
     // Only a missing base file falls back, so a broken one never takes the default branch's rules.
     ['a rule on the default branch when the base config does not parse', { config: 'skip_branches: [feature', configAt: { main: 'skip_labels: [dependencies]' }, labels: ['dependencies'], baseRef: 'develop' }],
+    ['a rule on the default branch when the base config is too large for GitHub to send', {
+      configReplyAt: { develop: { type: 'file', size: 2_000_000, encoding: 'none', content: '' } }, configAt: { main: 'skip_labels: [dependencies]' }, labels: ['dependencies'], baseRef: 'develop',
+    }],
     ['no config', {}],
   ])('reviews a push matching %s', async (_case, change) => {
     const pr = pullRequest();
