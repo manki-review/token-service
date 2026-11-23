@@ -11,6 +11,8 @@ const REPO_FILES = ['learnings.yml', 'suppressions.yml', 'patterns.yml'] as cons
 const GLOBAL_FILES = ['learnings.yml', 'conventions.md'] as const;
 /** The files of a repository's own memory folder a run appends lines to. */
 const APPEND_FILES = ['metrics/fix-rate.jsonl'] as const;
+/** The files of a repository's own memory folder a run may read one at a time. */
+const READ_FILES = [...REPO_FILES, ...APPEND_FILES] as const;
 
 const MAX_FILE_BYTES = 512 * 1024;
 /**
@@ -155,7 +157,15 @@ export async function handleMemory(request: Request, env: Env, operation: Memory
       const read = async (prefix: string, files: readonly string[]) => Object.fromEntries(
         await Promise.all(files.map(async (file) => [file, await readFile(token, repository, `${prefix}/${file}`)] as const)),
       );
-      return Response.json({ repo: await read(folder, REPO_FILES), global: await read('_global', GLOBAL_FILES) });
+      const { file } = body;
+      if (file === undefined) return Response.json({ repo: await read(folder, REPO_FILES), global: await read('_global', GLOBAL_FILES) });
+      if (typeof file !== 'string' || !(READ_FILES as readonly string[]).includes(file)) return bad(`file must be one of ${READ_FILES.join(', ')}`);
+      const stored = await readFile(token, repository, `${folder}/${file}`);
+      if (stored !== null && encoder.encode(stored.text).byteLength > MAX_APPEND_FILE_BYTES) {
+        log('memory_read_too_large', { ...audit, file });
+        return bad(`${file} is over ${MAX_APPEND_FILE_BYTES} bytes`, 413);
+      }
+      return Response.json({ repo: { [file]: stored } });
     }
 
     const message = commitMessage(body.message, claims);

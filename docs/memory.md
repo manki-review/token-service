@@ -17,7 +17,12 @@ Review memory lives in one central repository, `MEMORY_REPO` in `wrangler.toml` 
 }
 ```
 
-Each file is its raw text with its blob sha, or `null` when it does not exist. `repo` holds the files of the repository's folder and `global` those of `_global/`. Nothing else is read, so `metrics/fix-rate.jsonl` is never returned.
+Each file is its raw text with its blob sha, or `null` when it does not exist. `repo` holds the files of the repository's folder and `global` those of `_global/`. `metrics/fix-rate.jsonl` is not in this reply.
+
+With `{ owner, repo, pr, file }` the read returns only that file of the repository's own folder, as `{ "repo": { "<file>": { "text": "...", "sha": "..." } } }`, or `null` for a missing file.
+
+- `file`: `learnings.yml`, `suppressions.yml`, `patterns.yml` or `metrics/fix-rate.jsonl`. Anything else, such as a path or a file of `_global/`, gets `400`.
+- A file over 1,000,000 bytes, the most an append lets `metrics/fix-rate.jsonl` grow, gets `413` with a `memory_read_too_large` log line.
 
 **`POST /memory/write`** with `{ owner, repo, pr, file, content, sha, message }` replaces one file of the repository's own folder.
 

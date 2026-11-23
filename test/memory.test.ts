@@ -111,6 +111,33 @@ describe('/memory', () => {
     expect(logged(log, 'token_minted')).toMatchObject([{ purpose: 'memory', repository: FOLDER, run_id: String(DISPATCHED_RUN_ID), installation_id: MEMORY_INSTALLATION }]);
   });
 
+  it('reads one file of the repository\'s own folder when the body names it', async () => {
+    fakeMemory({
+      [`${FOLDER}/metrics/fix-rate.jsonl`]: '{"pr":1}\n',
+      [`${FOLDER}/learnings.yml`]: '- id: l1\n',
+      'xdustinface/rust-dashcore/metrics/fix-rate.jsonl': '{"pr":2}\n',
+    });
+    expect(await call('read', { file: 'metrics/fix-rate.jsonl' })).toEqual({ status: 200, body: { repo: { 'metrics/fix-rate.jsonl': { text: '{"pr":1}\n', sha: sha(1) } } } });
+    expect(await call('read', { file: 'patterns.yml' })).toEqual({ status: 200, body: { repo: { 'patterns.yml': null } } });
+  });
+
+  it.each([
+    ['a file of `_global`', '_global/learnings.yml'],
+    ['a path into another folder', '../../xdustinface/rust-dashcore/metrics/fix-rate.jsonl'],
+    ['a file name that is no string', 7],
+  ])('refuses a read of %s', async (_case, file) => {
+    fakeMemory();
+    expect(await call('read', { file })).toEqual({
+      status: 400, body: { error: 'file must be one of learnings.yml, suppressions.yml, patterns.yml, metrics/fix-rate.jsonl' },
+    });
+  });
+
+  it('refuses a read of one file over 1,000,000 bytes', async () => {
+    fakeMemory({ [`${FOLDER}/metrics/fix-rate.jsonl`]: 'x'.repeat(1_000_001) });
+    expect(await call('read', { file: 'metrics/fix-rate.jsonl' })).toEqual({ status: 413, body: { error: 'metrics/fix-rate.jsonl is over 1000000 bytes' } });
+    expect(logged(log, 'memory_read_too_large')).toMatchObject([{ file: 'metrics/fix-rate.jsonl' }]);
+  });
+
   it('replaces a file of the repository\'s own folder only while it still has the sha the run read', async () => {
     const { state } = fakeMemory({ [`${FOLDER}/suppressions.yml`]: '[]\n' });
     const write = (sha: string | null, message = 'Add suppression: noisy\nlint') =>
