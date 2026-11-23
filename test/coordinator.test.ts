@@ -1368,6 +1368,10 @@ describe('PrCoordinator dispatch', () => {
     expect(await state()).toMatchObject({ active: [{ run_id: 9003, event: 'issue_comment.created' }] });
     expect(await call('/state/report', { reviewed: { commit: SHA_2 }, pause: null }, '9003')).toEqual({ status: 200, body: { changed: ['reviewed', 'pause'] } });
     expect(await state()).toMatchObject({ last_reviewed: { commit: SHA_2, run_id: 9003 }, pause: null, last_approval: afterReview.last_approval });
+    // A withdrawn approval clears the stored one, and clearing it again changes nothing.
+    expect(await call('/state/report', { approval: null }, '9003')).toEqual({ status: 200, body: { changed: ['approval'] } });
+    expect(await call('/state/report', { approval: null }, '9003')).toEqual({ status: 200, body: { changed: [] } });
+    expect(await state()).toMatchObject({ last_reviewed: { commit: SHA_2, run_id: 9003 }, pause: null, last_approval: null });
     expect(await pr.stub.runCompleted(key('d-4'), 9003, 'success')).toMatchObject({ accepted: true });
     github.head = SHA_3;
     await pr.send('pull_request', pr.push(SHA_3));
@@ -1411,7 +1415,8 @@ describe('PrCoordinator dispatch', () => {
     ['a missing PR', {}, undefined, 400, 'pr must be a positive integer'],
     ['a PR given as a string', { pr: '7' }, undefined, 400, 'pr must be a positive integer'],
     ['a short commit', { pr: 7, reviewed: { commit: 'abc1234' } }, undefined, 400, 'reviewed must be { commit } with a full commit SHA'],
-    ['an approval without held', { pr: 7, approval: { commit: SHA_1 } }, undefined, 400, 'approval must be { commit, held } with a full commit SHA'],
+    ['an approval without held', { pr: 7, approval: { commit: SHA_1 } }, undefined, 400, 'approval must be null or { commit, held } with a full commit SHA'],
+    ['an approval given as false', { pr: 7, approval: false }, undefined, 400, 'approval must be null or { commit, held } with a full commit SHA'],
     ['an empty pause reason', { pr: 7, pause: { reason: '' } }, undefined, 400, 'pause must be null or { reason } with a reason of 1 to 1024 characters'],
     ['a pause reason over 1024 characters', { pr: 7, pause: { reason: 'x'.repeat(1025) } }, undefined, 400, 'pause must be null or { reason } with a reason of 1 to 1024 characters'],
     ['a token without a run_id claim', { pr: 7 }, null, 403, 'OIDC verification failed'],

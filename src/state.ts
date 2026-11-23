@@ -21,10 +21,10 @@ function parseReport(body: Record<string, unknown>): StateReport | string {
     report.reviewed = { commit: reviewed.commit };
   }
   if (approval !== undefined) {
-    if (!isObject(approval) || typeof approval.commit !== 'string' || !COMMIT.test(approval.commit) || typeof approval.held !== 'boolean') {
-      return 'approval must be { commit, held } with a full commit SHA';
+    if (approval !== null && (!isObject(approval) || typeof approval.commit !== 'string' || !COMMIT.test(approval.commit) || typeof approval.held !== 'boolean')) {
+      return 'approval must be null or { commit, held } with a full commit SHA';
     }
-    report.approval = { commit: approval.commit, held: approval.held };
+    report.approval = approval && { commit: approval.commit as string, held: approval.held as boolean };
   }
   if (pause !== undefined) {
     if (pause !== null && (!isObject(pause) || typeof pause.reason !== 'string' || !pause.reason || pause.reason.length > MAX_REASON_LENGTH)) {

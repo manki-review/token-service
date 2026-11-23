@@ -117,7 +117,7 @@ Every endpoint except `/webhook` takes the run's [GitHub OIDC token](https://doc
 | `POST /webhook` | GitHub App | Receives deliveries, checked by HMAC signature | [coordinator](docs/coordinator.md#receiving-deliveries) |
 | `POST /token` | Manki run | Mints a scoped installation token | [tokens](docs/tokens.md) |
 | `POST /state` | Manki run | Reads the PR's queue, active runs, last review, approval, pause and settings | [PR state](docs/state.md) |
-| `POST /state/report` | The PR's active run | Records the reviewed commit, an approval or a pause | [PR state](docs/state.md) |
+| `POST /state/report` | The PR's active run | Records the reviewed commit, an approval or its withdrawal, and a pause | [PR state](docs/state.md) |
 | `POST /resolve` | Manki run | Resolves or reopens one of Manki's threads | [thread resolution](docs/resolve.md) |
 | `POST /access` | Manki run | Says whether an account is on the repository's allow list | [allow list](docs/coordinator.md#allow-list) |
 | `POST /memory/read` | Run of a public repository | Reads the repository's and the global memory files | [memory](docs/memory.md) |
