@@ -36,7 +36,7 @@ Only the Worker cleans up. Naming the check in a `/token` reply hands nothing ov
 | The dispatch was refused or failed for good, or no run turned up | `failure` | Review could not start |
 | The Worker cancelled the run: no runner picked it up, twice, or it ran past its timeout | `timed_out` | Review timed out |
 | The PR closed, or the review was cancelled or dropped, before its run started | `cancelled` | Review not started |
-| The base branch's `.manki.yml` turns `auto_review` off for a push review that showed its check while queued | `cancelled` | Automatic review off |
+| The base branch's `.manki.yml`, or the default branch's when the base has none, turns `auto_review` off for a push review that showed its check while queued | `cancelled` | Automatic review off |
 | The run ended without reviewing the commit | `cancelled`, or `failure` when the run failed | Review did not run |
 | The run took the check over and ended without completing it | `cancelled`, or `failure` when the run failed | Review stopped |
 

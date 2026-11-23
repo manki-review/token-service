@@ -69,11 +69,14 @@ const REACTION_MINTS = 2;
 /**
  * The most calls one step of a lane makes, by a count of the code with one check to end: a poll, the end of the waiting
  * checks, or the start of an item. The costliest is a settings edit that ticks Review again on the head under review
- * and Deeper review, with a fresh opt-in read.
+ * and Deeper review, with a fresh opt-in read. The start of a push review stays below it with both `.manki.yml` reads.
  */
 const STEP_COST = 32;
-/** The most calls the start of an item of `LIGHT_KINDS` makes, with a fresh opt-in read. The costliest is a bot's push that gets its skipped check. */
-const LIGHT_COST = 11;
+/**
+ * The most calls the start of an item of `LIGHT_KINDS` makes, with a fresh opt-in read. The costliest is a bot's push
+ * that gets its skipped check after reading `.manki.yml` on the base and the default branch.
+ */
+const LIGHT_COST = 12;
 /** The kinds whose start only dispatches a run, answers help or ends a bot's push. Any other kind is checked against `STEP_COST`. */
 const LIGHT_KINDS: ReadonlySet<Work['kind']> = new Set(['merged', 'review_state', 'thread', 'comment', 'issue', 'help', 'bot_push']);
 /** How long a review waits before each new read of a PR whose mergeability GitHub has not computed yet. */
@@ -421,12 +424,16 @@ function waitingCheckEnd(item: WorkRow, status: string, superseded: boolean): Ch
   return { conclusion: 'cancelled', title: 'Review not started', summary: `Manki did not start the review of ${sha}: ${item.note ?? 'it was dropped'}.` };
 }
 
-/** How a waiting check shown while its push review was queued ends once the base config turns automatic review off. */
-function autoReviewOff(head: string): CheckReport {
+/**
+ * How a waiting check shown while its push review was queued ends once the base config turns automatic review off.
+ * `fromDefault` says that the default branch's file applies because the base branch has none.
+ */
+function autoReviewOff(head: string, fromDefault: boolean): CheckReport {
+  const file = fromDefault ? 'The default branch\'s `.manki.yml`, which applies because the base branch has none,' : 'The base branch\'s `.manki.yml`';
   return {
     conclusion: 'cancelled',
     title: 'Automatic review off',
-    summary: `The base branch's \`.manki.yml\` turns automatic review off, so Manki does not review \`${head.slice(0, 7)}\` for this push. ${TICK_AGAIN} to review it.`,
+    summary: `${file} turns automatic review off, so Manki does not review \`${head.slice(0, 7)}\` for this push. ${TICK_AGAIN} to review it.`,
   };
 }
 
@@ -2101,7 +2108,7 @@ export class PrCoordinator extends DurableObject<Env> {
       if (first && config !== null && !waitingCheck && item.check_ref !== null && item.check_head === pr.head.sha) {
         const checks = await this.token({ checks: 'write' });
         if (checks === null) this.forgetCheck(item.id);
-        else await this.endWaitingCheck(item, target, checks, false, autoReviewOff(pr.head.sha));
+        else await this.endWaitingCheck(item, target, checks, false, autoReviewOff(pr.head.sha, fromDefault));
         if (!this.isDispatching(item.id)) return null;
       }
       const rule = first ? this.skipRule(config, pr, item.head_sha, item.sender, target) : null;

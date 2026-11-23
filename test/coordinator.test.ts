@@ -3151,9 +3151,20 @@ describe('PrCoordinator dispatch', () => {
       await queued.end();
       expect(queued.github.waitingChecks.at(-1)).toMatchObject({
         head_sha: SHA_2, status: 'completed', conclusion: 'cancelled',
-        output: { title: 'Automatic review off', summary: expect.stringContaining('turns automatic review off, so Manki does not review `2222222` for this push.') },
+        output: { title: 'Automatic review off', summary: expect.stringMatching(/^The base branch's `\.manki\.yml` turns automatic review off, so Manki does not review `2222222` for this push\./) },
       });
       expect(await workRows(queued.pr.stub)).toMatchObject([{ status: 'done' }, { status: 'running', check_ref: null }]);
+      // A base branch without the file takes the default branch's, and the check names that file.
+      const fromDefault = await dispatched(true, { config: 'auto_review: true', baseRef: 'develop' });
+      await fromDefault.pr.send('pull_request', fromDefault.pr.push(SHA_2), 'd-push-2');
+      await runDurableObjectAlarm(fromDefault.pr.stub);
+      Object.assign(fromDefault.github, { config: null, configAt: { main: 'auto_review: false' }, head: SHA_2 });
+      await fromDefault.end();
+      expect(fromDefault.github.configReads).toEqual(['develop', 'develop', 'main']);
+      expect(fromDefault.github.waitingChecks.at(-1)).toMatchObject({
+        head_sha: SHA_2, status: 'completed', conclusion: 'cancelled',
+        output: { title: 'Automatic review off', summary: expect.stringMatching(/^The default branch's `\.manki\.yml`, which applies because the base branch has none, turns automatic review off, so Manki does not review `2222222` for this push\./) },
+      });
       // A config that cannot be read says nothing about `auto_review`, so the run gets the check.
       const unread = await dispatched(true, { config: 'auto_review: true' });
       await unread.pr.send('pull_request', unread.pr.push(SHA_2), 'd-push-2');
