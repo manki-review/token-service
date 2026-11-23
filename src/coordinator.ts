@@ -69,11 +69,14 @@ const REACTION_MINTS = 2;
 /**
  * The most calls one step of a lane makes, by a count of the code with one check to end: a poll, the end of the waiting
  * checks, or the start of an item. The costliest is a settings edit that ticks Review again on the head under review
- * and Deeper review, with a fresh opt-in read.
+ * and Deeper review, with a fresh opt-in read. The start of a push review stays below it with both `.manki.yml` reads.
  */
 const STEP_COST = 32;
-/** The most calls the start of an item of `LIGHT_KINDS` makes, with a fresh opt-in read. The costliest is a bot's push that gets its skipped check. */
-const LIGHT_COST = 11;
+/**
+ * The most calls the start of an item of `LIGHT_KINDS` makes, with a fresh opt-in read. The costliest is a bot's push
+ * that gets its skipped check after reading `.manki.yml` on the base and the default branch.
+ */
+const LIGHT_COST = 12;
 /** The kinds whose start only dispatches a run, answers help or ends a bot's push. Any other kind is checked against `STEP_COST`. */
 const LIGHT_KINDS: ReadonlySet<Work['kind']> = new Set(['merged', 'review_state', 'thread', 'comment', 'issue', 'help', 'bot_push']);
 /** How long a review waits before each new read of a PR whose mergeability GitHub has not computed yet. */
@@ -421,12 +424,16 @@ function waitingCheckEnd(item: WorkRow, status: string, superseded: boolean): Ch
   return { conclusion: 'cancelled', title: 'Review not started', summary: `Manki did not start the review of ${sha}: ${item.note ?? 'it was dropped'}.` };
 }
 
-/** How a waiting check shown while its push review was queued ends once the base config turns automatic review off. */
-function autoReviewOff(head: string): CheckReport {
+/**
+ * How a waiting check shown while its push review was queued ends once the base config turns automatic review off.
+ * `fromDefault` says that the default branch's file applies because the base branch has none.
+ */
+function autoReviewOff(head: string, fromDefault: boolean): CheckReport {
+  const file = fromDefault ? 'The default branch\'s `.manki.yml`, which applies because the base branch has none,' : 'The base branch\'s `.manki.yml`';
   return {
     conclusion: 'cancelled',
     title: 'Automatic review off',
-    summary: `The base branch's \`.manki.yml\` turns automatic review off, so Manki does not review \`${head.slice(0, 7)}\` for this push. ${TICK_AGAIN} to review it.`,
+    summary: `${file} turns automatic review off, so Manki does not review \`${head.slice(0, 7)}\` for this push. ${TICK_AGAIN} to review it.`,
   };
 }
 
@@ -2079,7 +2086,7 @@ export class PrCoordinator extends DurableObject<Env> {
     }
     // A retry after a dispatch attempt may find that attempt's run, so only the first attempt can drop or skip.
     const first = item.attempts === 0;
-    const config = push && first ? await this.baseConfig(pr, target) : null;
+    const { config, fromDefault } = push && first ? await this.baseConfig(pr, target) : { config: null, fromDefault: false };
     if (!this.isDispatching(item.id)) return null;
     // A draft is reviewed on request, such as by its settings box, unless the base config reviews drafts.
     if (push && first && pr.draft && !reviewsDrafts(config)) {
@@ -2101,12 +2108,12 @@ export class PrCoordinator extends DurableObject<Env> {
       if (first && config !== null && !waitingCheck && item.check_ref !== null && item.check_head === pr.head.sha) {
         const checks = await this.token({ checks: 'write' });
         if (checks === null) this.forgetCheck(item.id);
-        else await this.endWaitingCheck(item, target, checks, false, autoReviewOff(pr.head.sha));
+        else await this.endWaitingCheck(item, target, checks, false, autoReviewOff(pr.head.sha, fromDefault));
         if (!this.isDispatching(item.id)) return null;
       }
       const rule = first ? this.skipRule(config, pr, item.head_sha, item.sender, target) : null;
       if (rule !== null) {
-        await this.reportSkipped(pr.head.sha, rule, target);
+        await this.reportSkipped(pr.head.sha, rule, fromDefault, target);
         if (!this.isDispatching(item.id)) return null;
       }
       // Who pushed a newer head is unknown, so its sender goes with the queued head, also for a retry after a failure.
@@ -2253,19 +2260,30 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Reads `.manki.yml` from the PR's base branch, so a PR cannot change what applies to itself. A missing file gives an
-   * empty config. A file that cannot be read, is oversized or does not parse gives null. Neither sets anything, as in
-   * Manki.
+   * Reads `.manki.yml` from the PR's base branch, so a PR cannot change what applies to itself. A base branch without the
+   * file, or with a directory, submodule or unfollowed symlink at its path, takes the default branch's, as Manki does,
+   * and `fromDefault` says so. With neither file the config is empty. A
+   * file that cannot be read, is oversized or does not parse gives null, and is never replaced by the default branch's.
+   * Neither sets anything, as in Manki.
    */
-  private async baseConfig(pr: PullRequestRead, target: Target): Promise<BaseConfig> {
+  private async baseConfig(pr: PullRequestRead, target: Target): Promise<{ config: BaseConfig; fromDefault: boolean }> {
     const token = await this.token({ contents: 'read', metadata: 'read' });
-    if (token === null) return null;
-    const response = await this.api(token, `/repos/${target.owner}/${target.repo}/contents/.manki.yml?ref=${encodeURIComponent(pr.base.ref)}`);
-    if (response.status === 404) return {};
-    if (!response.ok) throw new Error(`reading .manki.yml failed with ${response.status}`);
-    const file = await response.json() as { type?: string; size?: number; encoding?: string; content?: string };
-    if (file.type !== 'file' || file.encoding !== 'base64' || file.content === undefined || (file.size ?? 0) > MAX_CONFIG_BYTES) return null;
-    return parseConfig(new TextDecoder().decode(Uint8Array.from(atob(file.content.replace(/\s/g, '')), (c) => c.charCodeAt(0))));
+    if (token === null) return { config: null, fromDefault: false };
+    const read = async (ref: string): Promise<BaseConfig | undefined> => {
+      const response = await this.api(token, `/repos/${target.owner}/${target.repo}/contents/.manki.yml?ref=${encodeURIComponent(ref)}`);
+      if (response.status === 404) return undefined;
+      if (!response.ok) throw new Error(`reading .manki.yml failed with ${response.status}`);
+      const file = await response.json() as { type?: string; size?: number; encoding?: string; content?: string } | unknown[];
+      // As in Manki's `readConfigFile`: a directory, a symlink GitHub does not follow or a submodule is no file.
+      if (Array.isArray(file)) return undefined;
+      if (file.encoding !== 'base64' || file.content === undefined) return file.type === 'file' ? null : undefined;
+      if ((file.size ?? 0) > MAX_CONFIG_BYTES) return null;
+      return parseConfig(new TextDecoder().decode(Uint8Array.from(atob(file.content.replace(/\s/g, '')), (c) => c.charCodeAt(0))));
+    };
+    const own = await read(pr.base.ref);
+    if (own !== undefined) return { config: own, fromDefault: false };
+    const fallback = pr.base.ref === target.defaultBranch ? undefined : await read(target.defaultBranch);
+    return fallback === undefined ? { config: {}, fromDefault: false } : { config: fallback, fromDefault: true };
   }
 
   /**
@@ -2281,7 +2299,7 @@ export class PrCoordinator extends DurableObject<Env> {
     };
     const { pr, token } = await this.readPull(target);
     if (pr.state !== 'open' || pr.head.sha !== item.head_sha) return end('pushed by a bot, and no longer the head');
-    const config = await this.baseConfig(pr, target);
+    const { config, fromDefault } = await this.baseConfig(pr, target);
     // A draft gets no check from a push, as a person's push to it gets none.
     const rule = pr.draft && !reviewsDrafts(config) ? null : this.skipRule(config, pr, item.head_sha, item.sender, target);
     if (rule === null) return end('pushed by a bot');
@@ -2291,7 +2309,7 @@ export class PrCoordinator extends DurableObject<Env> {
     const checks = await this.token({ checks: 'write' });
     if (checks === null || await this.hasMankiCheck(pr.head.sha, target, checks)) return end(`${skipped}, no check added`, 'skipped');
     if (!this.isDispatching(item.id)) return;
-    await this.reportSkipped(pr.head.sha, rule, target);
+    await this.reportSkipped(pr.head.sha, rule, fromDefault, target);
     end(skipped, 'skipped');
   }
 
@@ -2310,8 +2328,9 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /** Completes a `Manki` check on `head` as skipped, as Manki does for a PR it skips. */
-  private async reportSkipped(head: string, rule: string, target: Target): Promise<void> {
-    const summary = `This PR matches the skip rule for ${rule} in \`.manki.yml\` on the base branch.`;
+  private async reportSkipped(head: string, rule: string, fromDefault: boolean, target: Target): Promise<void> {
+    const where = fromDefault ? 'default branch, which applies because the base branch has none' : 'base branch';
+    const summary = `This PR matches the skip rule for ${rule} in \`.manki.yml\` on the ${where}.`;
     await this.completeCheck(head, 'skipped', { title: 'Review skipped', summary }, target);
   }
 

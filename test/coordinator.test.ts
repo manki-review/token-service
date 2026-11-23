@@ -713,6 +713,10 @@ function fakeGitHub(number: number) {
     pullLists: [] as string[],
     /** The base branch's `.manki.yml`, or null when it has none. */
     config: null as string | null,
+    /** The `.manki.yml` of a branch that differs from `config`, by ref. */
+    configAt: {} as Record<string, string | null>,
+    /** The raw answer for `.manki.yml` by ref, such as a directory's listing, in place of a file. */
+    configReplyAt: {} as Record<string, unknown>,
     configStatus: 200,
     /** The refs `.manki.yml` was read at, and the completed check runs created. */
     configReads: [] as string[],
@@ -859,9 +863,12 @@ function fakeGitHub(number: number) {
     if (route === `GET ${repo}/contents/.manki.yml`) {
       state.configReads.push(url.searchParams.get('ref') ?? '');
       if (state.configStatus !== 200) return Response.json({ message: 'no' }, { status: state.configStatus });
-      if (state.config === null) return Response.json({ message: 'Not Found' }, { status: 404 });
-      const content = btoa(String.fromCharCode(...new TextEncoder().encode(state.config)));
-      return Response.json({ type: 'file', encoding: 'base64', size: state.config.length, content });
+      const ref = url.searchParams.get('ref') ?? '';
+      if (Object.hasOwn(state.configReplyAt, ref)) return Response.json(state.configReplyAt[ref]);
+      const config = Object.hasOwn(state.configAt, ref) ? state.configAt[ref] : state.config;
+      if (config === null) return Response.json({ message: 'Not Found' }, { status: 404 });
+      const content = btoa(String.fromCharCode(...new TextEncoder().encode(config)));
+      return Response.json({ type: 'file', encoding: 'base64', size: config.length, content });
     }
     if (route === `POST ${repo}/check-runs`) {
       state.onCheckRun?.();
@@ -1766,7 +1773,8 @@ describe('PrCoordinator dispatch', () => {
     github.head = SHA_2;
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches.at(-1)?.inputs).toMatchObject({ event: 'pull_request', head_sha: SHA_2 });
-    expect(github.configReads).toEqual(['develop', 'develop']);
+    // The base branch had no file at the first push, so the default branch's stood in, and had none either.
+    expect(github.configReads).toEqual(['develop', 'main', 'develop']);
     await pr.stub.runCompleted(key('d-draft'), 9001, 'success');
 
     // A retry after a dispatch attempt keeps the first attempt's decision, since that attempt's run may have started.
@@ -1777,7 +1785,7 @@ describe('PrCoordinator dispatch', () => {
     github.config = null;
     advanceClock(DISPATCH_BACKOFF_MS[0]);
     await runDurableObjectAlarm(pr.stub);
-    expect(github.configReads).toHaveLength(3);
+    expect(github.configReads).toHaveLength(4);
     expect(github.dispatches.at(-1)?.inputs).toMatchObject({ event: 'pull_request', head_sha: SHA_3 });
     expect((await workRows(pr.stub)).at(-1)).toMatchObject({ status: 'running' });
   });
@@ -1998,7 +2006,14 @@ describe('PrCoordinator dispatch', () => {
     ['a label, in any case', { config: 'skip_labels: [dependencies]', labels: ['Dependencies'] }, 'label "Dependencies"'],
     ['an author who also pushed', { config: 'skip_authors: [renovate-bot]', author: 'Renovate-Bot', sender: 'renovate-bot' }, 'author Renovate-Bot'],
     ['a branch glob', { config: 'skip_branches: ["release/**"]', headRef: 'release/1.2/fix' }, 'branch release/1.2/fix'],
-  ])('skips a push review matching %s on the base branch with a skipped check and no run', async (_case, change, rule) => {
+    ['a label on the default branch when the base branch has no config', { configAt: { main: 'skip_labels: [dependencies]' }, labels: ['dependencies'] }, 'label "dependencies"'],
+    ['a label on the default branch when the base branch has a directory at the config path', {
+      configReplyAt: { develop: [{ type: 'file', name: 'a.yml' }] }, configAt: { main: 'skip_labels: [dependencies]' }, labels: ['dependencies'],
+    }, 'label "dependencies"'],
+    ['a label on the default branch when the base branch has a symlink GitHub does not follow', {
+      configReplyAt: { develop: { type: 'symlink', target: 'missing.yml', size: 11 } }, configAt: { main: 'skip_labels: [dependencies]' }, labels: ['dependencies'],
+    }, 'label "dependencies"'],
+  ])('skips a push review matching %s with a skipped check and no run', async (_case, change, rule) => {
     const pr = pullRequest();
     const { sender, ...pull } = { sender: 'octocat', ...change };
     const github = Object.assign(fakeGitHub(pr.number), pull, { baseRef: 'develop' });
@@ -2006,10 +2021,12 @@ describe('PrCoordinator dispatch', () => {
     await pr.send('pull_request', { ...push, sender: { ...push.sender, login: sender } });
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches).toEqual([]);
-    expect(github.configReads).toEqual(['develop']);
+    const fromDefault = 'configAt' in change;
+    expect(github.configReads).toEqual(fromDefault ? ['develop', 'main'] : ['develop']);
+    const where = fromDefault ? 'default branch, which applies because the base branch has none' : 'base branch';
     expect(github.checkRuns).toEqual([{
       name: 'Manki', head_sha: SHA_1, status: 'completed', conclusion: 'skipped',
-      output: { title: 'Review skipped', summary: `This PR matches the skip rule for ${rule} in \`.manki.yml\` on the base branch.` },
+      output: { title: 'Review skipped', summary: `This PR matches the skip rule for ${rule} in \`.manki.yml\` on the ${where}.` },
     }]);
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'skipped', conclusion: 'skipped', note: `matches the skip rule for ${rule}` }]);
     // The cron and a late redelivery of the push leave a skipped head alone. It has no review, so marking the PR ready gets no approval check.
@@ -2026,6 +2043,11 @@ describe('PrCoordinator dispatch', () => {
     ['a branch on a fork head', { config: 'skip_branches: ["release/*"]', headRef: 'release/1', headRepositoryId: 1 }],
     ['rules that are not lists of non-empty strings', { config: 'skip_labels: dependencies\nskip_branches: ["feature"]' }],
     ['a config that does not parse', { config: 'skip_branches: [feature' }],
+    // Only a missing base file falls back, so a broken one never takes the default branch's rules.
+    ['a rule on the default branch when the base config does not parse', { config: 'skip_branches: [feature', configAt: { main: 'skip_labels: [dependencies]' }, labels: ['dependencies'], baseRef: 'develop' }],
+    ['a rule on the default branch when the base config is too large for GitHub to send', {
+      configReplyAt: { develop: { type: 'file', size: 2_000_000, encoding: 'none', content: '' } }, configAt: { main: 'skip_labels: [dependencies]' }, labels: ['dependencies'], baseRef: 'develop',
+    }],
     ['no config', {}],
   ])('reviews a push matching %s', async (_case, change) => {
     const pr = pullRequest();
@@ -3141,9 +3163,20 @@ describe('PrCoordinator dispatch', () => {
       await queued.end();
       expect(queued.github.waitingChecks.at(-1)).toMatchObject({
         head_sha: SHA_2, status: 'completed', conclusion: 'cancelled',
-        output: { title: 'Automatic review off', summary: expect.stringContaining('turns automatic review off, so Manki does not review `2222222` for this push.') },
+        output: { title: 'Automatic review off', summary: expect.stringMatching(/^The base branch's `\.manki\.yml` turns automatic review off, so Manki does not review `2222222` for this push\./) },
       });
       expect(await workRows(queued.pr.stub)).toMatchObject([{ status: 'done' }, { status: 'running', check_ref: null }]);
+      // A base branch without the file takes the default branch's, and the check names that file.
+      const fromDefault = await dispatched(true, { config: 'auto_review: true', baseRef: 'develop' });
+      await fromDefault.pr.send('pull_request', fromDefault.pr.push(SHA_2), 'd-push-2');
+      await runDurableObjectAlarm(fromDefault.pr.stub);
+      Object.assign(fromDefault.github, { config: null, configAt: { main: 'auto_review: false' }, head: SHA_2 });
+      await fromDefault.end();
+      expect(fromDefault.github.configReads).toEqual(['develop', 'develop', 'main']);
+      expect(fromDefault.github.waitingChecks.at(-1)).toMatchObject({
+        head_sha: SHA_2, status: 'completed', conclusion: 'cancelled',
+        output: { title: 'Automatic review off', summary: expect.stringMatching(/^The default branch's `\.manki\.yml`, which applies because the base branch has none, turns automatic review off, so Manki does not review `2222222` for this push\./) },
+      });
       // A config that cannot be read says nothing about `auto_review`, so the run gets the check.
       const unread = await dispatched(true, { config: 'auto_review: true' });
       await unread.pr.send('pull_request', unread.pr.push(SHA_2), 'd-push-2');
