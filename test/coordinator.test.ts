@@ -1201,7 +1201,7 @@ describe('PrCoordinator dispatch', () => {
   it.each<[string, string, (pr: ReturnType<typeof pullRequest>, sha: string) => WebhookPayload]>([
     ['review', 'pull_request', (pr, sha) => pr.push(sha)],
     ['review state check', 'pull_request_review', (pr) => pr.review()],
-  ])(`lets a %s go before replies once replies went ahead of it for ${REPLY_FIRST_MS / MINUTE} minutes`, async (_kind, event, payload) => {
+  ])(`lets a %s go before replies once it was queued for ${REPLY_FIRST_MS / MINUTE} minutes`, async (_kind, event, payload) => {
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
     await pr.send(event, payload(pr, SHA_1));
@@ -1216,7 +1216,9 @@ describe('PrCoordinator dispatch', () => {
     expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request_review_comment', event]);
   });
 
-  it('runs a reply first although its review waited behind a long run', async () => {
+  it('runs a review before a reply once it waited behind a long run, so replies cannot starve it', async () => {
+    // Without a waiting check only the time since the review was queued holds replies back.
+    await setTakesOverCheck(REPOSITORY_ID, false);
     const pr = pullRequest();
     const github = fakeGitHub(pr.number);
     await pr.send('pull_request', pr.push(SHA_1));
@@ -1227,7 +1229,7 @@ describe('PrCoordinator dispatch', () => {
     await pr.send('pull_request_review_comment', pr.reply('Fixed'));
     await pr.stub.runCompleted(key('d-review'), 9000, 'success');
     await runDurableObjectAlarm(pr.stub);
-    expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request', 'pull_request_review_comment']);
+    expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request', 'pull_request']);
   });
 
   it('gives a token only to the run it dispatched, from its workflow on the default branch, while that run is active', async () => {
@@ -1947,7 +1949,7 @@ describe('PrCoordinator dispatch', () => {
     expect((await workRows(failing.stub)).map((row) => row.status)).toEqual(['skipped', 'skipped', 'skipped']);
   });
 
-  it('reviews a PR GitHub has not computed mergeability for after reading it twice more, with replies first and newer pushes merged in, and a clean one at once', async () => {
+  it('reviews a PR GitHub has not computed mergeability for after reading it twice more, with newer pushes merged in, and a clean one at once', async () => {
     const pr = pullRequest();
     const github = Object.assign(fakeGitHub(pr.number), { mergeable: [null], mergeableState: 'unknown' });
     await pr.send('pull_request', pr.push(SHA_1));
@@ -1956,27 +1958,31 @@ describe('PrCoordinator dispatch', () => {
     expect(await workRows(pr.stub)).toMatchObject([{ status: 'queued', merge_checks: 1 }]);
     expect(await runInDurableObject(pr.stub, (_instance, state) => state.storage.getAlarm())).toBe(Date.now() + 5_000);
 
-    // A thread reply arriving during the wait goes first, and a newer push joins the waiting review.
+    // The waiting review shows its queued check, so a thread reply arriving during the wait waits behind it, and a newer
+    // push joins it and moves its check to the new head.
+    expect(github.waitingChecks).toMatchObject([{ head_sha: SHA_1, status: 'queued', output: { title: 'Queued' } }]);
     advanceClock(2_000);
     await pr.send('pull_request_review', pr.review());
     await pr.send('pull_request_review_comment', pr.reply('Fixed'));
     await runDurableObjectAlarm(pr.stub);
-    expect(github.dispatches.map((dispatch) => dispatch.inputs.event)).toEqual(['pull_request_review_comment']);
+    expect(github.dispatches).toEqual([]);
     expect(await pr.send('pull_request', pr.push(SHA_2))).toEqual({ accepted: true, effect: 'merged into work 1' });
     github.head = SHA_2;
     expect(await workRows(pr.stub)).toMatchObject([
-      { kind: 'review', status: 'queued', head_sha: SHA_2 }, { kind: 'review_state', status: 'queued' }, { kind: 'thread', status: 'running' },
+      { kind: 'review', status: 'queued', head_sha: SHA_2 }, { kind: 'review_state', status: 'queued' }, { kind: 'thread', status: 'queued' },
     ]);
 
     advanceClock(3_000);
-    await pr.stub.runCompleted(key('d-reply-end'), 9000, 'success');
     await runDurableObjectAlarm(pr.stub);
-    expect(await workRows(pr.stub)).toMatchObject([{ kind: 'review', status: 'queued', merge_checks: 2 }, { kind: 'review_state', status: 'queued' }, { kind: 'thread', status: 'done' }]);
+    expect(await workRows(pr.stub)).toMatchObject([{ kind: 'review', status: 'queued', merge_checks: 2 }, { kind: 'review_state', status: 'queued' }, { kind: 'thread', status: 'queued' }]);
+    expect(github.waitingChecks).toMatchObject([
+      { head_sha: SHA_1, status: 'completed', conclusion: 'cancelled', output: { title: 'Superseded by a newer commit' } },
+      { head_sha: SHA_2, status: 'queued', output: { title: 'Queued' } },
+    ]);
     advanceClock(15_000);
     await runDurableObjectAlarm(pr.stub);
-    expect(github.dispatches.map((dispatch) => [dispatch.inputs.event, dispatch.inputs.head_sha])).toEqual([
-      ['pull_request_review_comment', undefined], ['pull_request', SHA_2],
-    ]);
+    expect(github.dispatches.map((dispatch) => [dispatch.inputs.event, dispatch.inputs.head_sha])).toEqual([['pull_request', SHA_2]]);
+    expect(github.waitingChecks).toHaveLength(2);
     expect(logged(log, 'coordinator_mergeability_pending')).toHaveLength(2);
     expect(github.comments).toEqual([]);
 
@@ -2696,6 +2702,30 @@ describe('PrCoordinator dispatch', () => {
       expect(await workRows(pr.stub)).toMatchObject([{ status: 'done', check_id: null, check_head: null }]);
     });
 
+    it('shows the waiting check of a push review queued behind a run, lets no reply go first and hands the check to its run', async () => {
+      const { pr, github, ask, end } = await dispatched();
+      github.head = SHA_2;
+      await pr.send('pull_request', pr.push(SHA_2), 'd-push-2');
+      await runDurableObjectAlarm(pr.stub);
+      const queued = {
+        id: 501, head_sha: SHA_2, status: 'queued', external_id: 'd-push-2',
+        output: { title: 'Queued', summary: 'Manki reviews `2222222` once the Manki runs before it on this pull request end and GitHub Actions gives its run a runner.' },
+      };
+      expect(github.waitingChecks).toEqual([WAITING, queued]);
+      await pr.send('pull_request_review_comment', pr.reply('Fixed'));
+      await end();
+      expect(github.dispatches.map(({ inputs }) => inputs.event)).toEqual(['pull_request', 'pull_request']);
+      expect(github.waitingChecks).toMatchObject([{ status: 'completed', output: { title: 'Superseded by a newer commit' } }, queued]);
+      expect(await ask({ takes_over_check: true }, 9001)).toMatchObject({ check_run: { id: 501, head_sha: SHA_2 } });
+
+      // A pause holds the push review back, so it shows no check.
+      const paused = await dispatched();
+      await paused.pr.stub.report(9000, { pause: { reason: 'Round cap reached.' } });
+      await paused.pr.send('pull_request', paused.pr.push(SHA_2), 'd-push-2');
+      await runDurableObjectAlarm(paused.pr.stub);
+      expect(paused.github.waitingChecks).toEqual([WAITING]);
+    });
+
     it('ends the waiting check before the token leaves for a run that reports in a check of its own', async () => {
       const { pr, github, ask, end } = await dispatched();
       // The token mint that follows the hand-over finds the check ended already.
@@ -2963,13 +2993,17 @@ describe('PrCoordinator dispatch', () => {
       expect(await pr.send('pull_request', pr.push(SHA_2))).toEqual({ accepted: true, effect: 'head already reviewed or under review' });
       await end();
       expect(github.dispatches).toHaveLength(1);
-      expect(github.waitingChecks).toMatchObject([{ head_sha: SHA_1, conclusion: 'cancelled', output: { title: 'Superseded by a newer commit' } }]);
+      expect(github.waitingChecks).toMatchObject([
+        { head_sha: SHA_1, conclusion: 'cancelled', output: { title: 'Superseded by a newer commit' } },
+        { head_sha: SHA_2, conclusion: 'cancelled', output: { title: 'Review not started', summary: `Manki did not start the review of \`${SHA_2.slice(0, 7)}\`: an earlier run reviewed it.` } },
+      ]);
 
       // A review someone asked for still runs on that head.
       const asked = await dispatched();
       asked.github.head = SHA_2;
       await asked.pr.send('issue_comment', asked.pr.comment('@manki review'), 'd-request');
       await asked.pr.send('pull_request', asked.pr.push(SHA_2), 'd-push-2');
+      await runDurableObjectAlarm(asked.pr.stub);
       await asked.pr.stub.report(9000, { reviewed: { commit: SHA_2 } });
       await asked.end();
       expect(asked.github.dispatches.map(({ inputs }) => inputs.event)).toEqual(['pull_request', 'issue_comment']);
@@ -3088,6 +3122,17 @@ describe('PrCoordinator dispatch', () => {
         expect(off.github.dispatches).toHaveLength(1);
       }
       expect((await dispatched(true, { config: 'auto_review: true' })).github.waitingChecks).toEqual([WAITING]);
+      // A push queued behind a run shows its check before the config is read, and the review's start ends it.
+      const queued = await dispatched(true, { config: 'auto_review: true' });
+      await queued.pr.send('pull_request', queued.pr.push(SHA_2), 'd-push-2');
+      await runDurableObjectAlarm(queued.pr.stub);
+      Object.assign(queued.github, { config: 'auto_review: false', head: SHA_2 });
+      await queued.end();
+      expect(queued.github.waitingChecks.at(-1)).toMatchObject({
+        head_sha: SHA_2, status: 'completed', conclusion: 'cancelled',
+        output: { title: 'Automatic review off', summary: expect.stringContaining('turns automatic review off, so Manki does not review `2222222` for this push.') },
+      });
+      expect(await workRows(queued.pr.stub)).toMatchObject([{ status: 'done' }, { status: 'running', check_ref: null }]);
       // A review someone asked for runs whatever `auto_review` says.
       const asked = pullRequest();
       const askedGitHub = Object.assign(fakeGitHub(asked.number), { config: 'auto_review: false' });
