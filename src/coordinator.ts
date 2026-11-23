@@ -251,10 +251,10 @@ const EMPTY_STATE: ReportedState = {
   settings: { paused: false },
 };
 
-/** What a run of the PR reports. A field left out keeps its value, and `pause: null` lifts the pause. */
+/** What a run of the PR reports. A field left out keeps its value, `approval: null` clears the approval and `pause: null` lifts the pause. */
 export interface StateReport {
   reviewed?: { commit: string };
-  approval?: { commit: string; held: boolean };
+  approval?: { commit: string; held: boolean } | null;
   pause?: { reason: string } | null;
 }
 
@@ -725,6 +725,9 @@ export class PrCoordinator extends DurableObject<Env> {
     const lastApproval = state.last_approval;
     if (approval && (lastApproval?.commit !== approval.commit || lastApproval.held !== approval.held || lastApproval.run_id !== runId)) {
       state.last_approval = { commit: approval.commit, held: approval.held, run_id: runId, at: now };
+      changed.push('approval');
+    } else if (approval === null && lastApproval !== null) {
+      state.last_approval = null;
       changed.push('approval');
     }
     if (pause !== undefined && (state.pause?.reason ?? null) !== (pause?.reason ?? null)) {
