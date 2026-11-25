@@ -174,10 +174,22 @@ describe('PrCoordinator.receive', () => {
     expect((await workRows(pr.stub)).map((row) => `${row.lane}:${row.kind}`)).toEqual([
       'state:review', 'state:thread', 'state:comment', 'chat:comment',
     ]);
-    // Only a thread item names its comment, so a running review knows which replies still wait.
-    const [, reply] = await workRows(pr.stub);
-    expect(reply!.object_id).not.toBeNull();
-    expect((await pr.stub.state()).queue.map((item) => item.comment_id)).toEqual([null, reply!.object_id, null, null]);
+    // Only a thread reply names its comment, so a running review knows which replies still wait. A box tick in Manki's
+    // comment or review is a thread item that names no reply, and a review's id could be another comment's.
+    const box = (tick: string) => `- [${tick}] Create an issue for this <!-- manki-box:issue:src/app.ts:1:0123456789ab -->`;
+    const ticks = [
+      ['pull_request_review_comment', { ...reviewCommentEvent(box('x'), { user: MANKI_AUTHOR }, 'edited', { number: pr.number }), sender: { login: 'alice', type: 'User' } }],
+      ['pull_request_review', { ...reviewEvent('edited', { user: MANKI_AUTHOR, node_id: 'PRR_1', body: box('x') }, { number: pr.number }), sender: MANKI_AUTHOR }],
+    ] as const;
+    for (const [event, payload] of ticks) {
+      const route = routeDelivery(event, { ...payload, changes: { body: { from: box(' ') } } });
+      if (route.type !== 'work') throw new Error(`Route ${route.type} is not for the coordinator`);
+      await pr.stub.receive(key(crypto.randomUUID()), route);
+    }
+    const rows = await workRows(pr.stub);
+    expect(rows.slice(4).map((row) => `${row.kind}:${row.event}`)).toEqual(['thread:pull_request_review_comment.edited', 'thread:pull_request_review.edited']);
+    expect(rows.slice(4).every((row) => row.object_id !== null)).toBe(true);
+    expect((await pr.stub.state()).queue.map((item) => item.comment_id)).toEqual([null, rows[1]!.object_id, null, null, null, null]);
   });
 
   it('keeps a review state check queued behind a thread reply', async () => {
