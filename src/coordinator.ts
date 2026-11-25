@@ -1658,13 +1658,13 @@ export class PrCoordinator extends DurableObject<Env> {
     return `resumed, ${this.enqueue(work, item.delivery, Date.now())}`;
   }
 
-  /** Whether the PR is an open draft whose head has no review that ended, runs or waits. */
-  private async unreviewedDraft(): Promise<boolean> {
+  /** Whether the PR is an open draft whose head has no review that ended, runs or waits. With `head`, that commit must be its head. */
+  private async unreviewedDraft(head?: string): Promise<boolean> {
     const target = await this.verifiedTarget();
     if (!target) throw new Error('the repository could not be read');
     const { pr } = await this.readPull(target);
     const { sha } = pr.head;
-    return pr.state === 'open' && pr.draft === true && this.reviewState(sha) === null && this.approvalCheckAfter(sha) === null;
+    return pr.state === 'open' && pr.draft === true && sha === (head ?? sha) && this.reviewState(sha) === null && this.approvalCheckAfter(sha) === null;
   }
 
   /**
@@ -2126,10 +2126,15 @@ export class PrCoordinator extends DurableObject<Env> {
    * Tells a draft that its push is not reviewed, with the boxes that review it. A settings comment the PR already has
    * gets the status line and the boxes instead, and a later push only updates that comment. Nothing is written once
    * Review every push is ticked or a review was asked for, since that review's progress comment holds the boxes, or
-   * while a change of Review every push waits.
+   * while a change of Review every push waits. An item that waited out a failure may find the PR marked ready, pushed to
+   * or reviewed, so the PR is read again first.
    */
   private async showDraft(item: WorkRow): Promise<void> {
     const head = item.head_sha ?? '';
+    if (!(await this.unreviewedDraft(head))) {
+      if (this.isDispatching(item.id)) this.finish(item.id, 'skipped', 'the draft notice no longer applies');
+      return;
+    }
     await this.postNotice(item, {
       key: 'draft_notice', name: 'draft notice', marker: DRAFT_NOTICE_MARKER, text: draftNotice(head),
       refresh: (body) => withSettingsStatus(withDraftBoxes(body), DRAFT_STATUS, ['auto'], head),

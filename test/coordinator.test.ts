@@ -2545,6 +2545,38 @@ describe('PrCoordinator dispatch', () => {
       expect(other.comments).toHaveLength(1);
       expect(await draftNotices(asked)).toEqual([['help', 'skipped', 'the draft notice no longer applies']]);
     });
+
+    it.each([
+      ['is marked ready', { draft: false }],
+      ['is closed', { prState: 'closed' }],
+      ['has a newer head', { head: SHA_2 }],
+    ])('writes nothing when the PR %s while a failed notice waits for its retry', async (_case, change) => {
+      const pr = pullRequest();
+      const github = Object.assign(fakeGitHub(pr.number), { draft: true, commentStatus: 502 });
+      await pushDraft(pr, github, SHA_1, 'opened');
+      const settings = `Text\n\n---\nLast reviewed \`1111111\` · head \`1111111\` · up to date\n- [ ] Review again <!-- manki-box:again -->\n<!-- manki-settings -->`;
+      github.issueComments.set(7, settings);
+      Object.assign(github, { commentStatus: 201 }, change);
+      advanceClock(backoff(0));
+      await runDurableObjectAlarm(pr.stub);
+      expect(github.comments).toHaveLength(1);
+      expect(github.issueComments.get(7)).toBe(settings);
+      expect(await draftNotices(pr)).toEqual([['help', 'skipped', 'the draft notice no longer applies']]);
+    });
+
+    it('writes nothing when the head was reviewed while a failed notice waits for its retry', async () => {
+      const pr = pullRequest();
+      const github = Object.assign(fakeGitHub(pr.number), { draft: true, commentStatus: 502 });
+      await pushDraft(pr, github, SHA_1, 'opened');
+      await pr.send('issue_comment', pr.comment('/manki review'));
+      await runDurableObjectAlarm(pr.stub);
+      await pr.stub.runCompleted(key('d-reviewed'), 9000, 'success');
+      github.commentStatus = 201;
+      advanceClock(backoff(0));
+      await runDurableObjectAlarm(pr.stub);
+      expect(github.comments).toHaveLength(1);
+      expect(await draftNotices(pr)).toEqual([['help', 'skipped', 'the draft notice no longer applies']]);
+    });
   });
 
   it('looks up a commenter the payload does not show as a writer, and skips their comment without write access', async () => {
