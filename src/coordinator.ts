@@ -95,9 +95,8 @@ const FORK_NOTICE_MARKER = '<!-- manki-fork-notice -->';
 export function forkNotice(head: string): string {
   const text = 'This pull request comes from a fork, so Manki does not review it automatically. Someone with write access to this repository '
     + 'can start a review by ticking a box in the settings block below or by commenting `/manki review`, and has to do so again after each push.';
-  return `${text}\n\n${FORK_NOTICE_MARKER}\n\n${renderSettingsBlock(head, 'no automatic review')}`;
+  return `${text}\n\n${FORK_NOTICE_MARKER}\n\n${renderSettingsBlock(head, 'no automatic review', ['again', 'deeper'])}`;
 }
-const FORK_NOTICE_POSTED = 'fork notice already posted';
 const NOT_STARTED = new Set(['queued', 'requested', 'waiting', 'pending']);
 /** A larger `.manki.yml` is not parsed for skip rules, as it costs too much CPU in an alarm. */
 const MAX_CONFIG_BYTES = 64 * 1024;
@@ -231,6 +230,14 @@ interface PendingReaction {
   commentId: number;
   /** Mirrors `Work.repliesTo`. The reaction is added only when that comment starts one of Manki's threads. */
   repliesTo?: number;
+}
+
+/** A notice a PR gets once: the key it is recorded under, its name in notes, the marker that finds it, and its text. */
+interface Notice {
+  key: 'fork_notice';
+  name: string;
+  marker: string;
+  text: string;
 }
 
 /** Returns the GitHub calls a reaction takes. A reply costs the read of the comment it answers and the reaction, a command the reaction alone. */
@@ -1246,7 +1253,7 @@ export class PrCoordinator extends DurableObject<Env> {
         return;
       }
       if (item.kind === 'fork_notice') {
-        await this.postForkNotice(item);
+        await this.postNotice(item, { key: 'fork_notice', name: 'fork notice', marker: FORK_NOTICE_MARKER, text: forkNotice(item.head_sha ?? '') });
         return;
       }
       if (this.capped(item)) return;
@@ -2029,36 +2036,36 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Tells a PR from a fork once that it gets no automatic review, and how someone with write access starts one. The
-   * notice is a comment and never a `Manki` check, since a completed check satisfies a branch protection rule that
-   * requires it. Its boxes start nothing here: a tick arrives as a settings edit, whose editor needs write access. The
-   * coordinator records the notice, and without a record it looks for the marker among Manki's newest comments. A
-   * failure GitHub may recover from throws, and the retry looks for the marker again before it posts.
+   * Tells a PR once that it gets no automatic review, and how someone with write access starts one. The notice is a
+   * comment and never a `Manki` check, since a completed check satisfies a branch protection rule that requires it. Its
+   * boxes start nothing here: a tick arrives as a settings edit, whose editor needs write access. The coordinator
+   * records the notice, and without a record it looks for the marker among Manki's newest comments. A failure GitHub may
+   * recover from throws, and the retry looks for the marker again before it posts.
    */
-  private async postForkNotice(item: WorkRow): Promise<void> {
+  private async postNotice(item: WorkRow, { key, name, marker, text }: Notice): Promise<void> {
     const end = (status: WorkStatus, note: string) => {
       if (this.isDispatching(item.id)) this.finish(item.id, status, note);
     };
-    if (this.getMeta<boolean>('fork_notice')) return end('skipped', FORK_NOTICE_POSTED);
-    const notice = forkNotice(item.head_sha ?? '');
+    const already = `${name} already posted`;
+    if (this.getMeta<boolean>(key)) return end('skipped', already);
     // The block names the head the delivery gave. With a head that is no commit id it would not read as a settings block.
-    if (settingsHead(notice) === null) return end('skipped', 'the delivery names no head commit');
+    if (settingsHead(text) === null) return end('skipped', 'the delivery names no head commit');
     const target = await this.verifiedTarget();
     if (!target) throw new Error('the repository could not be read');
     const token = await this.token({ issues: 'write', pull_requests: 'write' });
     if (token === null) return end('skipped', 'installation lacks issues: write');
-    const held = await this.newestMankiComment(token, target, (body) => body.includes(FORK_NOTICE_MARKER));
+    const held = await this.newestMankiComment(token, target, (body) => body.includes(marker));
     if (held === null) {
       // A close may have dropped the item during the calls above.
       if (!this.isDispatching(item.id)) return;
-      const response = await this.api(token, `/repos/${target.owner}/${target.repo}/issues/${target.number}/comments`, { method: 'POST', body: { body: notice } });
+      const response = await this.api(token, `/repos/${target.owner}/${target.repo}/issues/${target.number}/comments`, { method: 'POST', body: { body: text } });
       if (!response.ok) {
-        if (!isRefusal(response, await response.text())) throw new Error(`posting the fork notice failed with ${response.status}`);
-        return end('failed', `posting the fork notice was refused with ${response.status}`);
+        if (!isRefusal(response, await response.text())) throw new Error(`posting the ${name} failed with ${response.status}`);
+        return end('failed', `posting the ${name} was refused with ${response.status}`);
       }
     }
-    this.setMeta('fork_notice', true);
-    end(held === null ? 'done' : 'skipped', held === null ? 'posted the fork notice' : FORK_NOTICE_POSTED);
+    this.setMeta(key, true);
+    end(held === null ? 'done' : 'skipped', held === null ? `posted the ${name}` : already);
   }
 
   /** Reads the PR, and returns it with the token that read it. Throws when it cannot be read. */

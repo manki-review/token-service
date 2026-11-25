@@ -274,16 +274,19 @@ export type ReviewMode = Extract<SettingsBox, 'again' | 'deeper' | 'draft'>;
 
 export const REVIEW_MODES: readonly ReviewMode[] = ['again', 'deeper', 'draft'];
 
-/** The boxes of a PR that has no review yet, with the labels Manki's `renderSettingsBlock` gives them then, in its order. */
-const UNREVIEWED_BOXES: ReadonlyArray<[ReviewMode, string]> = [['again', 'Review now'], ['deeper', 'Deeper review']];
+/** The boxes the Worker writes itself, with the labels Manki's `renderSettingsBlock` gives them on a PR without a review. */
+const BOX_LABELS = { again: 'Review now', deeper: 'Deeper review' } satisfies Partial<Record<SettingsBox, string>>;
+
+type WrittenBox = keyof typeof BOX_LABELS;
+
+const boxLine = (box: WrittenBox): string => `- [ ] ${BOX_LABELS[box]} <!-- manki-box:${box} -->`;
 
 /**
- * Returns the settings block of a PR that has no review yet, with `status` and both review boxes unticked. Manki reads
- * the block and writes it again, so it is what `renderSettingsBlock` in manki `src/settings.ts` returns, byte for byte.
+ * Returns the settings block of a PR that has no review yet, with `status` and `boxes` unticked. Manki reads the block
+ * and writes it again, so it is what `renderSettingsBlock` in manki `src/settings.ts` returns, byte for byte.
  */
-export function renderSettingsBlock(head: string, status: string): string {
-  const boxes = UNREVIEWED_BOXES.map(([box, label]) => `- [ ] ${label} <!-- manki-box:${box} -->`);
-  return ['---', `Not reviewed yet · head \`${head.slice(0, 7)}\` · ${status}`, ...boxes, SETTINGS_MARKER].join('\n');
+export function renderSettingsBlock(head: string, status: string, boxes: readonly WrittenBox[]): string {
+  return ['---', `Not reviewed yet · head \`${head.slice(0, 7)}\` · ${status}`, ...boxes.map(boxLine), SETTINGS_MARKER].join('\n');
 }
 
 /** Returns the head commit the settings block of `body` names, as Manki writes it, or null without a block. */
