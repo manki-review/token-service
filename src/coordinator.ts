@@ -8,12 +8,12 @@ import { log } from './log';
 import {
   type AccessCommand, allowBox, REFUSAL_MARKER, autoReviewIsOn, type BaseConfig, BOT_LOGIN, boxLabels, type BoxChange, cancelledProgress, HELP_REPLY, isMankiGraphqlLogin, isRunningProgress, MANKI_COMMENT_MARKER,
   MANKI_LOGINS, matchSkipRule, type MessageTick, parseConfig, renderSettingsBlock, REVIEW_MODES, type ReviewMode, reviewsDrafts, setBoxes, settleMessageBoxes,
-  type SettingsBox, settingsHead, skipRulesOf, withSettingsStatus,
+  type SettingsBox, settingsHead, skipRulesOf, withDraftBoxes, withSettingsStatus,
 } from './manki';
 import { type OptIn, readOptIn, type Repository } from './opt-in';
 import type { Permissions } from './permissions';
 import { isAllowedSender, RECONCILER_NAME } from './reconciler';
-import { type Lane, type Route, type Target, type Work } from './routing';
+import { isBot, type Lane, type Route, type Target, type Work } from './routing';
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -192,7 +192,7 @@ interface PullRequestRead {
   mergeable?: boolean | null;
   mergeable_state?: string;
   labels?: Array<{ name: string }>;
-  user?: { login?: string } | null;
+  user?: { login?: string; type?: string } | null;
   head: { sha: string; ref: string; repo?: { id?: number } | null };
   base: { ref: string };
 }
@@ -232,12 +232,28 @@ interface PendingReaction {
   repliesTo?: number;
 }
 
-/** A notice a PR gets once: the key it is recorded under, its name in notes, the marker that finds it, and its text. */
+/** Marks the Worker's notice on a draft, so a PR that holds one gets no second. */
+const DRAFT_NOTICE_MARKER = '<!-- manki-draft-notice -->';
+const DRAFT_STATUS = 'draft, not reviewed automatically';
+/** Returns the notice a draft gets once. As in `forkNotice`, it ends with a settings block and quotes only `head`. */
+export function draftNotice(head: string): string {
+  const text = 'This pull request is a draft, so Manki does not review it automatically. Marking it ready for review starts automatic reviews. '
+    + 'Until then, someone with write access to this repository can tick a box below: **Review this draft** reviews the current commit once, '
+    + '**Deeper review** does so with more effort, and **Review every push** reviews it now and again after each push.';
+  return `${text}\n\n${DRAFT_NOTICE_MARKER}\n\n${renderSettingsBlock(head, DRAFT_STATUS, ['deeper', 'draft', 'auto'])}`;
+}
+/** A notice a PR gets once. */
 interface Notice {
-  key: 'fork_notice';
+  /** The key it is recorded under. */
+  key: 'fork_notice' | 'draft_notice';
+  /** What the notes of its item call it. */
   name: string;
   marker: string;
   text: string;
+  /** Updates a settings comment of Manki's that the PR already has, which then takes the place of the notice. */
+  refresh?: (body: string) => string;
+  /** Whether the notice still applies, asked right before it is written. */
+  applies?: () => boolean;
 }
 
 /** Returns the GitHub calls a reaction takes. A reply costs the read of the comment it answers and the reaction, a command the reaction alone. */
@@ -247,14 +263,26 @@ function reactionCost(reaction: PendingReaction): number {
 
 export type ReceiveResult = { accepted: false; reason: string } | { accepted: true; effect: string };
 
+/** The sticky settings boxes as a writer set them. */
+interface Settings {
+  paused: boolean;
+  /** Whether Review every push is ticked on a draft. Left out until the box was offered, so Manki shows it only where it works. */
+  auto?: boolean;
+}
+
+/** The setting each sticky box sets. */
+const STICKY_BOXES = { pause: 'paused', auto: 'auto' } as const satisfies Partial<Record<SettingsBox, keyof Settings>>;
+
+const isSticky = (box: SettingsBox): box is keyof typeof STICKY_BOXES => Object.hasOwn(STICKY_BOXES, box);
+
 /** What the PR's runs reported, as stored. Times are in milliseconds. */
 interface ReportedState {
   last_reviewed: { commit: string; run_id: number; at: number } | null;
   last_approval: { commit: string; held: boolean; run_id: number; at: number } | null;
   /** The automatic pause the Action decided from the round history, such as the round cap. */
   pause: { reason: string; at: number } | null;
-  /** What a writer set with the settings boxes. Only Pause stays set, the other boxes ask for one review each. */
-  settings: { paused: boolean };
+  /** What a writer set with the sticky settings boxes. The other boxes ask for one review each. */
+  settings: Settings;
 }
 
 const EMPTY_STATE: ReportedState = {
@@ -280,7 +308,7 @@ export interface PrState {
   last_reviewed: { commit: string; run_id: number; at: string } | null;
   last_approval: { commit: string; held: boolean; run_id: number; at: string } | null;
   pause: { reason: string; at: string } | null;
-  settings: { paused: boolean };
+  settings: Settings;
 }
 
 export type ReportResult = { accepted: false; reason: string } | { accepted: true; changed: string[] };
@@ -1256,6 +1284,10 @@ export class PrCoordinator extends DurableObject<Env> {
         await this.postNotice(item, { key: 'fork_notice', name: 'fork notice', marker: FORK_NOTICE_MARKER, text: forkNotice(item.head_sha ?? '') });
         return;
       }
+      if (item.kind === 'draft_notice') {
+        await this.showDraft(item);
+        return;
+      }
       if (this.capped(item)) return;
       if (item.kind === 'help') await this.answerHelp(item);
       else if (item.kind === 'access') await this.applyAccess(item);
@@ -1569,10 +1601,10 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Applies a writer's box changes. Pause is set and cleared. A tick of a review box asks for one review with that mode,
-   * and Cancel cancels the running review. Unticking any other box changes nothing, since it clears itself. Pause is the
-   * only state an edit sets, so only its change is ignored when the edit is older than the last Pause change applied,
-   * such as a late redelivery.
+   * Applies a writer's box changes. Pause and Review every push are set and cleared. A tick of a review box asks for one
+   * review with that mode, and Cancel cancels the running review. Unticking any other box changes nothing, since it
+   * clears itself. A change of a sticky box is ignored when the edit is older than the last change of it applied, such
+   * as a late redelivery.
    */
   private async applySettings(item: WorkRow): Promise<void> {
     const { at, changes } = editOf(item);
@@ -1580,16 +1612,19 @@ export class PrCoordinator extends DurableObject<Env> {
     const ordered = [...changes].sort((a, b) => Number(b.box === 'cancel') - Number(a.box === 'cancel'));
     const effects: string[] = [];
     for (const { box, ticked } of ordered) {
-      if (box === 'pause') {
-        if (at < (this.getMeta<number>('pause_at') ?? 0)) {
-          effects.push('pause older than the last pause change');
+      if (isSticky(box)) {
+        if (at < (this.getMeta<number>(`${box}_at`) ?? 0)) {
+          effects.push(`${box} older than the last ${box} change`);
           continue;
         }
-        this.setMeta('pause_at', at);
+        // Read before anything is stored, so a failed read leaves the whole tick to the retry.
+        const unreviewed = box === 'auto' && ticked ? await this.unreviewedDraft() : false;
+        this.setMeta(`${box}_at`, at);
         const state = this.reported();
-        if (state.settings.paused === ticked) continue;
-        this.setMeta('pr_state', { ...state, settings: { paused: ticked } });
-        effects.push(ticked ? 'paused' : state.pause === null ? this.resume(item) : 'resumed');
+        if ((state.settings[STICKY_BOXES[box]] ?? false) === ticked) continue;
+        this.setMeta('pr_state', { ...state, settings: { ...state.settings, [STICKY_BOXES[box]]: ticked } });
+        if (box === 'auto') effects.push(!ticked ? 'stopped reviewing every push' : unreviewed ? `reviewing every push, ${await this.requestReview(item, 'draft')}` : 'reviewing every push');
+        else effects.push(ticked ? 'paused' : state.pause === null ? this.resume(item) : 'resumed');
       } else if (ticked && (REVIEW_MODES as readonly string[]).includes(box)) {
         effects.push(await this.reviewBox(item, box as ReviewMode, at));
       } else if (ticked && box === 'cancel') {
@@ -1621,6 +1656,15 @@ export class PrCoordinator extends DurableObject<Env> {
       trusted: true, acknowledge: false, writer: true,
     };
     return `resumed, ${this.enqueue(work, item.delivery, Date.now())}`;
+  }
+
+  /** Whether the PR is an open draft whose head has no review that ended, runs or waits. */
+  private async unreviewedDraft(): Promise<boolean> {
+    const target = await this.verifiedTarget();
+    if (!target) throw new Error('the repository could not be read');
+    const { pr } = await this.readPull(target);
+    const { sha } = pr.head;
+    return pr.state === 'open' && pr.draft === true && this.reviewState(sha) === null && this.approvalCheckAfter(sha) === null;
   }
 
   /**
@@ -1826,15 +1870,15 @@ export class PrCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Puts back the boxes someone without write access changed: Pause as it applies, and every other box unticked. The
-   * message boxes of another message of Manki's are unticked.
+   * Puts back the boxes someone without write access changed: a sticky box as it applies, and every other box unticked.
+   * The message boxes of another message of Manki's are unticked.
    */
   private async revertBoxes(item: WorkRow): Promise<void> {
     const { changes, ticks } = editOf(item);
-    const { paused } = this.reported().settings;
+    const { settings } = this.reported();
     await this.editTicked(item, (body) => (ticks
       ? settleMessageBoxes(body, ticks)
-      : setBoxes(body, changes.map(({ box }) => ({ box, ticked: box === 'pause' && paused })))));
+      : setBoxes(body, changes.map(({ box }) => ({ box, ticked: isSticky(box) && settings[STICKY_BOXES[box]] === true })))));
   }
 
   /**
@@ -2040,32 +2084,77 @@ export class PrCoordinator extends DurableObject<Env> {
    * comment and never a `Manki` check, since a completed check satisfies a branch protection rule that requires it. Its
    * boxes start nothing here: a tick arrives as a settings edit, whose editor needs write access. The coordinator
    * records the notice, and without a record it looks for the marker among Manki's newest comments. A failure GitHub may
-   * recover from throws, and the retry looks for the marker again before it posts.
+   * recover from throws, and the retry looks for the marker again before it posts. A notice with a `refresh` updates
+   * Manki's newest settings comment instead of posting a second one.
    */
-  private async postNotice(item: WorkRow, { key, name, marker, text }: Notice): Promise<void> {
+  private async postNotice(item: WorkRow, { key, name, marker, text, refresh, applies }: Notice): Promise<void> {
     const end = (status: WorkStatus, note: string) => {
       if (this.isDispatching(item.id)) this.finish(item.id, status, note);
     };
     const already = `${name} already posted`;
-    if (this.getMeta<boolean>(key)) return end('skipped', already);
+    if (this.getMeta<boolean>(key) && !refresh) return end('skipped', already);
     // The block names the head the delivery gave. With a head that is no commit id it would not read as a settings block.
     if (settingsHead(text) === null) return end('skipped', 'the delivery names no head commit');
     const target = await this.verifiedTarget();
     if (!target) throw new Error('the repository could not be read');
     const token = await this.token({ issues: 'write', pull_requests: 'write' });
     if (token === null) return end('skipped', 'installation lacks issues: write');
-    const held = await this.newestMankiComment(token, target, (body) => body.includes(marker));
-    if (held === null) {
-      // A close may have dropped the item during the calls above.
-      if (!this.isDispatching(item.id)) return;
-      const response = await this.api(token, `/repos/${target.owner}/${target.repo}/issues/${target.number}/comments`, { method: 'POST', body: { body: text } });
+    const held = await this.newestMankiComment(token, target, (body) => body.includes(marker) || (refresh !== undefined && settingsHead(body) !== null));
+    // A close may have dropped the item during the calls above.
+    if (!this.isDispatching(item.id)) return;
+    if (applies?.() === false) return end('skipped', `the ${name} no longer applies`);
+    const post = held === null && !this.getMeta<boolean>(key);
+    const body = held === null ? text : refresh?.(held.body) ?? held.body;
+    if (post || (held !== null && body !== held.body)) {
+      const comments = `/repos/${target.owner}/${target.repo}/issues`;
+      const response = held === null
+        ? await this.api(token, `${comments}/${target.number}/comments`, { method: 'POST', body: { body } })
+        : await this.api(token, `${comments}/comments/${held.id}`, { method: 'PATCH', body: { body } });
       if (!response.ok) {
-        if (!isRefusal(response, await response.text())) throw new Error(`posting the ${name} failed with ${response.status}`);
-        return end('failed', `posting the ${name} was refused with ${response.status}`);
+        const what = `${post ? 'posting' : 'updating'} the ${name}`;
+        if (!isRefusal(response, await response.text())) throw new Error(`${what} failed with ${response.status}`);
+        return end('failed', `${what} was refused with ${response.status}`);
       }
     }
     this.setMeta(key, true);
-    end(held === null ? 'done' : 'skipped', held === null ? `posted the ${name}` : already);
+    end(post ? 'done' : 'skipped', post ? `posted the ${name}` : already);
+  }
+
+  /**
+   * Tells a draft that its push is not reviewed, with the boxes that review it. A settings comment the PR already has
+   * gets the status line and the boxes instead, and a later push only updates that comment. Nothing is written once
+   * Review every push is ticked or a review was asked for, since that review's progress comment holds the boxes.
+   */
+  private async showDraft(item: WorkRow): Promise<void> {
+    const head = item.head_sha ?? '';
+    await this.postNotice(item, {
+      key: 'draft_notice', name: 'draft notice', marker: DRAFT_NOTICE_MARKER, text: draftNotice(head),
+      // A progress comment still in progress belongs to its run, which may edit it at any time.
+      refresh: (body) => (isRunningProgress(body) ? body : withSettingsStatus(withDraftBoxes(body), DRAFT_STATUS, ['auto'], head)),
+      applies: () => !this.reported().settings.auto
+        && this.sql.exec(`SELECT 1 FROM work WHERE kind = 'review' AND (status = 'queued' OR ${ACTIVE})`).toArray().length === 0,
+    });
+  }
+
+  /** Whether a push to the PR is not reviewed because it is a draft. */
+  private skipsDraft(pr: PullRequestRead, config: BaseConfig): boolean {
+    return pr.draft === true && !reviewsDrafts(config) && !this.reported().settings.auto;
+  }
+
+  /**
+   * Queues the notice of a draft whose push was dropped, and offers the Review every push box. Only a PR that marking
+   * ready would get reviewed is told, so not one a bot opened, one a skip rule matches, or one whose base config leaves
+   * automatic review off or could not be read.
+   */
+  private offerDraftReview(item: WorkRow, pr: PullRequestRead, config: BaseConfig, target: Target): void {
+    if (isBot(pr.user ?? undefined) || !autoReviewIsOn(config) || this.skipRule(config, pr, item.head_sha, item.sender, target) !== null) return;
+    const state = this.reported();
+    if (state.settings.auto === undefined) this.setMeta('pr_state', { ...state, settings: { ...state.settings, auto: false } });
+    const work: Work = {
+      lane: 'help', kind: 'draft_notice', event: item.event, headSha: pr.head.sha, objectId: null, sender: item.sender,
+      trusted: true, acknowledge: false, writer: true,
+    };
+    this.insert(work, item.delivery, Date.now());
   }
 
   /** Reads the PR, and returns it with the token that read it. Throws when it cannot be read. */
@@ -2095,9 +2184,10 @@ export class PrCoordinator extends DurableObject<Env> {
     const first = item.attempts === 0;
     const { config, fromDefault } = push && first ? await this.baseConfig(pr, target) : { config: null, fromDefault: false };
     if (!this.isDispatching(item.id)) return null;
-    // A draft is reviewed on request, such as by its settings box, unless the base config reviews drafts.
-    if (push && first && pr.draft && !reviewsDrafts(config)) {
+    // A draft is reviewed on request, such as by its settings box, unless the base config or its Review every push box reviews it.
+    if (push && first && this.skipsDraft(pr, config)) {
       this.finish(item.id, 'dropped', 'pull request is a draft');
+      this.offerDraftReview(item, pr, config, target);
       return null;
     }
     const reviewed = first ? await this.reviewedInstead(pr, target, token) : null;
@@ -2308,7 +2398,7 @@ export class PrCoordinator extends DurableObject<Env> {
     if (pr.state !== 'open' || pr.head.sha !== item.head_sha) return end('pushed by a bot, and no longer the head');
     const { config, fromDefault } = await this.baseConfig(pr, target);
     // A draft gets no check from a push, as a person's push to it gets none.
-    const rule = pr.draft && !reviewsDrafts(config) ? null : this.skipRule(config, pr, item.head_sha, item.sender, target);
+    const rule = this.skipsDraft(pr, config) ? null : this.skipRule(config, pr, item.head_sha, item.sender, target);
     if (rule === null) return end('pushed by a bot');
     const skipped = `matches the skip rule for ${rule}`;
     const reviewed = await this.reviewedInstead(pr, target, token);

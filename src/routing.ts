@@ -51,9 +51,11 @@ export type Lane = 'state' | 'chat' | 'help' | 'settings';
  * - `bot_push`: a bot's push, which Manki does not review. The Worker reads the skip rules for it, with no run
  * - `fork_notice`: a PR from a fork that was opened or marked ready. The Worker tells it once that it gets no automatic
  *   review, with no run
+ * - `draft_notice`: a push to a draft the coordinator dropped. The Worker tells the PR that drafts are not reviewed
+ *   automatically, with no run
  * - `access`: a command or a box tick that changes or lists the repository's allow list, applied by the Worker, with no run
  */
-export type WorkKind = 'review' | 'merged' | 'review_state' | 'thread' | 'comment' | 'issue' | 'help' | 'settings' | 'bot_push' | 'fork_notice' | 'access';
+export type WorkKind = 'review' | 'merged' | 'review_state' | 'thread' | 'comment' | 'issue' | 'help' | 'settings' | 'bot_push' | 'fork_notice' | 'draft_notice' | 'access';
 
 /** The pull request or issue a delivery is about. Every field comes from the signed payload. */
 export interface Target {
@@ -195,7 +197,7 @@ function targetOf(payload: WebhookPayload, number: number | undefined): Target |
   };
 }
 
-function isBot(user: User | undefined): boolean {
+export function isBot(user: User | undefined): boolean {
   return user?.type === 'Bot' || user?.login === BOT_LOGIN;
 }
 

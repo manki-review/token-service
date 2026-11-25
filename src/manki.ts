@@ -267,7 +267,7 @@ export function boxLabels(body: string, boxes: readonly string[]): string[] {
   return boxes.flatMap((box) => new RegExp(`^[ \\t]*[-*] \\[[ xX]\\] (.+?) <!-- manki-box:${box} -->`, 'm').exec(lines)?.[1] ?? []);
 }
 
-export type SettingsBox = 'pause' | 'again' | 'deeper' | 'cancel' | 'draft';
+export type SettingsBox = 'pause' | 'again' | 'deeper' | 'cancel' | 'draft' | 'auto';
 
 /** The boxes that ask for one review, as the `modes` of that review. */
 export type ReviewMode = Extract<SettingsBox, 'again' | 'deeper' | 'draft'>;
@@ -275,7 +275,7 @@ export type ReviewMode = Extract<SettingsBox, 'again' | 'deeper' | 'draft'>;
 export const REVIEW_MODES: readonly ReviewMode[] = ['again', 'deeper', 'draft'];
 
 /** The boxes the Worker writes itself, with the labels Manki's `renderSettingsBlock` gives them on a PR without a review. */
-const BOX_LABELS = { again: 'Review now', deeper: 'Deeper review' } satisfies Partial<Record<SettingsBox, string>>;
+const BOX_LABELS = { again: 'Review now', deeper: 'Deeper review', draft: 'Review this draft', auto: 'Review every push' } satisfies Partial<Record<SettingsBox, string>>;
 
 type WrittenBox = keyof typeof BOX_LABELS;
 
@@ -287,6 +287,15 @@ const boxLine = (box: WrittenBox): string => `- [ ] ${BOX_LABELS[box]} <!-- mank
  */
 export function renderSettingsBlock(head: string, status: string, boxes: readonly WrittenBox[]): string {
   return ['---', `Not reviewed yet · head \`${head.slice(0, 7)}\` · ${status}`, ...boxes.map(boxLine), SETTINGS_MARKER].join('\n');
+}
+
+/** Returns `body` with each box a draft has that its settings block lacks added to the block, unticked. */
+export function withDraftBoxes(body: string): string {
+  const block = SETTINGS_BLOCK.exec(body);
+  if (!block) return body;
+  const missing = (['draft', 'auto'] as const).map(boxLine).filter((line) => !block[2].includes(line.slice(line.indexOf('<!--'))));
+  const at = body.lastIndexOf(SETTINGS_MARKER);
+  return body.slice(0, at) + missing.map((line) => `${line}\n`).join('') + body.slice(at);
 }
 
 /** Returns the head commit the settings block of `body` names, as Manki writes it, or null without a block. */
@@ -315,7 +324,7 @@ export interface BoxChange {
 }
 
 // A box is a task list line that ends with its hidden id, so the label can change without touching the Worker.
-const BOX_LINE = /^([ \t]*[-*] \[)([ xX])(\] .*<!-- manki-box:(pause|again|deeper|cancel|draft) -->[ \t]*)$/gm;
+const BOX_LINE = /^([ \t]*[-*] \[)([ xX])(\] .*<!-- manki-box:(pause|again|deeper|cancel|draft|auto) -->[ \t]*)$/gm;
 
 function boxStates(body: string): Map<SettingsBox, boolean> {
   const states = new Map<SettingsBox, boolean>();
