@@ -174,6 +174,10 @@ describe('PrCoordinator.receive', () => {
     expect((await workRows(pr.stub)).map((row) => `${row.lane}:${row.kind}`)).toEqual([
       'state:review', 'state:thread', 'state:comment', 'chat:comment',
     ]);
+    // Only a thread item names its comment, so a running review knows which replies still wait.
+    const [, reply] = await workRows(pr.stub);
+    expect(reply!.object_id).not.toBeNull();
+    expect((await pr.stub.state()).queue.map((item) => item.comment_id)).toEqual([null, reply!.object_id, null, null]);
   });
 
   it('keeps a review state check queued behind a thread reply', async () => {
@@ -1296,7 +1300,7 @@ describe('PrCoordinator dispatch', () => {
     await pr.send('pull_request', pr.push(SHA_2));
     expect(await state()).toEqual({
       active: [{ lane: 'state', run_id: 9000, kind: 'review', event: 'pull_request.synchronize', head_sha: SHA_1, dispatched_at: new Date().toISOString(), modes: [] }],
-      queue: [{ lane: 'state', kind: 'review', event: 'pull_request.synchronize', head_sha: SHA_2, enqueued_at: new Date().toISOString(), modes: [] }],
+      queue: [{ lane: 'state', kind: 'review', event: 'pull_request.synchronize', head_sha: SHA_2, enqueued_at: new Date().toISOString(), modes: [], comment_id: null }],
       last_reviewed: null,
       last_approval: null,
       pause: null,

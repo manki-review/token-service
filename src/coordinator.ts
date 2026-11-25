@@ -304,7 +304,10 @@ export interface PrState {
   active: Array<{
     lane: Lane; run_id: number | null; kind: Work['kind']; event: string; head_sha: string | null; dispatched_at: string | null; modes: ReviewMode[];
   }>;
-  queue: Array<{ lane: Lane; kind: Work['kind']; event: string; head_sha: string | null; enqueued_at: string; modes: ReviewMode[] }>;
+  /** `comment_id` names the review comment of a queued thread item, so a run knows which replies still wait. */
+  queue: Array<{
+    lane: Lane; kind: Work['kind']; event: string; head_sha: string | null; enqueued_at: string; modes: ReviewMode[]; comment_id: number | null;
+  }>;
   last_reviewed: { commit: string; run_id: number; at: string } | null;
   last_approval: { commit: string; held: boolean; run_id: number; at: string } | null;
   pause: { reason: string; at: string } | null;
@@ -761,6 +764,7 @@ export class PrCoordinator extends DurableObject<Env> {
       })),
       queue: work.filter((row) => row.status === 'queued').map((row) => ({
         lane: row.lane, kind: row.kind, event: row.event, head_sha: row.head_sha, enqueued_at: iso(row.enqueued_at), modes: modesOf(row),
+        comment_id: row.kind === 'thread' ? row.object_id : null,
       })),
       last_reviewed: reviewed && { ...reviewed, at: iso(reviewed.at) },
       last_approval: approval && { ...approval, at: iso(approval.at) },
