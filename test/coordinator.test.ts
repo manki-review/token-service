@@ -7,6 +7,7 @@ import {
   DISPATCHES_PER_HOUR,
   CONFLICT_NOTE_MARKER,
   FINISHED_RETENTION_MS,
+  draftNotice,
   forkNotice,
   IDLE_RETENTION_MS,
   OPT_IN_TTL_MS,
@@ -690,6 +691,7 @@ function fakeGitHub(number: number) {
     draft: false,
     labels: [] as string[],
     author: 'octocat',
+    authorType: 'User',
     headRef: 'feature',
     headRepositoryId: REPOSITORY_ID,
     baseRef: 'main',
@@ -840,7 +842,7 @@ function fakeGitHub(number: number) {
         state: state.prState,
         draft: state.draft,
         labels: state.labels.map((name) => ({ name })),
-        user: { login: state.author },
+        user: { login: state.author, type: state.authorType },
         head: { sha: state.head, ref: state.headRef, repo: { id: state.headRepositoryId } },
         base: { ref: state.baseRef },
         html_url: `https://github.com/${OWNER}/${REPO}/pull/${number}`,
@@ -1602,6 +1604,7 @@ describe('PrCoordinator dispatch', () => {
       expect(events(github)).toEqual(['pull_request.ready_for_review']);
       expect(await workRows(pr.stub)).toMatchObject([
         { kind: 'review', status: 'dropped', note: 'pull request is a draft' },
+        { kind: 'draft_notice' },
         { kind: 'review', event: 'pull_request.ready_for_review', status: 'running', run_head: SHA_1 },
       ]);
     });
@@ -1721,7 +1724,7 @@ describe('PrCoordinator dispatch', () => {
     await pr.send('pull_request', pr.push(SHA_1));
     await runDurableObjectAlarm(pr.stub);
     expect(github.dispatches).toEqual([]);
-    expect(await workRows(pr.stub)).toMatchObject([{ status: 'dropped', note }]);
+    expect((await workRows(pr.stub))[0]).toMatchObject({ status: 'dropped', note });
   });
 
   it('reviews a closed or merged PR on a review command, unless an open PR has its head', async () => {
@@ -1931,9 +1934,8 @@ describe('PrCoordinator dispatch', () => {
     const draftGitHub = Object.assign(fakeGitHub(draft.number), { draft: true, otherPulls: [below()] });
     await draft.send('pull_request', draft.push(SHA_1));
     await runDurableObjectAlarm(draft.stub);
-    expect(await workRows(draft.stub)).toMatchObject([{ status: 'dropped', note: 'pull request is a draft' }]);
+    expect(await workRows(draft.stub)).toMatchObject([{ status: 'dropped', note: 'pull request is a draft' }, { kind: 'draft_notice' }]);
     expect(draftGitHub.pullLists).toEqual([]);
-    expect(draftGitHub.comments).toEqual([]);
 
     // A note that cannot be posted still holds the review, and the next event posts it.
     const failing = pullRequest();
@@ -2433,6 +2435,148 @@ describe('PrCoordinator dispatch', () => {
     await runDurableObjectAlarm(commanded.stub);
     expect(plain.dispatches).toHaveLength(1);
     expect(granted(plain)).toEqual({ ...got, tokens: expect.arrayContaining(got.tokens) });
+  });
+
+  describe('draft notice', () => {
+    const DRAFT_NOTICE = draftNotice(SHA_1);
+    /** Delivers a push of `sha` to a draft, and runs the alarm twice, so the notice it queues is handled. */
+    const pushDraft = async (pr: ReturnType<typeof pullRequest>, github: ReturnType<typeof fakeGitHub>, sha: string, action?: string) => {
+      github.head = sha;
+      await pr.send('pull_request', pr.push(sha, action));
+      await runDurableObjectAlarm(pr.stub);
+      await runDurableObjectAlarm(pr.stub);
+    };
+    const draftNotices = async (pr: ReturnType<typeof pullRequest>) =>
+      (await workRows(pr.stub)).filter((row) => row.kind === 'draft_notice').map((row) => [row.lane, row.status, row.note]);
+    const posted = ['help', 'done', 'posted the draft notice'];
+    const already = ['help', 'skipped', 'draft notice already posted'];
+
+    it('tells a draft once that it is not reviewed, in a comment with the review boxes and never a check, and then keeps its head', async () => {
+      const pr = pullRequest();
+      const github = Object.assign(fakeGitHub(pr.number), { draft: true });
+      await pushDraft(pr, github, SHA_1, 'opened');
+      expect(DRAFT_NOTICE.split('\n').slice(1)).toEqual([
+        '', '<!-- manki-draft-notice -->', '', '---',
+        'Not reviewed yet · head `1111111` · draft, not reviewed automatically',
+        '- [ ] Deeper review <!-- manki-box:deeper -->',
+        '- [ ] Review this draft <!-- manki-box:draft -->',
+        '- [ ] Review every push <!-- manki-box:auto -->',
+        '<!-- manki-settings -->',
+      ]);
+      // The Action reads the block as one of its own, and leaves the notice with its marker when it removes the block.
+      expect(DRAFT_NOTICE.replace(MANKI_BLOCK_RE, '')).toMatch(/after each push\.\n\n<!-- manki-draft-notice -->$/);
+      expect(github.comments).toEqual([DRAFT_NOTICE]);
+
+      // A later push only moves the head of the notice, also when the coordinator's record of it is gone.
+      github.issueComments.set(5005, DRAFT_NOTICE);
+      await pushDraft(pr, github, SHA_2);
+      expect(github.issueComments.get(5005)).toBe(draftNotice(SHA_2));
+      // A notice that was deleted is not posted again.
+      github.issueComments.delete(5005);
+      await pushDraft(pr, github, SHA_3);
+      expect(github.comments).toHaveLength(1);
+      expect(await draftNotices(pr)).toEqual([posted, already, already]);
+      expect([github.checkRuns, github.waitingChecks, github.dispatches]).toEqual([[], [], []]);
+    });
+
+    it('puts the draft boxes into a settings comment the PR already has, and passes over one still in progress', async () => {
+      const block = (status: string, sha: string, lines: string[]) => ['**Review complete**', '<!-- manki-bot -->', '', '---',
+        `Last reviewed \`1111111\` · head \`${sha.slice(0, 7)}\` · ${status}`, ...lines, '<!-- manki-settings -->', '<!-- manki-answered:7 -->'].join('\n');
+      const pause = '- [x] Pause automatic reviews <!-- manki-box:pause -->';
+      const draftLines = ['- [ ] Review this draft <!-- manki-box:draft -->', '- [ ] Review every push <!-- manki-box:auto -->'];
+      const pr = pullRequest();
+      const github = Object.assign(fakeGitHub(pr.number), { draft: true });
+      github.issueComments.set(7, block('up to date', SHA_1, [pause]));
+      await pushDraft(pr, github, SHA_2);
+      expect(github.issueComments.get(7)).toBe(block('draft, not reviewed automatically', SHA_2, [pause, ...draftLines]));
+      // A tick of Review every push the coordinator no longer holds, as after its storage was deleted, is cleared.
+      github.issueComments.set(7, github.issueComments.get(7)!.replace('[ ] Review every', '[x] Review every'));
+      await pushDraft(pr, github, SHA_3);
+      expect(github.issueComments.get(7)).toBe(block('draft, not reviewed automatically', SHA_3, [pause, ...draftLines]));
+      const running = block('review running', SHA_3, [pause]).replace('Review complete', 'Review in progress');
+      github.issueComments.set(8, running);
+      await pushDraft(pr, github, SHA_4);
+      expect(github.issueComments.get(8)).toBe(running);
+      expect(github.issueComments.get(7)).toBe(block('draft, not reviewed automatically', SHA_4, [pause, ...draftLines]));
+      expect(github.comments).toEqual([]);
+
+      // With nothing but the progress comment of a run that died, the draft is told.
+      const died = pullRequest();
+      const left = Object.assign(fakeGitHub(died.number), { draft: true });
+      left.issueComments.set(8, running);
+      await pushDraft(died, left, SHA_1);
+      expect(left.issueComments.get(8)).toBe(running);
+      expect(left.comments).toEqual([DRAFT_NOTICE]);
+      expect(await draftNotices(died)).toEqual([posted]);
+    });
+
+    it.each([
+      ['a bot opened', { authorType: 'Bot' }],
+      ['a skip rule matches', { config: 'skip_labels: [wip]', labels: ['wip'] }],
+      ['gets no automatic review once ready', { config: 'auto_review: false' }],
+      ['has an unreadable base config', { config: '- no mapping' }],
+      ['is reviewed as a draft', { config: 'drafts: review' }],
+    ])('posts no notice on a draft that %s, and offers it no box', async (_case, change) => {
+      const pr = pullRequest();
+      const github = Object.assign(fakeGitHub(pr.number), { draft: true }, change);
+      await pushDraft(pr, github, SHA_1, 'opened');
+      expect(github.comments).toEqual([]);
+      expect(await draftNotices(pr)).toEqual([]);
+      expect((await pr.stub.state()).settings).toEqual({ paused: false });
+    });
+
+    it('tries a failed post again, gives up on a refused one, and posts nothing once a review was asked for', async () => {
+      const pr = pullRequest();
+      const github = Object.assign(fakeGitHub(pr.number), { draft: true, commentStatus: 502 });
+      await pushDraft(pr, github, SHA_1, 'opened');
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ kind: 'draft_notice', status: 'queued', errors: 1 });
+      github.commentStatus = 403;
+      advanceClock(backoff(0));
+      await runDurableObjectAlarm(pr.stub);
+      expect(await draftNotices(pr)).toEqual([['help', 'failed', 'posting the draft notice was refused with 403']]);
+
+      const asked = pullRequest();
+      const other = Object.assign(fakeGitHub(asked.number), { draft: true, commentStatus: 502 });
+      await pushDraft(asked, other, SHA_1, 'opened');
+      await asked.send('issue_comment', asked.comment('/manki review'));
+      other.commentStatus = 201;
+      advanceClock(backoff(0));
+      await runDurableObjectAlarm(asked.stub);
+      expect(other.comments).toHaveLength(1);
+      expect(await draftNotices(asked)).toEqual([['help', 'skipped', 'the draft notice no longer applies']]);
+    });
+
+    it.each([
+      ['is marked ready', { draft: false }],
+      ['is closed', { prState: 'closed' }],
+      ['has a newer head', { head: SHA_2 }],
+    ])('writes nothing when the PR %s while a failed notice waits for its retry', async (_case, change) => {
+      const pr = pullRequest();
+      const github = Object.assign(fakeGitHub(pr.number), { draft: true, commentStatus: 502 });
+      await pushDraft(pr, github, SHA_1, 'opened');
+      const settings = `Text\n\n---\nLast reviewed \`1111111\` · head \`1111111\` · up to date\n- [ ] Review again <!-- manki-box:again -->\n<!-- manki-settings -->`;
+      github.issueComments.set(7, settings);
+      Object.assign(github, { commentStatus: 201 }, change);
+      advanceClock(backoff(0));
+      await runDurableObjectAlarm(pr.stub);
+      expect(github.comments).toHaveLength(1);
+      expect(github.issueComments.get(7)).toBe(settings);
+      expect(await draftNotices(pr)).toEqual([['help', 'skipped', 'the draft notice no longer applies']]);
+    });
+
+    it('writes nothing when the head was reviewed while a failed notice waits for its retry', async () => {
+      const pr = pullRequest();
+      const github = Object.assign(fakeGitHub(pr.number), { draft: true, commentStatus: 502 });
+      await pushDraft(pr, github, SHA_1, 'opened');
+      await pr.send('issue_comment', pr.comment('/manki review'));
+      await runDurableObjectAlarm(pr.stub);
+      await pr.stub.runCompleted(key('d-reviewed'), 9000, 'success');
+      github.commentStatus = 201;
+      advanceClock(backoff(0));
+      await runDurableObjectAlarm(pr.stub);
+      expect(github.comments).toHaveLength(1);
+      expect(await draftNotices(pr)).toEqual([['help', 'skipped', 'the draft notice no longer applies']]);
+    });
   });
 
   it('looks up a commenter the payload does not show as a writer, and skips their comment without write access', async () => {
@@ -3275,7 +3419,7 @@ describe('PrCoordinator dispatch', () => {
   describe('settings boxes', () => {
     const SETTINGS = 1500;
     const boxes = (ticked: string[] = []) => ['Last reviewed `1111111` · head `1111111` · up to date', '',
-      ...(['pause', 'again', 'deeper', 'cancel', 'draft'] as const).map((box) => `- [${ticked.includes(box) ? 'x' : ' '}] ${box} <!-- manki-box:${box} -->`),
+      ...(['pause', 'again', 'deeper', 'cancel', 'draft', 'auto'] as const).map((box) => `- [${ticked.includes(box) ? 'x' : ' '}] ${box} <!-- manki-box:${box} -->`),
       '<!-- manki-settings -->', '<!-- manki-bot -->'].join('\n');
     /** A running review's progress comment as Manki writes it, with a hidden marker another writer appended. */
     const LABELS = { pause: 'Pause automatic reviews', deeper: 'Deeper review', cancel: 'Cancel this review', draft: 'Review this draft' };
@@ -3341,7 +3485,7 @@ describe('PrCoordinator dispatch', () => {
       Object.assign(github, { head: SHA_3, draft: true });
       await pr.send('pull_request', pr.push(SHA_3));
       await runDurableObjectAlarm(pr.stub);
-      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ head_sha: SHA_3, status: 'dropped', note: 'pull request is a draft' });
+      expect((await workRows(pr.stub)).filter((row) => row.kind === 'review').at(-1)).toMatchObject({ head_sha: SHA_3, status: 'dropped', note: 'pull request is a draft' });
       Object.assign(github, { head: SHA_4, draft: false, config: 'skip_labels: [dependencies]', labels: ['dependencies'] });
       await pr.send('pull_request', pr.push(SHA_4));
       await runDurableObjectAlarm(pr.stub);
@@ -3404,7 +3548,7 @@ describe('PrCoordinator dispatch', () => {
 
       expect(github.checkRuns.map((check) => check.head_sha)).toEqual([SHA_1, SHA_4, SHA_3, SHA_5]);
       expect((await workRows(pr.stub)).filter((row) => row.kind === 'settings').map((row) => row.note)).toEqual([
-        'paused', 'resumed', 'paused', 'again review work 8', 'resumed', 'paused', 'resumed, queued work 15', 'paused', 'resumed',
+        'paused', 'resumed', 'paused', 'again review work 9', 'resumed', 'paused', 'resumed, queued work 16', 'paused', 'resumed',
       ]);
     });
 
@@ -3463,6 +3607,69 @@ describe('PrCoordinator dispatch', () => {
       await edit([], ['draft']);
       expect(github.dispatches).toHaveLength(1);
       expect(await state()).toMatchObject({ active: [{ kind: 'review', event: 'issue_comment.edited', modes: ['draft'] }] });
+    });
+
+    it('reviews every push of a draft while Review every push is ticked, starting with its head', async () => {
+      const { pr, github, state, edit } = setup();
+      github.draft = true;
+      const push = async (sha: string) => {
+        github.head = sha;
+        await pr.send('pull_request', pr.push(sha));
+        await runDurableObjectAlarm(pr.stub);
+      };
+      await push(SHA_1);
+      expect(await state()).toMatchObject({ settings: { paused: false, auto: false } });
+      // Someone without write access starts nothing and gets the box put back.
+      await edit([], ['auto'], 'mallory');
+      expect(github.issueComments.get(SETTINGS)).toBe(boxes([]));
+      expect([github.dispatches, (await state()).settings]).toEqual([[], { paused: false, auto: false }]);
+
+      await edit([], ['auto'], 'alice', '2030-01-01T00:00:01Z');
+      expect(await state()).toMatchObject({ settings: { paused: false, auto: true }, active: [{ kind: 'review', modes: ['draft'] }] });
+      await pr.stub.runCompleted(key('d-auto-1'), 9000, 'success');
+      await push(SHA_2);
+      expect(github.dispatches.map(({ inputs }) => [inputs.event, inputs.head_sha])).toEqual([['issue_comment', undefined], ['pull_request', SHA_2]]);
+      await pr.stub.runCompleted(key('d-auto-2'), 9001, 'success');
+
+      // Pause keeps the box, and the box keeps Pause: a paused push waits as on any PR.
+      await edit(['auto'], ['auto', 'pause']);
+      expect(await state()).toMatchObject({ settings: { paused: true, auto: true } });
+      await push(SHA_3);
+      expect((await workRows(pr.stub)).at(-1)).toMatchObject({ status: 'skipped', note: 'pull request is paused' });
+      // Someone else's untick is put back as it applies.
+      await edit(['auto', 'pause'], ['pause'], 'mallory');
+      expect(github.issueComments.get(SETTINGS)).toBe(boxes(['auto', 'pause']));
+
+      // An untick stops it, and a tick from before the untick changes nothing.
+      await edit(['auto'], [], 'alice', '2030-01-01T00:00:09Z');
+      await edit([], ['auto'], 'alice', '2030-01-01T00:00:08Z');
+      expect(await state()).toMatchObject({ settings: { auto: false } });
+      await edit(['pause'], [], 'alice');
+      await push(SHA_4);
+      expect((await workRows(pr.stub)).filter((row) => row.kind === 'review').at(-1)).toMatchObject({ status: 'dropped', note: 'pull request is a draft' });
+
+      // A head that has a review gets no second one from the tick.
+      github.head = SHA_2;
+      const dispatched = github.dispatches.length;
+      await edit([], ['auto'], 'alice', '2030-01-01T00:00:10Z');
+      expect(await state()).toMatchObject({ settings: { auto: true } });
+      expect(github.dispatches).toHaveLength(dispatched);
+    });
+
+    it('leaves Review every push ticked when a push is dropped right before its tick is applied', async () => {
+      const { pr, github, state } = setup();
+      github.draft = true;
+      const before = draftNotice(SHA_1);
+      const after = before.replace('[ ] Review every', '[x] Review every');
+      const payload = issueCommentEvent(after, { number: pr.number, action: 'edited', author: MANKI_AUTHOR, sender: { login: 'alice', type: 'User' }, previousBody: before });
+      github.issueComments.set(SETTINGS, after);
+      await pr.send('pull_request', pr.push(SHA_1));
+      await pr.send('issue_comment', { ...payload, comment: { ...payload.comment!, id: SETTINGS, updated_at: new Date().toISOString() } });
+      await runDurableObjectAlarm(pr.stub);
+      await runDurableObjectAlarm(pr.stub);
+      expect((await workRows(pr.stub)).filter((row) => row.kind === 'draft_notice')).toMatchObject([{ status: 'skipped', note: 'the draft notice no longer applies' }]);
+      expect(github.issueComments.get(SETTINGS)).toContain('[x] Review every push');
+      expect(await state()).toMatchObject({ settings: { auto: true } });
     });
 
     it('cancels the running review on a Cancel tick, which the cron then leaves alone', async () => {
