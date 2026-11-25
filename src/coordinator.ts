@@ -68,10 +68,10 @@ const REACTION_BUDGET = 18;
 const REACTION_MINTS = 2;
 /**
  * The most calls one step of a lane makes, by a count of the code with one check to end: a poll, the end of the waiting
- * checks, or the start of an item. The costliest is a settings edit that ticks Review again on the head under review
- * and Deeper review, with a fresh opt-in read. The start of a push review stays below it with both `.manki.yml` reads.
+ * checks, or the start of an item. The costliest is a settings edit that ticks Review again on the head under review,
+ * Deeper review and Review every push, with a fresh opt-in read. The start of a push review stays below it with both `.manki.yml` reads.
  */
-const STEP_COST = 32;
+const STEP_COST = 34;
 /**
  * The most calls the start of an item of `LIGHT_KINDS` makes, with a fresh opt-in read. The costliest is a bot's push
  * that gets its skipped check after reading `.manki.yml` on the base and the default branch.
@@ -2085,7 +2085,8 @@ export class PrCoordinator extends DurableObject<Env> {
    * boxes start nothing here: a tick arrives as a settings edit, whose editor needs write access. The coordinator
    * records the notice, and without a record it looks for the marker among Manki's newest comments. A failure GitHub may
    * recover from throws, and the retry looks for the marker again before it posts. A notice with a `refresh` updates
-   * Manki's newest settings comment instead of posting a second one.
+   * Manki's newest settings comment instead of posting a second one. A progress comment still in progress is passed
+   * over, since it belongs to its run, which may edit it at any time.
    */
   private async postNotice(item: WorkRow, { key, name, marker, text, refresh, applies }: Notice): Promise<void> {
     const end = (status: WorkStatus, note: string) => {
@@ -2099,7 +2100,8 @@ export class PrCoordinator extends DurableObject<Env> {
     if (!target) throw new Error('the repository could not be read');
     const token = await this.token({ issues: 'write', pull_requests: 'write' });
     if (token === null) return end('skipped', 'installation lacks issues: write');
-    const held = await this.newestMankiComment(token, target, (body) => body.includes(marker) || (refresh !== undefined && settingsHead(body) !== null));
+    const held = await this.newestMankiComment(token, target, (body) =>
+      body.includes(marker) || (refresh !== undefined && settingsHead(body) !== null && !isRunningProgress(body)));
     // A close may have dropped the item during the calls above.
     if (!this.isDispatching(item.id)) return;
     if (applies?.() === false) return end('skipped', `the ${name} no longer applies`);
@@ -2123,16 +2125,18 @@ export class PrCoordinator extends DurableObject<Env> {
   /**
    * Tells a draft that its push is not reviewed, with the boxes that review it. A settings comment the PR already has
    * gets the status line and the boxes instead, and a later push only updates that comment. Nothing is written once
-   * Review every push is ticked or a review was asked for, since that review's progress comment holds the boxes.
+   * Review every push is ticked or a review was asked for, since that review's progress comment holds the boxes, or
+   * while a change of Review every push waits.
    */
   private async showDraft(item: WorkRow): Promise<void> {
     const head = item.head_sha ?? '';
     await this.postNotice(item, {
       key: 'draft_notice', name: 'draft notice', marker: DRAFT_NOTICE_MARKER, text: draftNotice(head),
-      // A progress comment still in progress belongs to its run, which may edit it at any time.
-      refresh: (body) => (isRunningProgress(body) ? body : withSettingsStatus(withDraftBoxes(body), DRAFT_STATUS, ['auto'], head)),
-      applies: () => !this.reported().settings.auto
-        && this.sql.exec(`SELECT 1 FROM work WHERE kind = 'review' AND (status = 'queued' OR ${ACTIVE})`).toArray().length === 0,
+      refresh: (body) => withSettingsStatus(withDraftBoxes(body), DRAFT_STATUS, ['auto'], head),
+      // A change of Review every push that is not applied yet decides the box, so the notice must not untick it.
+      applies: () => !this.reported().settings.auto && this.sql.exec(
+        `SELECT 1 FROM work WHERE (kind = 'review' OR (kind = 'settings' AND boxes LIKE '%"box":"auto"%')) AND (status = 'queued' OR ${ACTIVE})`,
+      ).toArray().length === 0,
     });
   }
 

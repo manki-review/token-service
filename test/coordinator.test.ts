@@ -7,7 +7,8 @@ import {
   DISPATCHES_PER_HOUR,
   CONFLICT_NOTE_MARKER,
   FINISHED_RETENTION_MS,
-  draftNotice, forkNotice,
+  draftNotice,
+  forkNotice,
   IDLE_RETENTION_MS,
   OPT_IN_TTL_MS,
   backoff,
@@ -2478,7 +2479,7 @@ describe('PrCoordinator dispatch', () => {
       expect([github.checkRuns, github.waitingChecks, github.dispatches]).toEqual([[], [], []]);
     });
 
-    it('puts the draft boxes into a settings comment the PR already has, but not into one a run is writing', async () => {
+    it('puts the draft boxes into a settings comment the PR already has, and passes over one still in progress', async () => {
       const block = (status: string, sha: string, lines: string[]) => ['**Review complete**', '<!-- manki-bot -->', '', '---',
         `Last reviewed \`1111111\` · head \`${sha.slice(0, 7)}\` · ${status}`, ...lines, '<!-- manki-settings -->', '<!-- manki-answered:7 -->'].join('\n');
       const pause = '- [x] Pause automatic reviews <!-- manki-box:pause -->';
@@ -2496,7 +2497,17 @@ describe('PrCoordinator dispatch', () => {
       github.issueComments.set(8, running);
       await pushDraft(pr, github, SHA_4);
       expect(github.issueComments.get(8)).toBe(running);
+      expect(github.issueComments.get(7)).toBe(block('draft, not reviewed automatically', SHA_4, [pause, ...draftLines]));
       expect(github.comments).toEqual([]);
+
+      // With nothing but the progress comment of a run that died, the draft is told.
+      const died = pullRequest();
+      const left = Object.assign(fakeGitHub(died.number), { draft: true });
+      left.issueComments.set(8, running);
+      await pushDraft(died, left, SHA_1);
+      expect(left.issueComments.get(8)).toBe(running);
+      expect(left.comments).toEqual([DRAFT_NOTICE]);
+      expect(await draftNotices(died)).toEqual([posted]);
     });
 
     it.each([
@@ -3611,6 +3622,22 @@ describe('PrCoordinator dispatch', () => {
       await edit([], ['auto'], 'alice', '2030-01-01T00:00:10Z');
       expect(await state()).toMatchObject({ settings: { auto: true } });
       expect(github.dispatches).toHaveLength(dispatched);
+    });
+
+    it('leaves Review every push ticked when a push is dropped right before its tick is applied', async () => {
+      const { pr, github, state } = setup();
+      github.draft = true;
+      const before = draftNotice(SHA_1);
+      const after = before.replace('[ ] Review every', '[x] Review every');
+      const payload = issueCommentEvent(after, { number: pr.number, action: 'edited', author: MANKI_AUTHOR, sender: { login: 'alice', type: 'User' }, previousBody: before });
+      github.issueComments.set(SETTINGS, after);
+      await pr.send('pull_request', pr.push(SHA_1));
+      await pr.send('issue_comment', { ...payload, comment: { ...payload.comment!, id: SETTINGS, updated_at: new Date().toISOString() } });
+      await runDurableObjectAlarm(pr.stub);
+      await runDurableObjectAlarm(pr.stub);
+      expect((await workRows(pr.stub)).filter((row) => row.kind === 'draft_notice')).toMatchObject([{ status: 'skipped', note: 'the draft notice no longer applies' }]);
+      expect(github.issueComments.get(SETTINGS)).toContain('[x] Review every push');
+      expect(await state()).toMatchObject({ settings: { auto: true } });
     });
 
     it('cancels the running review on a Cancel tick, which the cron then leaves alone', async () => {
